@@ -27,7 +27,8 @@ Ultra (Snapdragon 8 Gen 3). Other phones, including Mali (Exynos, MediaTek, Tens
 - The **60 fps mode** runs at about 30–45 fps on my phone, so the game plays slower than normal there.
 - The limit is the CPU (the game's main thread and the threads it waits on) and how Android clocks the CPU for this
   kind of workload, not the GPU. The work in progress is described in [PROGRESS.md](PROGRESS.md).
-- The first start of each area is slower while shaders are compiled for your phone.
+- The first start builds the graphics for your phone (a loading screen shows the progress; about 2-3 minutes once).
+  After that the title screen comes in about 20 seconds. The first visit to each area can still hitch once.
 
 The goal is to run well on Snapdragon and Mali with the phone's own driver. Custom drivers are optional.
 

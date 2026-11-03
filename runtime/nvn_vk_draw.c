@@ -4339,6 +4339,9 @@ static void mem_report(int64_t frame) {
     fflush(stdout);
 }
 static void vk_present(void *arg) { vk_present2(arg, 0); }
+/* Android port: frames that reached the window (GameActivity's loading screen goes once the game shows its own) */
+static volatile int64_t g_win_presents;
+long long nvn_vk_window_presents(void) { return g_win_presents; }
 static void vk_present2(void *arg, int progress) {
     PresentJob *j = arg;
     static int shot = -2, every, shot_from, shot_to;
@@ -4530,6 +4533,7 @@ swap: ;
         pr.waitSemaphoreCount = 1; pr.pWaitSemaphores = &rend; pr.swapchainCount = 1; pr.pSwapchains = &V.swapchain; pr.pImageIndices = &index;
         g_wd_where = 4;
         r = vkQueuePresentKHR(V.queue, &pr);
+        if (r >= 0) plat_atomic_inc(&g_win_presents);
 #ifdef __ANDROID__
         /* Android port: Android answers SUBOPTIMAL for more than a changed window (measured on a Galaxy S24 Ultra: the
          * swapchain was made again over and over, 14% of the render thread in a cutscene). The swapchain is made again

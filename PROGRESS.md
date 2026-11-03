@@ -408,6 +408,27 @@ sharpening 75):
   Exit on the emulator writes `bind_EXIT`. Touches during the black boot screen do nothing: the touch controls start
   when the game sets up its controllers.
 
+## Start-up time: the pipeline cache was never written on Android (2026-11-03)
+
+- Every phone log of the beta check showed the same thing: the ~4,400 pipelines listed in `pipes.bin` made again at
+  every start in 85-128 s ("pipelines made ahead"), and the game's first frame held in `program_set` for that long, so
+  the title screen came after 1.5-2 minutes. No log had "pipeline cache saved": the cache file (8 MB) was never
+  written back. The exit path that writes it (vkd_shutdown) never runs on Android (the process ends with `_exit`), and
+  the held loading screen that writes it belongs to the stage-library path (SMO_VK_GPL=2), which phones do not take.
+- Now `nvn_vk_pcache_save` (nvn_vk_m4.c) writes it: when the game goes to the background (GameActivity.onStop, a
+  thread of its own), when it is left with Exit (after the save wait), and once after a start whose pipelines made
+  ahead took 10 s or more (some were not in the cache). Skipped when the driver's data is the size of the file.
+- Measured on the S24 Ultra (the phone's own driver): the start that built the cache wrote it after its pipelines
+  made ahead (32 MB, read out in 13 ms, written in 29 ms, no frame lost); Exit then found nothing new. The next start:
+  pipelines made ahead in 2.6 s instead of 113 s, the game's frames from about 8 s after Play, the title screen at 18 s
+  (was about 2 minutes).
+- **Loading screen** (GameActivity.showLoading): the game's window stays empty until its renderer shows a frame, and
+  Samsung's opening animation stopped half way on it. A window of its own (not focusable, not touchable) now covers it
+  at once in the app's colours: the icon, "Preparing graphics... n%" while the pipelines are made ahead (polled from
+  `nvn_vk_load_progress`), "Starting the game..." after, and a note on a slow first start. It fades out once the game's
+  frames have reached the window for 0.6 s (`nvn_vk_window_presents`).
+- The game's window keeps the screen on (FLAG_KEEP_SCREEN_ON): the phone locked itself during a 2-minute first start.
+
 ## Open problems, most important first
 
 1. **BC textures on phones without BC (Mali, PowerVR): decoded on the CPU since 2026-10-28.**

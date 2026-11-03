@@ -100,6 +100,9 @@ void android_exit_request(void) {                    /* the looper thread (input
 }
 void display_menu_hold(int on);                       /* display.c */
 void fs_quiesce(void);                                /* nnfs.c */
+void nvn_vk_pcache_save(const char *why);             /* nvn_vk_m4.c */
+int nvn_vk_load_progress(long long *done, long long *total);      /* nvn_vk_m4.c */
+long long nvn_vk_window_presents(void);               /* nvn_vk_draw.c */
 static void JNICALL native_hold(JNIEnv *env, jobject self, jboolean on) { (void)env; (void)self; display_menu_hold(on ? 1 : 0); }
 static void JNICALL native_quiesce(JNIEnv *env, jobject self) {
     (void)env; (void)self;
@@ -108,11 +111,25 @@ static void JNICALL native_quiesce(JNIEnv *env, jobject self) {
     printf("smo: leaving the game: no save in progress%c", 10);
     fflush(stdout);
 }
+static void JNICALL native_save_cache(JNIEnv *env, jobject self, jboolean leaving) {      /* GameActivity: a thread of its own */
+    (void)env; (void)self;
+    nvn_vk_pcache_save(leaving ? "the game is left" : "the game went to the background");
+}
+/* GameActivity's loading screen, polled from the UI thread: {frames that reached the window, pipelines made ahead,
+ * of how many, 1 when they are all made} */
+static void JNICALL native_load_state(JNIEnv *env, jobject self, jlongArray out) {
+    (void)self;
+    long long done = 0, total = 0;
+    int fin = nvn_vk_load_progress(&done, &total);
+    jlong v[4] = {nvn_vk_window_presents(), done, total, fin};
+    (*env)->SetLongArrayRegion(env, out, 0, 4, v);
+}
 static void register_natives(void) {
     JNIEnv *env = jni_env();
     jclass c = (*env)->GetObjectClass(env, g_app->activity->clazz);
-    JNINativeMethod m[2] = {{"nativeHold", "(Z)V", (void *)native_hold}, {"nativeQuiesce", "()V", (void *)native_quiesce}};
-    if ((*env)->RegisterNatives(env, c, m, 2) != 0) { (*env)->ExceptionClear(env); printf("smo: no GameActivity: no Exit button%c", 10); }
+    JNINativeMethod m[4] = {{"nativeHold", "(Z)V", (void *)native_hold}, {"nativeQuiesce", "()V", (void *)native_quiesce}, {"nativeSaveCache", "(Z)V", (void *)native_save_cache},
+                            {"nativeLoadState", "([J)V", (void *)native_load_state}};
+    if ((*env)->RegisterNatives(env, c, m, 4) != 0) { (*env)->ExceptionClear(env); printf("smo: no GameActivity: no Exit button%c", 10); }
     (*env)->DeleteLocalRef(env, c);
 }
 static int display_rotation(void) {                  /* Surface.ROTATION_0 .. 270 as 0..3 */

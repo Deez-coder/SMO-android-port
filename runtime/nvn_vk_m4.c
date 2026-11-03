@@ -45,6 +45,7 @@ static volatile int64_t g_wd_beat;                  /* QueryPerformanceCounter o
 static volatile int32_t g_wd_where;                   /* the render thread's place in a present (1 barrier, 2 acquire, 4 present) */
 static volatile int32_t g_pcsave_want;                /* see pcache_save_at */
 static void pcache_save_at(int where, int marker);
+void nvn_vk_pcache_save(const char *why);           /* the Android port: written when the game is left or goes to the background */
 static volatile int64_t g_wd_try;                 /* present attempts (one that failed or was skipped counts here, not in g_wd_beat) */
 static int wd_enter(const char *fn, int line) {
     plat_li t; ((t).QuadPart = plat_qpc());
@@ -1199,6 +1200,12 @@ typedef struct { uint32_t magic, compute; uint64_t vs_h, fs_h; PKey k; } PipeRec
 static PipeRec *g_pw_rec;
 static volatile int32_t g_pw_next, g_pw_left;
 static int64_t g_pw_t0, g_pw_t1;
+/* Android port, GameActivity's loading screen: the pipelines made ahead so far, of how many; 1 once they are all made */
+int nvn_vk_load_progress(long long *done, long long *total) {
+    int n = g_pw_n, next = g_pw_next;
+    *total = n; *done = next < n ? next : n;
+    return g_pw_t0 != 0 && g_pw_left == 0;
+}
 static char g_pcache_path[160];
 static VStage *pw_stage(int s, uint64_t vh) {      /* g_sh_lock held: a variant named by pipes.bin, from its record */
     StageRec r;
@@ -1587,7 +1594,11 @@ static uint32_t  pw_main(void *arg) {
         if (p) { pipe_build(p); plat_atomic_inc(&g_pw_pipes); }
     }
     plat_atomic_xchg(&g_pw_t1, tk());
-    if (plat_atomic_dec(&g_pw_left) == 0) plat_event_set(g_pw_gate);
+    if (plat_atomic_dec(&g_pw_left) == 0) {
+        plat_event_set(g_pw_gate);
+        plat_li pfq; ((pfq).QuadPart = plat_qpf());
+        if (g_pw_t1 - g_pw_t0 > pfq.QuadPart * 10) nvn_vk_pcache_save("after the pipelines made ahead (10 s or more: not all of them were in it)");      /* the last worker; the game holds a loading screen now */
+    }
     int prio = PLAT_PRIO_NORMAL;
     for (;;) {                                     /* 2. what the game hands over while it runs */
         {   /* Session 7: in a fight the workers run BELOW the game's threads (measured, run s7fn1 frames 2101-2118: the 16
@@ -2007,7 +2018,7 @@ static void pcache_write(PcWrite *w) {
     if (w->where == 2) plat_sleep_ms(300);                 /* the frame that was held behind the driver's lock has been presented by now */
     printf("nvn_vk: pipeline cache %s: %llu KB, %s; vkGetPipelineCacheData %.0f ms (%s), on a thread of priority %d; file written in %.0f ms%s; longest time between two presented frames while the cache was read out: %.0f ms (frame %lld, %s)\n",
            ok ? "saved" : "NOT SAVED (the file could not be written)", (unsigned long long)(w->n >> 10),
-           w->where == 0 ? "on the exit path" : w->where == 1 ? "by the render thread inside a held loading screen" : "BY THE PREPARATION THREAD DURING PLAY (SMO_VK_PCSAVE=prep: the behaviour before session 12)",
+           w->where == 0 ? "on the exit path" : w->where == 1 ? "by the render thread inside a held loading screen" : w->where == 3 ? "the game left, in the background or after the start (nvn_vk_pcache_save)" : "BY THE PREPARATION THREAD DURING PLAY (SMO_VK_PCSAVE=prep: the behaviour before session 12)",
            (double)w->t_get * 1000.0 / (double)fq.QuadPart, w->one_call ? "one call" : "two calls: size, then data", w->prio, (double)(t1 - t0) * 1000.0 / (double)fq.QuadPart, w->where == 1 ? " by a thread of its own" : "",
            (double)g_gap_max * 1000.0 / (double)fq.QuadPart, (long long)nvn_front_frame_next(), g_in_fight ? "IN A FIGHT" : "no fight");
     if (ok && w->marker && !g_prep_limited && g_prep_marker[0]) {
@@ -2046,7 +2057,8 @@ static uint32_t  pcprobe_main(void *arg) {
     stage_mod_put(src);
     return 0;
 }
-/* where: 0 the exit path, 1 the render thread inside a held loading screen, 2 the preparation thread at once (old behaviour) */
+/* where: 0 the exit path, 1 the render thread inside a held loading screen, 2 the preparation thread at once (old behaviour),
+ * 3 nvn_vk_pcache_save */
 static void pcache_save_at(int where, int marker) {
     size_t n = 0;
     VkResult r = VK_INCOMPLETE;
@@ -2085,6 +2097,26 @@ static void pcache_save_at(int where, int marker) {
     pcache_write(w); free(w);
 }
 static void pcache_save(void) { pcache_save_at(0, plat_atomic_xchg(&g_pcsave_want, 0)); }      /* the exit path (vkd_shutdown) */
+/* Android port: the process ends without the exit path (android_main.c _exit), and the held loading screen that writes the
+ * cache belongs to the stage-library path phones do not take, so nothing wrote it there: every start made its ~4,400
+ * pipelines from nothing again (about 100 s before the title screen on the S24 Ultra, the phone's own driver). Written
+ * now when the game is left or goes to the background (GameActivity: Exit, onStop) and after a start whose pipelines
+ * made ahead were not in it; skipped when the driver's data is the size of the file (nothing new). */
+static volatile int32_t g_pcsave_busy;
+void nvn_vk_pcache_save(const char *why) {
+    if (!g_pcache) return;
+    while (plat_atomic_xchg(&g_pcsave_busy, 1)) plat_sleep_ms(20);
+    size_t n = 0;
+    uint64_t fsize = 0;
+    int have = plat_file_stamp(g_pcache_path, &fsize, NULL);
+    if (vkGetPipelineCacheData(V.device, g_pcache, &n, NULL) == VK_SUCCESS && n && (!have || fsize != (uint64_t)n)) {
+        printf("nvn_vk: pipeline cache, %s: the driver has %llu KB, the file %llu KB: writing it\n", why, (unsigned long long)(n >> 10), (unsigned long long)(fsize >> 10));
+        fflush(stdout);
+        pcache_save_at(3, plat_atomic_xchg(&g_pcsave_want, 0));
+    } else printf("nvn_vk: pipeline cache, %s: nothing new (%llu KB)\n", why, (unsigned long long)(n >> 10));
+    fflush(stdout);
+    plat_atomic_xchg(&g_pcsave_busy, 0);
+}
 
 /* ---------------------------------------------------------------- session 6: the shader container scan
  * The game keeps its Maxwell stages in "BNSH" containers (a file of their own, or embedded in an effect / shader-database
