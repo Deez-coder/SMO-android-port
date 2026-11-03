@@ -429,6 +429,75 @@ sharpening 75):
   frames have reached the window for 0.6 s (`nvn_vk_window_presents`).
 - The game's window keeps the screen on (FLAG_KEEP_SCREEN_ON): the phone locked itself during a 2-minute first start.
 
+## The map below 30 fps: heat, not the code (2026-11-03)
+- Reported: under 30 fps on the map screen after a long session. The two play logs (over an hour of testing while
+  charging) show thermal "light" all along with the big core capped at ~1.8 GHz (2.6-3.4 when cool): 22-28 fps
+  stretches, the render thread's batch replay 15-18 ms, ~0 ms waiting for the GPU (CPU-bound on lowered clocks).
+- MEASURED, phone cooled to thermal status 0, the same build and the user's own graphics.ini (vsync mailbox, scale 1.00,
+  fxaa, sharpening 75, 30 fps): Cascade gameplay 30.0 fps (1% low 21-26, replay 11-18 ms), the map ('-') 30.0 fps
+  (1% low 27-28, replay 6.3 ms). No code change; today's additions (icons, pipeline cache, loading screen, the :game
+  process) do not cost frames.
+
+## Heat: the touch controls held the GPU clock high (2026-11-03)
+- Method: `heat.sh` (scratchpad tooling, not in the repo). Each run cools the phone to thermal 0 and SKIN ≤ 35 °C, plays
+  3 min of Cascade with the phone on a cooler, and samples GPU busy / clock (`gpu_clock_stats` residency) and the HAL
+  temperatures. `SMO_VK_PASSTIME=<frame>` now also times the present pass.
+- MEASURED before, with the user's graphics.ini: the present pass took 20-25 ms of GPU time a frame, the game's own
+  60 passes ~5 ms. GPU 84-91 % busy at 680-834 MHz; after 3 min AP 48-49 °C, SKIN 40.4-40.7 °C.
+- Ruled out one at a time (present pass still 22-24 ms each): FXAA and sharpening off; the compositor rotating the
+  picture instead of the pass; the frame's work submitted before the acquire; the acquire's fence waited for on the CPU
+  (0.00 ms: the swapchain image is free); a one-colour shader for the picture; drawing into an image of our own and
+  copying it. An empty pass (no draws) and a pass without the touch controls' draw were fast.
+- Cause: the touch controls' shader indexed constant arrays (the letters' strokes, `GS[43]`, `GR[9]`) with a variable.
+  On the Adreno 750 (system driver) that cost ~20 ms a frame for ~20 small squares. Fix: the tables are in the overlay's
+  uniform block (`k_ov_gs`, `k_ov_gr`, OV_BYTES 2048). The fps counter's `SEG[10]` became packed constants.
+- MEASURED after, the user's graphics.ini, touch controls shown: present pass 2.65 ms, GPU 231 MHz 100 % of the time
+  (47 % busy), 30.0 fps (1% low 22-26). After 3 min AP 40.9 °C, SKIN 36.2 °C. The screenshot matches the old one
+  (letters, icons, fps counter).
+- With a controller the touch controls hide (auto mode), and that case was already cool before the fix (run without
+  the overlay draw: 231 MHz, AP 41.6 °C). The fix matters while the controls are on screen.
+- The display rate: touches raised the panel to 120 Hz. Now `setFrameRateBoostOnTouchEnabled(false)` (Android 15+) and
+  the 60 Hz vote with COMPATIBILITY_DEFAULT (FIXED_SOURCE behind `SMO_FRAME_RATE_VIDEO`). With them, 10 of 13 runs
+  stayed at 60 Hz after 8 swipes (three went to 120). Not settled.
+
+## The user's own setup: controller, passthrough charging (2026-11-03)
+- adb over Wi-Fi (wireless debugging, paired), so the GameSir X3 Pro could sit in the USB-C port. `heat.sh` with
+  `PAD=wait`: the user presses A on the title menu (an injected `input gamepad` key joins as a virtual player 1 that
+  the menu ignores). On USB to the PC the battery mostly drained during play (down to -1.0 A): those runs had almost no
+  charging heat.
+- MEASURED after 3 min, cooler on, touch controls hidden by the controller:
+  - flag view (845 draws), no charging: 30.0 fps, GPU 231 MHz, AP 40.2, SKIN 35.2, BAT 29.2 °C.
+  - waterfall view (1170-1196 draws), no charging: 24-27 fps, AP 42.9, SKIN 37.0, BAT 30.9 °C.
+  - waterfall view, passthrough charging (battery +2.0..2.6 A): 25-28 fps, AP 44.5, SKIN 38.4, BAT 31.2 °C. A
+    power-saving overlay (the phone's app lock) may have been on in this run; the fps matched the uncharged run.
+- So: charging adds ~1.5 °C in 3 min and costs no frames. Thermal status stayed "none" in every run.
+- The waterfall view's fps loss is the CPU: render thread 21.5 ms a frame (draw preparation 13.0), the game's busiest
+  thread ~60 % and the render thread ~40 % of a 37 ms frame, apparently one after the other. In that run neither ran
+  on the prime core (cpu7); both were on the medium cores at 0.5-2.0 GHz. In the flag view one sat on cpu7. Next:
+  thread placement (the ADPF session / affinity) and how far the game thread and the render thread overlap.
+
+## Heavy views: CPU boost (2026-11-03)
+- Same waterfall view, 1,310-1,350 draws, 30 fps mode, system driver. Each idea was switched at run time in one
+  session, so the comparison is at the same view and temperature.
+- Threads made by the render thread inherited its pin to cpu7: pw_main x6, wd_main and pf_threads all queued on the
+  one prime core. `plat_posix.c` thread_main now widens a one-CPU affinity to every other CPU. Built, not measured on
+  its own.
+- Present queued to the render thread (`SMO_PRESENT_ASYNC`): the game thread's wait-present went from 21 ms to 0, but
+  the frame rate stayed at 25.5-26. The frame is the render thread's replay (~21 ms, draw preparation ~13 ms) at low
+  clocks. The switchable test hook was removed.
+- A utilization floor for the frame's threads (sched_setattr UTIL_CLAMP_MIN): Android refuses it to apps (EPERM).
+- Hot threads spinning 16 ms before they block (`plat_spinhot_ns`): 25.5 -> 29.3-29.8 fps, 1% low 24-27, replay
+  21 -> 16 ms, mid cores 0.5-1.4 -> 1.8-2.0 GHz. Cost: the chip warmed ~2 °C a minute (44.2 -> 46.8) where it cooled
+  ~2 °C without; SKIN 38.2 -> 39.1.
+- So it is automatic: graphics.ini `boost = auto` (default; launcher Performance, "CPU boost"), in
+  `android_perf.c` boost_frame. It turns on after two 1 s windows 5% over the frame target, holds at least 10 s, then
+  goes off to look; a still-heavy view turns it back on and doubles the hold (up to 2 min).
+- MEASURED with auto in the waterfall view: on at 24.1-25.6 fps, 28.7-30.0 fps while on, holds 10/20/40/80 s. At the
+  title menu (122 draws, 30.0 fps) it stayed off, clocks 0.8-0.9 GHz.
+- `boost = on` ("Always"): MEASURED at the title, the log says on, the two frame threads 68-71 % busy (45-55 % without),
+  clocks 1.3-1.4 GHz. Not measured in the heavy view or for heat. `boost = off`: no spin.
+- In 60 fps mode the target is 16.7 ms, so auto turns on below ~57 fps. Not measured in 60 fps mode yet.
+
 ## Open problems, most important first
 
 1. **BC textures on phones without BC (Mali, PowerVR): decoded on the CPU since 2026-10-28.**

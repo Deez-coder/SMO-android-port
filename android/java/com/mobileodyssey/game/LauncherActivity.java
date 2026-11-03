@@ -236,6 +236,8 @@ public class LauncherActivity extends Activity {
                 "60 = no limit. WARNING: the game advances one step per frame, so any limit below 60 makes it run in slow "
                 + "motion (at 40, two thirds of its speed). Only \"30 fps, full speed\" above keeps normal speed; when it is "
                 + "chosen, this limit is not used."));
+        c.addView(choice(g, "boost", "CPU boost", new String[]{"auto", "on", "off"}, new String[]{"Auto", "Always", "Off"}, "auto",
+                "Keeps the phone's CPU clocks up so heavy scenes hold the frame rate. Auto: only while frames are late. Always: everywhere, warmer."));
         c.addView(choice(g, "shader_wait", "New shaders", new String[]{"hold", "skip"}, new String[]{"Wait", "Skip until ready"}, "hold",
                 "Skip avoids a stutter the first time an effect appears; the effect is missing for a moment instead."));
         content.addView(c);

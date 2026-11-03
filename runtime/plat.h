@@ -173,21 +173,33 @@ void plat_sleep_ns(int64_t ns);
 #endif
 #ifndef _WIN32
 extern _Thread_local int plat_spin_hot_;              /* plat_posix.c */
+extern int64_t plat_spinhot_ns_;                      /* plat_posix.c: the hot threads' spin, changed at run time (android_perf.c) */
 static inline void plat_spin_mark_hot(void) { plat_spin_hot_ = 1; }
 static inline int plat_spin_is_hot(void) { return plat_spin_hot_; }
+static inline int64_t plat_spinhot_ns(void) {
+    int64_t h = __atomic_load_n(&plat_spinhot_ns_, __ATOMIC_RELAXED);
+    if (h < 0) {
+        const char *e = getenv("SMO_SPINHOT_US");
+        h = (e ? atoll(e) : PLAT_SPINHOT_DEFAULT_US) * 1000;
+        int64_t unset = -1;
+        __atomic_compare_exchange_n(&plat_spinhot_ns_, &unset, h, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+        h = __atomic_load_n(&plat_spinhot_ns_, __ATOMIC_RELAXED);
+    }
+    return h;
+}
+static inline void plat_spinhot_set_ns(int64_t ns) { __atomic_store_n(&plat_spinhot_ns_, ns, __ATOMIC_RELAXED); }
 #else
 static inline void plat_spin_mark_hot(void) {}
 static inline int plat_spin_is_hot(void) { return 0; }
+static inline int64_t plat_spinhot_ns(void) { return 0; }
 #endif
 static inline int64_t plat_spin_ns(void) {
-    static int64_t ns = -1, hot = -1;
+    static int64_t ns = -1;
     if (ns < 0) {
-        const char *e = getenv("SMO_SPINHOT_US");
-        hot = (e ? atoll(e) : PLAT_SPINHOT_DEFAULT_US) * 1000;
-        e = getenv("SMO_SPINWAIT_US");
+        const char *e = getenv("SMO_SPINWAIT_US");
         ns = (e ? atoll(e) : PLAT_SPIN_DEFAULT_US) * 1000;
     }
-    return plat_spin_is_hot() ? hot : ns;
+    return plat_spin_is_hot() ? plat_spinhot_ns() : ns;
 }
 /* Spins while cond holds, at most plat_spin_ns(); cond reads shared state with atomic loads. */
 #define PLAT_SPIN_WHILE(cond) do { \

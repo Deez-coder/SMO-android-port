@@ -36,6 +36,10 @@ public class GameActivity extends NativeActivity {
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);      /* a first start, a cutscene, a controller: no touches for minutes */
+        /* Heat (2026-11-03): every touch raised the display to 120 Hz for as long as fingers were on it (Samsung, Android
+         * 16: the touch controls kept it there for whole sessions), whatever rate the game asks for (android_main.c). The
+         * game shows 30 or 60 frames a second: the refreshes above that only cost power. Android 15+. */
+        if (android.os.Build.VERSION.SDK_INT >= 35) getWindow().setFrameRateBoostOnTouchEnabled(false);
         fullScreen(this);
         showLoading();
     }

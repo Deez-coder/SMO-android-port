@@ -252,6 +252,22 @@ struct plat_thread { pthread_t t; plat_thread_fn fn; void *arg; volatile uint32_
 
 static void *thread_main(void *p) {
     plat_thread *t = p;
+    {   /* A thread held on one processor keeps it for itself: its new threads do not inherit that. Measured on a Galaxy
+         * S24 Ultra (2026-11-03): the render thread, held on the Cortex-X4, started the pipeline workers (6), the watchdog
+         * and the pf_threads helper, and all of them ran on its one processor. They get every other processor now;
+         * threads that choose their own (the render thread, the console's cores: os_threads.c) still do so after. */
+        cpu_set_t s;
+        CPU_ZERO(&s);
+        if (sched_getaffinity(0, sizeof s, &s) == 0 && CPU_COUNT(&s) == 1) {
+            int n = plat_cpu_count(), one = -1;
+            for (int i = 0; i < n && i < CPU_SETSIZE; i++) if (CPU_ISSET(i, &s)) one = i;
+            if (n > 1 && one >= 0) {
+                CPU_ZERO(&s);
+                for (int i = 0; i < n && i < CPU_SETSIZE; i++) if (i != one) CPU_SET(i, &s);
+                sched_setaffinity(0, sizeof s, &s);
+            }
+        }
+    }
     t->tid = plat_tid();
     if (t->name[0]) pthread_setname_np(pthread_self(), t->name);
     t->fn(t->arg);
@@ -358,6 +374,7 @@ void plat_event_reset(plat_event *e) {
 }
 
 _Thread_local int plat_spin_hot_;                     /* plat.h: spinning before blocking */
+int64_t plat_spinhot_ns_ = -1;                        /* plat.h: the hot threads' spin; -1 until SMO_SPINHOT_US is read */
 
 int plat_event_wait(plat_event *e, uint32_t ms) {
     if (ms) PLAT_SPIN_WHILE(!__atomic_load_n(&e->set, __ATOMIC_ACQUIRE));         /* plat.h: spinning before blocking */

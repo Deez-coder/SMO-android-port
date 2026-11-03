@@ -22,6 +22,7 @@
 #include <sys/types.h>
 #include <android/thermal.h>
 #include "gfx_options.h"
+#include "plat.h"
 
 const char *plat_data_root(void);                    /* plat.h */
 
@@ -62,7 +63,7 @@ static int perf_on(void) {
     g_boost = (e = getenv("SMO_PERF_BOOST")) && atoi(e);
     g_state = p_get_manager && p_create && p_report && p_close;
     printf("android_perf: performance hints %s\n", g_state ? "available (APerformanceHint): the game's threads get the clocks a 60 fps frame needs" : "not on this system (Android 13+ has them)");
-    if (g_state) printf("android_perf: target %.2f ms, boost %s (power-efficiency call %s, workload-rise call %s)\n", g_target_ns / 1e6,
+    if (g_state) printf("android_perf: target %.2f ms, SMO_PERF_BOOST %s (power-efficiency call %s, workload-rise call %s)\n", g_target_ns / 1e6,
                         g_boost ? "on" : "off", p_prefer_efficiency ? "there" : "missing", p_workload_increase ? "there" : "missing");
     return g_state;
 }
@@ -150,8 +151,81 @@ static void perf_line(int64_t dt) {
     total = 0;
 }
 
+/* SMO_SPIN_TEST=1, a measuring aid: <files>/config/spinhot holds the hot threads' spin in microseconds (plat.h
+ * plat_spinhot_ns), read every 60 frames; no file: 0. (A utilization floor through sched_setattr UTIL_CLAMP_MIN was
+ * tried first: Android refuses it to apps, EPERM for every thread, 2026-11-03.) */
+static void spin_test_poll(void) {
+    static int on = -1, frames;
+    static long cur = -1;
+    if (on < 0) on = getenv("SMO_SPIN_TEST") && atoi(getenv("SMO_SPIN_TEST"));
+    if (!on || ++frames % 60) return;
+    char path[512];
+    snprintf(path, sizeof path, "%s/config/spinhot", plat_data_root());
+    long us = 0;
+    FILE *f = fopen(path, "r");
+    if (f) { if (fscanf(f, "%ld", &us) != 1) us = 0; fclose(f); }
+    if (us < 0) us = 0;
+    if (us == cur) return;
+    plat_spinhot_set_ns((int64_t)us * 1000);
+    printf("android_perf: hot threads spin %ld us before they block (SMO_SPIN_TEST)%c", us, 10);
+    cur = us;
+}
+
+/* graphics.ini boost = auto (the default): the hot threads (plat_spin_mark_hot: render thread, the game thread that
+ * presents) spin before they block while the frames are late, and do not when they are on time. Measured in Cascade's
+ * waterfall view (1,300 draws, 30 fps mode, S24 Ultra): the governor kept the mid cores at 0.5-1.4 GHz and the frame at
+ * 25.5 fps; a 16 ms spin raised them to 1.8-2.0 GHz and the frame to 29.3-29.8 fps, but the chip warmed ~2 C a minute
+ * where it cooled ~2 C without, so it runs only where it is needed (2026-11-03).
+ * One-second windows of frames (a frame over 100 ms, a loading pause, is left out): two windows in a row whose average
+ * frame is 5% over the target (frame_rate 30: 33.3 ms, fps_cap: its frame, else 16.7 ms) turn it on, for at least 10 s;
+ * then it goes off to see whether the frames keep up without it. A view that is still heavy turns it back on within
+ * seconds, and then it stays on twice as long (at most 2 minutes) before the next look. boost = on: always on.
+ * SMO_SPINHOT_US or SMO_SPIN_TEST set: the spin they give, nothing automatic. */
+#define BOOST_SPIN_NS   16000000
+#define BOOST_HOLD_NS   10000000000LL
+#define BOOST_HOLD_MAX  120000000000LL
+static void boost_frame(int64_t now, int64_t dt) {
+    static int mode = -1, on, slow_run;
+    static int64_t target, win_sum, win_start, hold = BOOST_HOLD_NS, until, off_at;
+    static int win_n;
+    if (mode < 0) {
+        const GfxOptions *o = gfx_options();
+        mode = o->boost && !getenv("SMO_SPINHOT_US") && !(getenv("SMO_SPIN_TEST") && atoi(getenv("SMO_SPIN_TEST")));
+        target = o->fps30 ? 33333333 : o->fps_cap ? 1000000000LL / o->fps_cap : 16666667;
+        if (mode && o->boost == 2) mode = 2;
+        printf("android_perf: CPU boost %s%c", mode == 2 ? "on (graphics.ini boost = on: the frame's threads always spin)" : mode ? "auto (the frame's threads spin while the frames are late)" : "off", 10);
+        if (mode) plat_spinhot_set_ns(mode == 2 ? BOOST_SPIN_NS : 0);
+    }
+    if (mode != 1 || dt <= 0 || dt > 100000000) return;
+    if (!win_n) win_start = now;
+    win_sum += dt;
+    win_n++;
+    if (now - win_start < 1000000000) return;
+    int slow = win_sum > (int64_t)win_n * target / 100 * 105;
+    double fps = win_n * 1e9 / (double)win_sum;
+    win_sum = 0;
+    win_n = 0;
+    if (on) {
+        if (now < until) return;
+        on = 0;
+        slow_run = 0;
+        off_at = now;
+        plat_spinhot_set_ns(0);
+        printf("android_perf: CPU boost off, %.1f fps with it (a look whether the frames keep up without)%c", fps, 10);
+        return;
+    }
+    slow_run = slow ? slow_run + 1 : 0;
+    if (slow_run < 2) return;
+    hold = off_at && now - off_at < 8000000000LL ? (hold * 2 > BOOST_HOLD_MAX ? BOOST_HOLD_MAX : hold * 2) : BOOST_HOLD_NS;
+    on = 1;
+    until = now + hold;
+    plat_spinhot_set_ns(BOOST_SPIN_NS);
+    printf("android_perf: CPU boost on for %.0f s, %.1f fps without it%c", hold / 1e9, fps, 10);
+}
+
 /* After a present, on the render thread: the time since the present before. */
 void android_perf_frame(void) {
+    spin_test_poll();
     static int64_t last_ns;
     static int spun, frames;
     if (!spun && getenv("SMO_SPIN") && ++frames % 30 == 0) {
@@ -164,6 +238,7 @@ void android_perf_frame(void) {
     int64_t now = (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec, dt = last_ns ? now - last_ns : 0;
     last_ns = now;
     perf_line(dt);
+    boost_frame(now, dt);
     if (!perf_on()) return;
     pthread_mutex_lock(&g_lock);
     if (g_dirty && g_ntids) {                      /* threads came (or the first frame): the session's thread list */

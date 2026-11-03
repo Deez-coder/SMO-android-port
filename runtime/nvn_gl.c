@@ -5392,7 +5392,7 @@ static void cmd_tess_levels(Ctx *c) {                   /* (cmdbuf, const float 
     if (src) memcpy(BLOB(m), P(src), outer ? 16 : 8);
 }
 static void cmd_barrier(Ctx *c) { rec(c, OP_BARRIER, 0); }
-static void cmd_discard_color(Ctx *c) { rec(c, OP_DISCARD, 0); }
+static void cmd_discard_color(Ctx *c) { rec(c, OP_DISCARD, 0)->a[0] = A1 & 7; }      /* (cmdbuf, index) */
 static void cmd_discard_ds(Ctx *c) { rec(c, OP_DISCARD, 0)->a[0] = ~0ull; }
 static void cmd_clear_color_typed(Ctx *c) {             /* ClearColori / ClearColorui (cmdbuf, index, const int *, mask) */
     uint64_t src = A2;

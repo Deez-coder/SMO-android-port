@@ -68,6 +68,11 @@ static const char *const k_default_ini =
 ";   frame, so below 60 it runs in slow motion; frame_rate = 30 keeps full speed and is used instead when set.\r\n"
 "fps_cap = 60\r\n"
 "\r\n"
+"; boost = auto | on | off      (Android) auto: while frames come later than the frame rate asks, the threads that set it\r\n"
+";   keep their CPUs busy instead of sleeping, so the phone raises the clocks (more fps in heavy scenes, more heat\r\n"
+";   while it is on); it stops by itself when the frames are on time again. on: always, also where it gains nothing.\r\n"
+"boost = auto\r\n"
+"\r\n"
 "; anti_aliasing = off | fxaa      (Vulkan) fxaa: edges smoothed on the final picture; a little softer, cheap\r\n"
 "anti_aliasing = off\r\n"
 "\r\n"
@@ -141,7 +146,7 @@ static void opt_load(void) {
     GfxOptions *o = &g_opt;
     int written = 0, unknown = 0;
     memset(o, 0, sizeof *o);
-    o->width = 1280; o->height = 720; o->scale = 0.0f; o->window_mode = 3; o->fps_counter = 1; o->dynres = 1;
+    o->width = 1280; o->height = 720; o->scale = 0.0f; o->window_mode = 3; o->fps_counter = 1; o->dynres = 1; o->boost = 1;
     opt_path(o->path);
     FILE *f = fopen(o->path, "rb");
     if (!f) {
@@ -174,6 +179,7 @@ static void opt_load(void) {
         else if (!plat_stricmp(key, "sharpening")) { float v = (float)atof(val); o->sharpen = v < 0 ? 0 : v > 100 ? 1.0f : v / 100.0f; }
         else if (!plat_stricmp(key, "dynamic_resolution")) o->dynres = plat_stricmp(val, "off") != 0;
         else if (!plat_stricmp(key, "anti_aliasing")) o->fxaa = !plat_stricmp(val, "fxaa");
+        else if (!plat_stricmp(key, "boost")) o->boost = !plat_stricmp(val, "off") ? 0 : !plat_stricmp(val, "on") ? 2 : 1;
         else if (!plat_stricmp(key, "fps_counter")) o->fps_counter = plat_stricmp(val, "off") != 0;
         else if (!plat_stricmp(key, "driver")) o->driver_system = !plat_stricmp(val, "system");
         else if (!plat_stricmp(key, "shader_wait")) o->shader_skip = !plat_stricmp(val, "skip");

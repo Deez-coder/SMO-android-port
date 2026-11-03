@@ -323,7 +323,8 @@ static int g_pe_on = -1;
 #define PT_MAX 400
 static int g_pt_frame = -2, g_pt_on, g_pt_n;
 static VkQueryPool g_pt_pool;
-static struct { int w, h, ncol, cfmt, dfmt; int64_t d0, d1; } g_pt[PT_MAX];
+static struct { int w, h, ncol, cfmt, dfmt; int64_t d0, d1; unsigned load, clear, disc, why; } g_pt[PT_MAX];     /* load / clear: attachments begun with LOAD / CLEAR; disc: discarded while the pass ran (bits 0..7 colour, 8 depth-stencil); why: what ended it */
+static int g_pt_dout;                              /* discards outside a pass in that frame */
 static void pt_mark(int end) {
     if (!g_pt_on || g_pt_n >= PT_MAX) return;
     vkCmdWriteTimestamp(R.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_pt_pool, (uint32_t)(g_pt_n * 2 + end));
@@ -1707,6 +1708,9 @@ static int pass_begin(void) {
     if (g_pt_on && g_pt_n < PT_MAX) {
         g_pt[g_pt_n].w = w; g_pt[g_pt_n].h = h; g_pt[g_pt_n].ncol = R.ncol; g_pt[g_pt_n].d0 = R.frame_draws;
         g_pt[g_pt_n].cfmt = R.ncol && R.col[0].tex ? (int)R.col[0].tex->b.format : 0; g_pt[g_pt_n].dfmt = R.depth.tex ? (int)R.depth.tex->b.format : 0;
+        g_pt[g_pt_n].load = g_pt[g_pt_n].clear = g_pt[g_pt_n].disc = 0;
+        for (int i = 0; i < R.ncol; i++) if (ca[i].imageView) { if (ca[i].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) g_pt[g_pt_n].load |= 1u << i; else g_pt[g_pt_n].clear |= 1u << i; }
+        if (ri.pDepthAttachment || ri.pStencilAttachment) { if (da.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) g_pt[g_pt_n].load |= 0x100; else g_pt[g_pt_n].clear |= 0x100; }
         pt_mark(0);
     }
     ri.renderArea.extent.width = (uint32_t)w; ri.renderArea.extent.height = (uint32_t)h; ri.layerCount = 1; ri.colorAttachmentCount = (uint32_t)R.ncol; ri.pColorAttachments = ca;
@@ -3235,7 +3239,10 @@ static void exec(const Cmd *m, int depth) {
     const uint8_t *blob = BLOB(m);
     const uint64_t *a = m->a;
     switch (m->op) {
-    case OP_NOP: case OP_DEBUG: case OP_DISCARD: case OP_CONSDILATE: case OP_SUBPIXEL: break;
+    case OP_NOP: case OP_DEBUG: case OP_CONSDILATE: case OP_SUBPIXEL: break;
+    case OP_DISCARD:                               /* the game no longer needs an attachment's contents (a[0]: colour index, ~0 depth-stencil); counted with SMO_VK_PASSTIME */
+        if (g_pt_on) { if (R.in_pass && g_pt_n < PT_MAX) g_pt[g_pt_n].disc |= a[0] == ~0ull ? 0x100u : 1u << (a[0] & 7); else g_pt_dout++; }
+        break;
     case OP_TEXPOOL: R.tpool = P(a[0]); break;
     case OP_SMPPOOL: R.spool = P(a[0]); break;
     case OP_PROGRAM:
@@ -3891,26 +3898,86 @@ static void swapchain_views(int make) {
  * format; one descriptor set per frame from a ring of 16 (8 command buffers are in flight at most). Returns 0 when it
  * cannot draw (no view of the swapchain image): the caller blits as before. The swapchain image is TRANSFER_DST before
  * and after (the blitted overlays follow). */
-static struct { VkDescriptorSetLayout dsl; VkPipelineLayout layout; VkDescriptorPool pool; VkDescriptorSet sets[16]; VkSampler smp; VkShaderModule vs, fs;
-                struct { VkFormat fmt; VkPipeline p; } pipe[4]; int npipe, next, failed;
+static struct { VkDescriptorSetLayout dsl; VkPipelineLayout layout; VkDescriptorPool pool; VkDescriptorSet sets[16]; VkSampler smp; VkShaderModule vs, fs, ovs, ofs;
+                struct { VkFormat fmt; VkPipeline p, po; } pipe[4]; int npipe, next, failed;      /* po: the touch controls' */
                 VkBuffer ubo; VMem ubo_mem;                /* the overlay: 16 slices of OV_BYTES, one per descriptor set */
                 int fps; int64_t fps_t0, fps_n; } g_pp;
 /* the overlay's uniform block (std140): shapes (x, y in the window 0..1, r in heights, kind 1 disc / 2 ring), colours,
  * info (count, fps, aspect of the window, opacity) */
 #define OV_SHAPES 24
-#define OV_BYTES 1024
-typedef struct { float sh[OV_SHAPES][4], col[OV_SHAPES][4], info[4], info2[4], glyph[OV_SHAPES]; } OvBlock;      /* info2.x: sharpening 0..1; glyph: 0 a plain disc, else the icon (the shader's glyph()) */
-static VkPipeline pp_pipeline(VkFormat fmt) {
-    for (int i = 0; i < g_pp.npipe; i++) if (g_pp.pipe[i].fmt == fmt) return g_pp.pipe[i].p;
+#define OV_BYTES 2048
+typedef struct { float sh[OV_SHAPES][4], col[OV_SHAPES][4], info[4], info2[4], glyph[OV_SHAPES], gs[43][4]; int32_t gr[9][4]; } OvBlock;      /* info2.x: sharpening 0..1; glyph: 0 a plain disc, else the icon (the shader's glyph()) */
+/* the letters' strokes (x0 y0 x1 y1, in a button of radius 1, y down) and each letter's first stroke and count (A B X Y
+ * house L R Z ~), read by the overlay shader from its uniform block: as constant arrays indexed by a variable the
+ * Adreno 750 (system driver) made them again for every pixel, 20 ms of GPU time a frame for the touch controls and the
+ * GPU clock held at 680..834 MHz instead of 231 (2026-11-03, heat) */
+static const float k_ov_gs[43][4] = {
+    {-0.32, 0.42, 0.0, -0.42}, {0.0, -0.42, 0.32, 0.42}, {-0.19, 0.1, 0.19, 0.1},      /* A */
+    {-0.24, -0.42, -0.24, 0.42}, {-0.24, -0.42, 0.1, -0.42}, {0.1, -0.42, 0.24, -0.3}, {0.24, -0.3, 0.24, -0.12}, {0.24, -0.12, 0.1, 0.0}, {-0.24, 0.0, 0.12, 0.0}, {0.12, 0.0, 0.28, 0.13}, {0.28, 0.13, 0.28, 0.29}, {0.28, 0.29, 0.12, 0.42}, {0.12, 0.42, -0.24, 0.42},      /* B */
+    {-0.3, -0.42, 0.3, 0.42}, {0.3, -0.42, -0.3, 0.42},      /* X */
+    {-0.3, -0.42, 0.0, 0.0}, {0.3, -0.42, 0.0, 0.0}, {0.0, 0.0, 0.0, 0.42},      /* Y */
+    {-0.48, 0.02, 0.0, -0.44}, {0.0, -0.44, 0.48, 0.02}, {-0.3, -0.14, -0.3, 0.4}, {0.3, -0.14, 0.3, 0.4}, {-0.3, 0.4, 0.3, 0.4},      /* a house */
+    {-0.2, -0.42, -0.2, 0.42}, {-0.2, 0.42, 0.26, 0.42},      /* L */
+    {-0.24, -0.42, -0.24, 0.42}, {-0.24, -0.42, 0.1, -0.42}, {0.1, -0.42, 0.26, -0.28}, {0.26, -0.28, 0.26, -0.12}, {0.26, -0.12, 0.1, 0.0}, {0.1, 0.0, -0.24, 0.0}, {0.02, 0.0, 0.28, 0.42},      /* R */
+    {-0.24, -0.42, 0.24, -0.42}, {0.24, -0.42, -0.24, 0.42}, {-0.24, 0.42, 0.26, 0.42},      /* Z */
+    {-0.46, 0.0, -0.345, -0.092}, {-0.345, -0.092, -0.23, -0.13}, {-0.23, -0.13, -0.115, -0.092}, {-0.115, -0.092, 0.0, 0.0}, {0.0, 0.0, 0.115, 0.092}, {0.115, 0.092, 0.23, 0.13}, {0.23, 0.13, 0.345, 0.092}, {0.345, 0.092, 0.46, 0.0},      /* ~ */
+};
+static const int32_t k_ov_gr[9][4] = {{0, 3}, {3, 10}, {13, 2}, {15, 3}, {18, 5}, {23, 2}, {25, 7}, {32, 3}, {35, 8}};
+/* the present pass's shaders, in parts: the picture (one triangle over the window) and the touch controls (one square
+ * per button, drawn over it: only the pixels under a button work out its shape). The 20 ms a frame the touch controls
+ * cost on an Adreno 750 was not the split's to fix (the time stayed the same): it was the letters' tables (k_ov_gs). */
+#define PP_HEAD \
+            "#version 460\n" \
+            "layout(push_constant) uniform PC { vec4 rect; vec4 crop; vec2 ext; int rot; } pc;\n"   /* rect: the picture in the window (0..1), crop: its part of the texture (uv) */ \
+            "layout(set = 0, binding = 0) uniform sampler2D src;\n" \
+            "layout(std140, set = 0, binding = 1) uniform OV { vec4 sh[24]; vec4 col[24]; vec4 info; vec4 info2; vec4 glyph[6]; vec4 gs[43]; ivec4 gr[9]; } ov;\n"   /* the overlay: touch controls, fps */ \
+            "layout(location = 0) out vec4 o;\n"
+#define PP_SHAPES \
+            "float sg(vec2 p, vec4 s) { vec2 pa = p - s.xy, ba = s.zw - s.xy; return length(pa - ba * clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0)); }\n" \
+            "float letter(int k, vec2 p, vec2 o, float sc) {\n" \
+            "  ivec2 r = ov.gr[k].xy; vec2 q = (p - o) / sc; float d = 1e9;\n" \
+            "  for (int j = 0; j < 10; j++) { if (j >= r.y) break; d = min(d, sg(q, ov.gs[r.x + j])); }\n" \
+            "  return d * sc;\n" \
+            "}\n" \
+            "float rbox(vec2 p, vec2 b, vec4 r) {\n"   /* a rounded box, corner radii top left, top right, bottom left, bottom right */ \
+            "  float rr = p.x < 0.0 ? (p.y < 0.0 ? r.x : r.z) : (p.y < 0.0 ? r.y : r.w);\n" \
+            "  vec2 q = abs(p) - b + rr; return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - rr;\n" \
+            "}\n" \
+            "float tri(vec2 p, vec2 p0, vec2 p1, vec2 p2) {\n"   /* signed distance to a triangle (after Inigo Quilez) */ \
+            "  vec2 e0 = p1 - p0, e1 = p2 - p1, e2 = p0 - p2, v0 = p - p0, v1 = p - p1, v2 = p - p2;\n" \
+            "  vec2 q0 = v0 - e0 * clamp(dot(v0, e0) / dot(e0, e0), 0.0, 1.0), q1 = v1 - e1 * clamp(dot(v1, e1) / dot(e1, e1), 0.0, 1.0), q2 = v2 - e2 * clamp(dot(v2, e2) / dot(e2, e2), 0.0, 1.0);\n" \
+            "  float sn = sign(e0.x * e2.y - e0.y * e2.x);\n" \
+            "  vec2 d = min(min(vec2(dot(q0, q0), sn * (v0.x * e0.y - v0.y * e0.x)), vec2(dot(q1, q1), sn * (v1.x * e1.y - v1.y * e1.x))), vec2(dot(q2, q2), sn * (v2.x * e2.y - v2.y * e2.x)));\n" \
+            "  return -sqrt(d.x) * sign(d.y);\n" \
+            "}\n" \
+            "float body(int g, vec2 p) {\n"   /* the button's outline, a signed distance: 6 7 the L R tabs, 8 9 ZL ZR, 10 11 + -, else a circle */ \
+            "  if (g == 6 || g == 7) return rbox(p, vec2(0.9, 0.62), vec4(0.22));\n" \
+            "  if (g == 8) return rbox(p, vec2(0.9, 0.62), vec4(0.55, 0.18, 0.18, 0.18));\n" \
+            "  if (g == 9) return rbox(p, vec2(0.9, 0.62), vec4(0.18, 0.55, 0.18, 0.18));\n" \
+            "  if (g == 10) return min(rbox(p, vec2(0.82, 0.27), vec4(0.06)), rbox(p, vec2(0.27, 0.82), vec4(0.06)));\n" \
+            "  if (g == 11) return rbox(p, vec2(0.82, 0.25), vec4(0.06));\n" \
+            "  return length(p) - 0.86;\n" \
+            "}\n" \
+            "float glyph(int g, vec2 p) {\n"   /* the distance to its icon: 1-4 A B X Y, 5 a house, 6-9 L R ZL ZR, 12-15 arrows up right down left, 16 R3, 17 ~, 18 19 the sticks' knobs */ \
+            "  if (g <= 7) return letter(g - 1, p, vec2(0.0), 1.0);\n" \
+            "  if (g <= 9) return min(letter(7, p, vec2(-0.27, 0.0), 0.8), letter(g - 3, p, vec2(0.29, 0.0), 0.8));\n" \
+            "  if (g <= 11) return 1e9;\n" \
+            "  if (g <= 15) { vec2 q = p; for (int k = 0; k < 3; k++) if (k < g - 12) q = vec2(q.y, -q.x); return tri(q, vec2(0.0, -0.42), vec2(0.4, 0.28), vec2(-0.4, 0.28)) + 0.075; }\n" \
+            "  if (g == 16) return min(min(abs(length(p - vec2(0.0, 0.18)) - 0.44), letter(6, p, vec2(0.0, 0.18), 0.55)), tri(p, vec2(0.0, -0.33), vec2(0.2, -0.58), vec2(-0.2, -0.58)) + 0.075);\n" \
+            "  if (g == 17) return letter(8, p, vec2(0.0), 1.0);\n" \
+            "  return min(abs(length(p) - 0.56), letter(g == 18 ? 5 : 6, p, vec2(0.0), 0.62));\n" \
+            "}\n"
+static VkPipeline pp_pipeline(VkFormat fmt, VkPipeline *po) {
+    for (int i = 0; i < g_pp.npipe; i++) if (g_pp.pipe[i].fmt == fmt) { *po = g_pp.pipe[i].po; return g_pp.pipe[i].p; }
     if (g_pp.npipe >= 4) return VK_NULL_HANDLE;
     if (!g_pp.layout) {
         uint64_t h;
         VkDescriptorSetLayoutBinding b[2] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
-                                             {1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}};
+                                             {1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, NULL}};
         VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
         li.bindingCount = 2; li.pBindings = b;
         VKC(vkCreateDescriptorSetLayout(V.device, &li, NULL, &g_pp.dsl));
-        VkPushConstantRange pc = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 48};
+        VkPushConstantRange pc = {VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 48};
         VkPipelineLayoutCreateInfo pl = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         pl.setLayoutCount = 1; pl.pSetLayouts = &g_pp.dsl; pl.pushConstantRangeCount = 1; pl.pPushConstantRanges = &pc;
         VKC(vkCreatePipelineLayout(V.device, &pl, NULL, &g_pp.layout));
@@ -3930,63 +3997,13 @@ static VkPipeline pp_pipeline(VkFormat fmt) {
         g_pp.vs = module_from_glsl(0, "#version 460\nvoid main() { vec2 p = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2); gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0); }\n",
                                    "present pass vertex", &h, NULL);
         g_pp.fs = module_from_glsl(1,
-            "#version 460\n"
-            "layout(push_constant) uniform PC { vec4 rect; vec4 crop; vec2 ext; int rot; } pc;\n"   /* rect: the picture in the window (0..1), crop: its part of the texture (uv) */
-            "layout(set = 0, binding = 0) uniform sampler2D src;\n"
-            "layout(std140, set = 0, binding = 1) uniform OV { vec4 sh[24]; vec4 col[24]; vec4 info; vec4 info2; vec4 glyph[6]; } ov;\n"   /* the overlay: touch controls, fps */
-            "layout(location = 0) out vec4 o;\n"
-            "const int SEG[10] = int[10](0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F);\n"
+            PP_HEAD
             "bool seg7(int d, vec2 p) {\n"                                                      /* p: 0..1 in the digit's box */
-            "  int m = SEG[d]; float t = 0.16;\n"
+            "  int m = int(((d < 4 ? 0x4F5B063Fu : d < 8 ? 0x077D6D66u : 0x6F7Fu) >> uint(8 * (d % 4))) & 0x7Fu); float t = 0.16;\n"   /* the segments of 0..9, packed: no array indexed by a variable (k_ov_gs) */
             "  bool h = p.x > t && p.x < 1.0 - t, up = p.y > t && p.y < 0.5, lo = p.y > 0.5 && p.y < 1.0 - t;\n"
             "  return ((m & 1) != 0 && p.y < t && h) || ((m & 2) != 0 && p.x > 1.0 - t && up) || ((m & 4) != 0 && p.x > 1.0 - t && lo) ||\n"
             "         ((m & 8) != 0 && p.y > 1.0 - t && h) || ((m & 16) != 0 && p.x < t && lo) || ((m & 32) != 0 && p.x < t && up) ||\n"
             "         ((m & 64) != 0 && abs(p.y - 0.5) < t * 0.5 && h);\n"
-            "}\n"
-            "const vec4 GS[43] = vec4[43](\n"   /* strokes (x0 y0 x1 y1) of the letters, in a button of radius 1, y down */
-            "  vec4(-0.32, 0.42, 0.0, -0.42), vec4(0.0, -0.42, 0.32, 0.42), vec4(-0.19, 0.1, 0.19, 0.1),\n"   /* A */
-            "  vec4(-0.24, -0.42, -0.24, 0.42), vec4(-0.24, -0.42, 0.1, -0.42), vec4(0.1, -0.42, 0.24, -0.3), vec4(0.24, -0.3, 0.24, -0.12), vec4(0.24, -0.12, 0.1, 0.0), vec4(-0.24, 0.0, 0.12, 0.0), vec4(0.12, 0.0, 0.28, 0.13), vec4(0.28, 0.13, 0.28, 0.29), vec4(0.28, 0.29, 0.12, 0.42), vec4(0.12, 0.42, -0.24, 0.42),\n"   /* B */
-            "  vec4(-0.3, -0.42, 0.3, 0.42), vec4(0.3, -0.42, -0.3, 0.42),\n"   /* X */
-            "  vec4(-0.3, -0.42, 0.0, 0.0), vec4(0.3, -0.42, 0.0, 0.0), vec4(0.0, 0.0, 0.0, 0.42),\n"   /* Y */
-            "  vec4(-0.48, 0.02, 0.0, -0.44), vec4(0.0, -0.44, 0.48, 0.02), vec4(-0.3, -0.14, -0.3, 0.4), vec4(0.3, -0.14, 0.3, 0.4), vec4(-0.3, 0.4, 0.3, 0.4),\n"   /* a house */
-            "  vec4(-0.2, -0.42, -0.2, 0.42), vec4(-0.2, 0.42, 0.26, 0.42),\n"   /* L */
-            "  vec4(-0.24, -0.42, -0.24, 0.42), vec4(-0.24, -0.42, 0.1, -0.42), vec4(0.1, -0.42, 0.26, -0.28), vec4(0.26, -0.28, 0.26, -0.12), vec4(0.26, -0.12, 0.1, 0.0), vec4(0.1, 0.0, -0.24, 0.0), vec4(0.02, 0.0, 0.28, 0.42),\n"   /* R */
-            "  vec4(-0.24, -0.42, 0.24, -0.42), vec4(0.24, -0.42, -0.24, 0.42), vec4(-0.24, 0.42, 0.26, 0.42),\n"   /* Z */
-            "  vec4(-0.46, 0.0, -0.345, -0.092), vec4(-0.345, -0.092, -0.23, -0.13), vec4(-0.23, -0.13, -0.115, -0.092), vec4(-0.115, -0.092, 0.0, 0.0), vec4(0.0, 0.0, 0.115, 0.092), vec4(0.115, 0.092, 0.23, 0.13), vec4(0.23, 0.13, 0.345, 0.092), vec4(0.345, 0.092, 0.46, 0.0));\n"   /* ~ */
-            "const ivec2 GR[9] = ivec2[9](ivec2(0, 3), ivec2(3, 10), ivec2(13, 2), ivec2(15, 3), ivec2(18, 5), ivec2(23, 2), ivec2(25, 7), ivec2(32, 3), ivec2(35, 8));\n"   /* first stroke, count: A B X Y house L R Z ~ */
-            "float sg(vec2 p, vec4 s) { vec2 pa = p - s.xy, ba = s.zw - s.xy; return length(pa - ba * clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0)); }\n"
-            "float letter(int k, vec2 p, vec2 o, float sc) {\n"
-            "  ivec2 r = GR[k]; vec2 q = (p - o) / sc; float d = 1e9;\n"
-            "  for (int j = 0; j < 10; j++) { if (j >= r.y) break; d = min(d, sg(q, GS[r.x + j])); }\n"
-            "  return d * sc;\n"
-            "}\n"
-            "float rbox(vec2 p, vec2 b, vec4 r) {\n"   /* a rounded box, corner radii top left, top right, bottom left, bottom right */
-            "  float rr = p.x < 0.0 ? (p.y < 0.0 ? r.x : r.z) : (p.y < 0.0 ? r.y : r.w);\n"
-            "  vec2 q = abs(p) - b + rr; return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - rr;\n"
-            "}\n"
-            "float tri(vec2 p, vec2 p0, vec2 p1, vec2 p2) {\n"   /* signed distance to a triangle (after Inigo Quilez) */
-            "  vec2 e0 = p1 - p0, e1 = p2 - p1, e2 = p0 - p2, v0 = p - p0, v1 = p - p1, v2 = p - p2;\n"
-            "  vec2 q0 = v0 - e0 * clamp(dot(v0, e0) / dot(e0, e0), 0.0, 1.0), q1 = v1 - e1 * clamp(dot(v1, e1) / dot(e1, e1), 0.0, 1.0), q2 = v2 - e2 * clamp(dot(v2, e2) / dot(e2, e2), 0.0, 1.0);\n"
-            "  float sn = sign(e0.x * e2.y - e0.y * e2.x);\n"
-            "  vec2 d = min(min(vec2(dot(q0, q0), sn * (v0.x * e0.y - v0.y * e0.x)), vec2(dot(q1, q1), sn * (v1.x * e1.y - v1.y * e1.x))), vec2(dot(q2, q2), sn * (v2.x * e2.y - v2.y * e2.x)));\n"
-            "  return -sqrt(d.x) * sign(d.y);\n"
-            "}\n"
-            "float body(int g, vec2 p) {\n"   /* the button's outline, a signed distance: 6 7 the L R tabs, 8 9 ZL ZR, 10 11 + -, else a circle */
-            "  if (g == 6 || g == 7) return rbox(p, vec2(0.9, 0.62), vec4(0.22));\n"
-            "  if (g == 8) return rbox(p, vec2(0.9, 0.62), vec4(0.55, 0.18, 0.18, 0.18));\n"
-            "  if (g == 9) return rbox(p, vec2(0.9, 0.62), vec4(0.18, 0.55, 0.18, 0.18));\n"
-            "  if (g == 10) return min(rbox(p, vec2(0.82, 0.27), vec4(0.06)), rbox(p, vec2(0.27, 0.82), vec4(0.06)));\n"
-            "  if (g == 11) return rbox(p, vec2(0.82, 0.25), vec4(0.06));\n"
-            "  return length(p) - 0.86;\n"
-            "}\n"
-            "float glyph(int g, vec2 p) {\n"   /* the distance to its icon: 1-4 A B X Y, 5 a house, 6-9 L R ZL ZR, 12-15 arrows up right down left, 16 R3, 17 ~, 18 19 the sticks' knobs */
-            "  if (g <= 7) return letter(g - 1, p, vec2(0.0), 1.0);\n"
-            "  if (g <= 9) return min(letter(7, p, vec2(-0.27, 0.0), 0.8), letter(g - 3, p, vec2(0.29, 0.0), 0.8));\n"
-            "  if (g <= 11) return 1e9;\n"
-            "  if (g <= 15) { vec2 q = p; for (int k = 0; k < 3; k++) if (k < g - 12) q = vec2(q.y, -q.x); return tri(q, vec2(0.0, -0.42), vec2(0.4, 0.28), vec2(-0.4, 0.28)) + 0.075; }\n"
-            "  if (g == 16) return min(min(abs(length(p - vec2(0.0, 0.18)) - 0.44), letter(6, p, vec2(0.0, 0.18), 0.55)), tri(p, vec2(0.0, -0.33), vec2(0.2, -0.58), vec2(-0.2, -0.58)) + 0.075);\n"
-            "  if (g == 17) return letter(8, p, vec2(0.0), 1.0);\n"
-            "  return min(abs(length(p) - 0.56), letter(g == 18 ? 5 : 6, p, vec2(0.0), 0.62));\n"
             "}\n"
             "float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }\n"
             "vec3 fxaa(vec2 uv) {\n"                                                       /* anti_aliasing = fxaa: blend along an edge found from the luma of the neighbours */
@@ -4020,23 +4037,8 @@ static VkPipeline pp_pipeline(VkFormat fmt) {
             "  vec3 w = -amp * mix(0.125, 0.2, k);\n"
             "  return clamp((c + w * (a + b + d + e)) / (1.0 + 4.0 * w), 0.0, 1.0);\n"
             "}\n"
-            "vec3 overlay(vec3 c, vec2 l) {\n"                                                   /* l: the pixel in the window, 0..1 */
-            "  float asp = ov.info.z, op = ov.info.w;\n"
-            "  for (int i = 0; i < int(ov.info.x) % 100; i++) {\n"
-            "    vec4 s = ov.sh[i]; vec2 p = vec2((l.x - s.x) * asp, l.y - s.y) / s.z; float d = length(p);\n"
-            "    if (d > 1.15) continue;\n"
-            "    int g = int(ov.glyph[i / 4][i % 4]);\n"
-            "    if (s.w > 1.5 || g == 0) {\n"   /* rings (the stick bases, the on/off ring) and plain discs */
-            "      if (d > 1.0) continue;\n"
-            "      c = mix(c, ov.col[i].rgb, s.w > 1.5 ? (d > 0.88 ? op : 0.0) : (d > 0.85 ? min(1.0, op * 1.6) : op * ov.col[i].a));\n"
-            "      continue;\n"
-            "    }\n"
-            "    float px = 1.0 / (s.z * (pc.rot % 2 == 1 ? pc.ext.x : pc.ext.y)), db = body(g, p), io = min(1.0, op * 2.0);\n"   /* an icon button: a dark fill, a white outline and icon (dark on white while pressed); px: one pixel in its units */
-            "    vec3 ink = ov.col[i].a > 1.2 ? vec3(0.1) : vec3(1.0);\n"
-            "    c = mix(c, ov.col[i].rgb, clamp(0.5 - db / px, 0.0, 1.0) * op * ov.col[i].a);\n"
-            "    c = mix(c, ink, clamp((0.075 - abs(db)) / px + 0.5, 0.0, 1.0) * io);\n"
-            "    c = mix(c, ink, clamp((0.075 - glyph(g, p)) / px + 0.5, 0.0, 1.0) * io);\n"
-            "  }\n"
+            "vec3 fpsc(vec3 c, vec2 l) {\n"                                                      /* l: the pixel in the window, 0..1 */
+            "  float asp = ov.info.z;\n"
             "  int fps = int(ov.info.y);\n"                                                       /* the fps counter, top left */
             "  if (fps >= 0) {\n"
             "    vec2 q = vec2(l.x * asp, l.y) - vec2(0.02, 0.02); float dw = 0.028, dh = 0.05, gap = 0.012;\n"
@@ -4058,15 +4060,54 @@ static VkPipeline pp_pipeline(VkFormat fmt) {
             "  float r = max(length(dx * ts), length(dy * ts));\n"                          /* texels of the picture per screen pixel */
             "  vec3 c = (q.x < 0.0 || q.y < 0.0 || q.x > 1.0 || q.y > 1.0) ? vec3(0.0) : (r > 1.05 ? ssaa(uv, dx, dy, r) : ov.info.x >= 100.0 ? fxaa(uv) : texture(src, uv).rgb);\n"
             "  if (ov.info2.x > 0.0 && q.x >= 0.0 && q.y >= 0.0 && q.x <= 1.0 && q.y <= 1.0) c = sharpen(c, uv, dx, dy, ov.info2.x);\n"
-            "  o = vec4(overlay(c, l), 1.0);\n"
+            "  o = vec4(fpsc(c, l), 1.0);\n"
             "}\n", "present pass fragment", &h, NULL);
-        if (!g_pp.vs || !g_pp.fs) { printf("nvn_vk: the present pass's shaders were not made: the picture is blitted (not turned)\n"); g_pp.failed = 1; return VK_NULL_HANDLE; }
+        g_pp.ovs = module_from_glsl(0,                 /* a square around button gl_VertexIndex / 6, in the window as the app sees it, turned into the swapchain image */
+            "#version 460\n"
+            "layout(push_constant) uniform PC { vec4 rect; vec4 crop; vec2 ext; int rot; } pc;\n"
+            "layout(std140, set = 0, binding = 1) uniform OV { vec4 sh[24]; vec4 col[24]; vec4 info; vec4 info2; vec4 glyph[6]; vec4 gs[43]; ivec4 gr[9]; } ov;\n"
+            "layout(location = 0) flat out int si;\n"
+            "void main() {\n"
+            "  int i = gl_VertexIndex / 6, k = gl_VertexIndex % 6; vec4 s = ov.sh[i];\n"
+            "  vec2 c = vec2(k == 1 || k == 2 || k == 4 ? 1.0 : -1.0, k == 2 || k == 4 || k == 5 ? 1.0 : -1.0);\n"
+            "  vec2 l = s.xy + c * vec2(1.2 * s.z / ov.info.z, 1.2 * s.z);\n"      /* the fragment shader draws within 1.15 radii */
+            "  vec2 b = pc.rot == 1 ? vec2(1.0 - l.y, l.x) : pc.rot == 2 ? vec2(1.0 - l.x, 1.0 - l.y) : pc.rot == 3 ? vec2(l.y, 1.0 - l.x) : l;\n"   /* the inverse of the picture's turn */
+            "  gl_Position = vec4(b * 2.0 - 1.0, 0.0, 1.0); si = i;\n"
+            "}\n", "present pass touch controls vertex", &h, NULL);
+        g_pp.ofs = module_from_glsl(1,                 /* one button, premultiplied: blended over the picture as overlay() mixed it in (the layers in order) */
+            PP_HEAD
+            "layout(location = 0) flat in int si;\n"
+            PP_SHAPES
+            "void lay(inout vec4 r, vec3 c, float a) { a = clamp(a, 0.0, 1.0); r = vec4(r.rgb * (1.0 - a) + c * a, r.a * (1.0 - a) + a); }\n"
+            "void main() {\n"
+            "  vec2 b = gl_FragCoord.xy / pc.ext;\n"
+            "  vec2 l = pc.rot == 1 ? vec2(b.y, 1.0 - b.x) : pc.rot == 2 ? vec2(1.0 - b.x, 1.0 - b.y) : pc.rot == 3 ? vec2(1.0 - b.y, b.x) : b;\n"
+            "  float asp = ov.info.z, op = ov.info.w; int i = si;\n"
+            "  vec4 s = ov.sh[i]; vec2 p = vec2((l.x - s.x) * asp, l.y - s.y) / s.z; float d = length(p);\n"
+            "  if (d > 1.15) discard;\n"
+            "  int g = int(ov.glyph[i / 4][i % 4]); vec4 r = vec4(0.0);\n"
+            "  if (s.w > 1.5 || g == 0) {\n"   /* rings (the stick bases, the on/off ring) and plain discs */
+            "    if (d > 1.0) discard;\n"
+            "    lay(r, ov.col[i].rgb, s.w > 1.5 ? (d > 0.88 ? op : 0.0) : (d > 0.85 ? min(1.0, op * 1.6) : op * ov.col[i].a));\n"
+            "  } else {\n"
+            "    float px = 1.0 / (s.z * (pc.rot % 2 == 1 ? pc.ext.x : pc.ext.y)), db = body(g, p), io = min(1.0, op * 2.0);\n"   /* an icon button: a dark fill, a white outline and icon (dark on white while pressed); px: one pixel in its units */
+            "    vec3 ink = ov.col[i].a > 1.2 ? vec3(0.1) : vec3(1.0);\n"
+            "    lay(r, ov.col[i].rgb, clamp(0.5 - db / px, 0.0, 1.0) * op * ov.col[i].a);\n"
+            "    lay(r, ink, clamp((0.075 - abs(db)) / px + 0.5, 0.0, 1.0) * io);\n"
+            "    lay(r, ink, clamp((0.075 - glyph(g, p)) / px + 0.5, 0.0, 1.0) * io);\n"
+            "  }\n"
+            "  o = r;\n"
+            "}\n", "present pass touch controls fragment", &h, NULL);
+        if (!g_pp.vs || !g_pp.fs || !g_pp.ovs || !g_pp.ofs) { printf("nvn_vk: the present pass's shaders were not made: the picture is blitted (not turned)\n"); g_pp.failed = 1; return VK_NULL_HANDLE; }
     }
     VkPipelineShaderStageCreateInfo st[2];
     memset(st, 0, sizeof st);
     st[0].sType = st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     st[0].stage = VK_SHADER_STAGE_VERTEX_BIT; st[0].module = g_pp.vs; st[0].pName = "main";
     st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = g_pp.fs; st[1].pName = "main";
+    VkPipelineShaderStageCreateInfo sto[2];
+    memcpy(sto, st, sizeof st);
+    sto[0].module = g_pp.ovs; sto[1].module = g_pp.ofs;
     VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -4081,6 +4122,11 @@ static VkPipeline pp_pipeline(VkFormat fmt) {
     ba.colorWriteMask = 15;
     VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     cb.attachmentCount = 1; cb.pAttachments = &ba;
+    VkPipelineColorBlendAttachmentState bo = ba;
+    bo.blendEnable = VK_TRUE; bo.colorBlendOp = bo.alphaBlendOp = VK_BLEND_OP_ADD;
+    bo.srcColorBlendFactor = bo.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE; bo.dstColorBlendFactor = bo.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    VkPipelineColorBlendStateCreateInfo cbo = cb;
+    cbo.pAttachments = &bo;
     VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
     VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
     dy.dynamicStateCount = 2; dy.pDynamicStates = dyn;
@@ -4089,16 +4135,20 @@ static VkPipeline pp_pipeline(VkFormat fmt) {
     VkGraphicsPipelineCreateInfo gi = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     gi.pNext = &ri; gi.stageCount = 2; gi.pStages = st; gi.pVertexInputState = &vi; gi.pInputAssemblyState = &ia; gi.pViewportState = &vp;
     gi.pRasterizationState = &rs; gi.pMultisampleState = &ms; gi.pColorBlendState = &cb; gi.pDynamicState = &dy; gi.layout = g_pp.layout;
+    VkGraphicsPipelineCreateInfo go = gi;
+    go.pStages = sto; go.pColorBlendState = &cbo;
     VkPipeline p = VK_NULL_HANDLE;
-    if (vkCreateGraphicsPipelines(V.device, NULL, 1, &gi, NULL, &p) != VK_SUCCESS) { printf("nvn_vk: the present pass's pipeline was not made: the picture is blitted (not turned)\n"); g_pp.failed = 1; return VK_NULL_HANDLE; }
-    g_pp.pipe[g_pp.npipe].fmt = fmt; g_pp.pipe[g_pp.npipe].p = p; g_pp.npipe++;
+    *po = VK_NULL_HANDLE;
+    if (vkCreateGraphicsPipelines(V.device, NULL, 1, &gi, NULL, &p) != VK_SUCCESS || vkCreateGraphicsPipelines(V.device, NULL, 1, &go, NULL, po) != VK_SUCCESS) { printf("nvn_vk: the present pass's pipeline was not made: the picture is blitted (not turned)\n"); g_pp.failed = 1; return VK_NULL_HANDLE; }
+    g_pp.pipe[g_pp.npipe].fmt = fmt; g_pp.pipe[g_pp.npipe].p = p; g_pp.pipe[g_pp.npipe].po = *po; g_pp.npipe++;
     return p;
 }
 static int present_pass(uint32_t index, VTex *vt, const int *s4) {
     if (!g_pp.failed && V.image_count && !V.views[0]) swapchain_views(1);      /* the first present on this swapchain (the device's functions are loaded by now) */
     if (g_pp.failed || index >= 16 || !V.views[index] || !vt || vt->samples != 1 || vt->aspect != VK_IMAGE_ASPECT_COLOR_BIT || vt->is3d) return 0;
-    VkPipeline p = pp_pipeline(V.format.format);
+    VkPipeline po, p = pp_pipeline(V.format.format, &po);
     if (!p) return 0;
+    int nshape = 0;
     EView e;
     eview_of(vt->t, vt, NULL, &e);
     e.target = 1; e.lvl0 = 0; e.nlvl = 1; e.lay0 = 0; e.nlay = 1;
@@ -4112,7 +4162,7 @@ static int present_pass(uint32_t index, VTex *vt, const int *s4) {
         TouchShape ts[OV_SHAPES];
         float op = 0.45f;
         memset(&ob, 0, sizeof ob);
-        int n = android_touch_shapes(ts, OV_SHAPES, &op);
+        int n = nshape = android_touch_shapes(ts, OV_SHAPES, &op);
         for (int i = 0; i < n; i++) {
             const char *lb = ts[i].label;
             static const char *k_glyph[] = {"", "A", "B", "X", "Y", "EX", "L", "R", "ZL", "ZR", "+", "-", "^", ">", "v", "<", "R3", "~", "LS", "RS"};
@@ -4137,6 +4187,7 @@ static int present_pass(uint32_t index, VTex *vt, const int *s4) {
         ob.info2[0] = gfx_options()->sharpen;
         ob.info[0] = (float)n + (gfx_options()->fxaa ? 100.0f : 0.0f); ob.info[1] = show_fps ? (float)(g_pp.fps > 999 ? 999 : g_pp.fps) : -1.0f;
         ob.info[2] = (float)(V.rot & 1 ? BHo : BWo) / (float)(V.rot & 1 ? BWo : BHo); ob.info[3] = op;
+        memcpy(ob.gs, k_ov_gs, sizeof ob.gs); memcpy(ob.gr, k_ov_gr, sizeof ob.gr);
         memcpy((uint8_t *)g_pp.ubo_mem.map + (size_t)slot * OV_BYTES, &ob, sizeof ob);
     }
     VkDescriptorImageInfo ii = {g_pp.smp, src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
@@ -4159,15 +4210,22 @@ static int present_pass(uint32_t index, VTex *vt, const int *s4) {
     ca.imageView = V.views[index]; ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; ca.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO};
     ri.renderArea.extent = V.extent; ri.layerCount = 1; ri.colorAttachmentCount = 1; ri.pColorAttachments = &ca;
+    if (g_pt_on && g_pt_n < PT_MAX) {              /* SMO_VK_PASSTIME: this pass too (format -1: the window's) */
+        memset(&g_pt[g_pt_n], 0, sizeof g_pt[0]);
+        g_pt[g_pt_n].w = BW; g_pt[g_pt_n].h = BH; g_pt[g_pt_n].ncol = 1; g_pt[g_pt_n].cfmt = -1; g_pt[g_pt_n].d0 = g_pt[g_pt_n].d1 = R.frame_draws;
+        pt_mark(0);
+    }
     vkCmdBeginRendering(R.cmd, &ri);
     VkViewport vpt = {0, 0, (float)BW, (float)BH, 0, 1};
     VkRect2D sc = {{0, 0}, V.extent};
     vkCmdBindPipeline(R.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
     vkCmdSetViewport(R.cmd, 0, 1, &vpt); vkCmdSetScissor(R.cmd, 0, 1, &sc);
     vkCmdBindDescriptorSets(R.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pp.layout, 0, 1, &set, 0, NULL);
-    vkCmdPushConstants(R.cmd, g_pp.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, &pc);
+    vkCmdPushConstants(R.cmd, g_pp.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, &pc);
     vkCmdDraw(R.cmd, 3, 1, 0, 0);
+    if (nshape > 0) { vkCmdBindPipeline(R.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, po); vkCmdDraw(R.cmd, 6u * (uint32_t)nshape, 1, 0, 0); }      /* the touch controls, one square each */
     vkCmdEndRendering(R.cmd);
+    if (g_pt_on && g_pt_n < PT_MAX && g_pt[g_pt_n].cfmt == -1) pt_mark(1);
     image_barrier(V.images[index], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     R.pipe_bound = NULL; R.dyn_dirty = 1;          /* our own pipeline and dynamic state: the game's draws set theirs again */
     android_touch_aspect((float)LW / (float)(LH > 0 ? LH : 1));
@@ -4526,6 +4584,9 @@ swap: ;
                        (double)(ts[g_pt_n * 2 - 1] - ts[0]) * per);
                 for (int k = 0; k < g_pt_n && k < 15; k++) { int i = order[k]; printf("nvn_vk_passtime:   pass %3d: %6.2f ms  %4dx%-4d %d colour (format 0x%x) depth 0x%x, %lld draws\n", i, dur[i], g_pt[i].w, g_pt[i].h, g_pt[i].ncol, g_pt[i].cfmt, g_pt[i].dfmt, (long long)(g_pt[i].d1 - g_pt[i].d0)); }
                 for (int k = 0; k < g_pt_n && k < 15; k++) { int i = gord[k]; if (gap[i] > 0.05) printf("nvn_vk_passtime:   gap before pass %3d: %6.2f ms\n", i, gap[i]); }
+                printf("nvn_vk_passtime: every pass in order (load / clear / discarded in the pass: bits 0..7 colour, 0x100 depth); %d discards outside a pass\n", g_pt_dout);
+                for (int i = 0; i < g_pt_n; i++) printf("nvn_vk_passtime:   #%3d %6.3f ms gap %6.3f  %4dx%-4d %d col 0x%x depth 0x%x  load %03x clear %03x disc %03x  %lld draws\n", i, dur[i], gap[i], g_pt[i].w, g_pt[i].h, g_pt[i].ncol, g_pt[i].cfmt, g_pt[i].dfmt,
+                                                  g_pt[i].load, g_pt[i].clear, g_pt[i].disc, (long long)(g_pt[i].d1 - g_pt[i].d0));
             }
             free(ts);
         }
@@ -4565,7 +4626,7 @@ swap: ;
         if (!progress && g_pt_frame > 0 && frame + 1 == g_pt_frame && D.f12.hostQueryReset) {
             if (!g_pt_pool) { VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO}; qi.queryType = VK_QUERY_TYPE_TIMESTAMP; qi.queryCount = PT_MAX * 2; VKC(vkCreateQueryPool(V.device, &qi, NULL, &g_pt_pool)); }
             vkResetQueryPool(V.device, g_pt_pool, 0, PT_MAX * 2);
-            g_pt_n = 0; g_pt_on = 1;
+            g_pt_n = 0; g_pt_dout = 0; g_pt_on = 1;
         }
     }
     g_wd_where = 0;

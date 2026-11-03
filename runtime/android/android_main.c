@@ -346,11 +346,14 @@ static void on_cmd(struct android_app *app, int32_t cmd) {
         pthread_mutex_unlock(&g_win_lock);
         {   /* The game's frame rate, so the display runs at a rate that shows 60 frames a second evenly (a 120 Hz panel left
              * at its own choice showed frames paced by display.c's clock for one, two or three refreshes).
-             * SMO_FRAME_RATE=<fps> (0: not set). */
+             * SMO_FRAME_RATE=<fps> (0: not set). Heat (2026-11-03): COMPATIBILITY_DEFAULT, not FIXED_SOURCE. The compositor
+             * still raised a FIXED_SOURCE (video) vote to 120 Hz for every touch, and the touch controls kept the panel at
+             * 120 Hz for whole sessions. With DEFAULT (and GameActivity's touch boost off) 10 of 13 runs stayed at 60
+             * Hz after 8 swipes on a Galaxy S24 Ultra; three still went to 120. */
             const char *e = getenv("SMO_FRAME_RATE");
             float fps = e ? (float)atof(e) : 60.0f;
             if (fps > 0 && app->window) {
-                int r = ANativeWindow_setFrameRate(app->window, fps, ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE);
+                int r = ANativeWindow_setFrameRate(app->window, fps, getenv("SMO_FRAME_RATE_VIDEO") ? ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE : ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_DEFAULT);
                 printf("android: window frame rate %.0f fps asked for%s\n", fps, r ? " (refused)" : "");
             }
         }
