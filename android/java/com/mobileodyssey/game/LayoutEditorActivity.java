@@ -28,15 +28,16 @@ import java.util.Locale;
 
 public class LayoutEditorActivity extends Activity {
     /* The layout as made: the same table as k_buttons and k_stick in nnpad_android.c (keep the two in step). */
-    static final String[] KEYS = {"A", "B", "X", "Y", "L", "ZL", "R", "ZR", "MINUS", "PLUS", "R3", "SHAKE", "LEFT", "RIGHT", "UP", "DOWN", "LSTICK", "RSTICK"};
-    static final String[] LABELS = {"A", "B", "X", "Y", "L", "ZL", "R", "ZR", "-", "+", "R3", "~", "<", ">", "^", "v", "", ""};
+    static final String[] KEYS = {"A", "B", "X", "Y", "L", "ZL", "R", "ZR", "MINUS", "PLUS", "R3", "SHAKE", "LEFT", "RIGHT", "UP", "DOWN", "EXIT", "LSTICK", "RSTICK"};
+    static final String[] LABELS = {"A", "B", "X", "Y", "L", "ZL", "R", "ZR", "-", "+", "R3", "~", "<", ">", "^", "v", "\u2302", "", ""};
     static final float[][] DEF = {      /* x, y, radius in parts of the height */
         {0.930f, 0.700f, 0.070f}, {0.855f, 0.835f, 0.070f}, {0.855f, 0.565f, 0.070f}, {0.780f, 0.700f, 0.070f},
         {0.090f, 0.200f, 0.060f}, {0.090f, 0.070f, 0.055f}, {0.910f, 0.200f, 0.060f}, {0.910f, 0.070f, 0.055f},
         {0.420f, 0.060f, 0.045f}, {0.580f, 0.060f, 0.045f}, {0.690f, 0.880f, 0.050f}, {0.690f, 0.540f, 0.055f},
         {0.250f, 0.870f, 0.042f}, {0.330f, 0.870f, 0.042f}, {0.290f, 0.790f, 0.042f}, {0.290f, 0.950f, 0.042f},
+        {0.250f, 0.060f, 0.040f},
         {0.140f, 0.700f, 0.130f}, {0.560f, 0.720f, 0.130f}};
-    static final int N = KEYS.length, LSTICK = 16, RSTICK = 17;
+    static final int N = KEYS.length, LSTICK = 17, RSTICK = 18;
 
     LauncherActivity.Ini ini;
     float[] x = new float[N], y = new float[N], size = new float[N];
@@ -123,7 +124,7 @@ public class LayoutEditorActivity extends Activity {
                 : name(sel) + ": size " + Math.round(size[sel] * 100) + "%");
         board.invalidate();
     }
-    String name(int i) { return i == LSTICK ? "Left stick" : i == RSTICK ? "Camera stick" : KEYS[i].charAt(0) + KEYS[i].substring(1).toLowerCase(Locale.ROOT); }
+    String name(int i) { return i == LSTICK ? "Left stick" : i == RSTICK ? "Camera stick" : i == 16 ? "Exit" : KEYS[i].charAt(0) + KEYS[i].substring(1).toLowerCase(Locale.ROOT); }
 
     Button tool(String s, View.OnClickListener l) {
         Button b = new Button(this);

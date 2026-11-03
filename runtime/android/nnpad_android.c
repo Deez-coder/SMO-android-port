@@ -40,7 +40,8 @@
 #include "nnpad.h"
 #include "android_host.h"
 
-enum { B_A, B_B, B_X, B_Y, B_LS, B_RS, B_L, B_R, B_ZL, B_ZR, B_PLUS, B_MINUS, B_LEFT, B_UP, B_RIGHT, B_DOWN, B_SHAKE = 32 };
+enum { B_A, B_B, B_X, B_Y, B_LS, B_RS, B_L, B_R, B_ZL, B_ZR, B_PLUS, B_MINUS, B_LEFT, B_UP, B_RIGHT, B_DOWN, B_SHAKE = 32,
+       B_EXIT = 33 };      /* not console buttons: SHAKE shakes the phone, EXIT asks to leave the game (android_main.c) */
 #define STICK_MAX 32767
 
 typedef struct {
@@ -68,6 +69,7 @@ static const TButton k_buttons[] = {
     {0.420f, 0.060f, 0.045f, B_MINUS, "-", "MINUS"}, {0.580f, 0.060f, 0.045f, B_PLUS, "+", "PLUS"}, {0.690f, 0.880f, 0.050f, B_RS, "R3", "R3"},
     {0.690f, 0.540f, 0.055f, B_SHAKE, "~", "SHAKE"},
     {0.250f, 0.870f, 0.042f, B_LEFT, "<", "LEFT"}, {0.330f, 0.870f, 0.042f, B_RIGHT, ">", "RIGHT"}, {0.290f, 0.790f, 0.042f, B_UP, "^", "UP"}, {0.290f, 0.950f, 0.042f, B_DOWN, "v", "DOWN"},
+    {0.250f, 0.060f, 0.040f, B_EXIT, "EX", "EXIT"},
 };
 #define NBUTTONS ((int)(sizeof k_buttons / sizeof k_buttons[0]))
 /* The player's layout (pos_ lines of controls.ini, load_config): the buttons, and where the left stick (0) and the camera
@@ -112,6 +114,7 @@ static int hit_button(float x, float y) {
 }
 void android_touch(int pointer, float x, float y, int down) {
     int64_t now = (int64_t)plat_ms64();
+    int ask_exit = 0;
     pthread_mutex_lock(&g_lock);
     g_last_touch_ms = now;
     Finger *f = NULL;
@@ -127,7 +130,7 @@ void android_touch(int pointer, float x, float y, int down) {
             g_cfg.touch_mode = g_cfg.touch_mode == 2 ? 0 : 2;
             save_touch_mode();
         } else if (g_cfg.touch_mode == 2) f->kind = 5;      /* controls off: the touch reaches the game no more */
-        else if (b >= 0) { f->kind = 3; f->button = b; }
+        else if (b >= 0) { f->kind = 3; f->button = b; ask_exit = g_btn[b].bit == B_EXIT; }
         else f->kind = stick_side(x);
     } else {
         f->x = x; f->y = y;
@@ -137,6 +140,7 @@ void android_touch(int pointer, float x, float y, int down) {
         }
     }
     pthread_mutex_unlock(&g_lock);
+    if (ask_exit) android_exit_request();
 }
 /* the touch pad's state; called with g_lock held */
 static void touch_state(NnPadState *o, int64_t now) {
@@ -146,7 +150,7 @@ static void touch_state(NnPadState *o, int64_t now) {
         if (f->kind == 3) {
             int bit = g_btn[f->button].bit;
             if (bit == B_SHAKE) g_shake_until = now + 120;
-            else o->buttons |= 1ull << bit;
+            else if (bit <= B_DOWN) o->buttons |= 1ull << bit;
         } else if (f->kind == 1) {
             float r = STICK_R(0), dx = (f->x - f->x0) * g_aspect / r, dy = (f->y - f->y0) / r, m = sqrtf(dx * dx + dy * dy);
             if (m > 1) { dx /= m; dy /= m; }
@@ -252,6 +256,7 @@ static int key_bit_default(int code) {
 /* The player's bindings (bind_ lines, load_config): g_bind[b] the key code for console button b, 0 = its own key. */
 #define NKEYS 512
 static int g_bind[B_DOWN + 1];
+static int g_exit_key = AKEYCODE_BUTTON_MODE;      /* bind_EXIT: the controller key that asks to leave the game (the Home / guide button) */
 static int key_bit(int code) {                    /* g_lock held */
     for (int b = 0; b <= B_DOWN; b++) if (g_bind[b] == code) return b;
     int bit = key_bit_default(code);
@@ -262,6 +267,7 @@ int android_pad_key(int device, int code, int down) {
     int64_t now = (int64_t)plat_ms64();
     if (device == ANDROID_PAD_BACK_GESTURE) { g_back_key = down ? 1ull << B_MINUS : 0; return 1; }
     pthread_mutex_lock(&g_lock);
+    if (code == g_exit_key) { pthread_mutex_unlock(&g_lock); if (down) android_exit_request(); return 1; }
     int bit = key_bit(code);
     if (bit < 0) { pthread_mutex_unlock(&g_lock); return key_bit_default(code) >= 0; }     /* a game key either way: not passed on */
     Ctl *c = ctl_for(device, now);
@@ -361,7 +367,7 @@ static void load_config(int force) {
     g_ini_stamp = stamp;
     TButton btn[NBUTTONS];
     float st[2][3];
-    int bind[B_DOWN + 1] = {0}, moved = 0, bound = 0;
+    int bind[B_DOWN + 1] = {0}, moved = 0, bound = 0, exit_key = AKEYCODE_BUTTON_MODE;
     memcpy(btn, k_buttons, sizeof btn);
     memcpy(st, k_stick, sizeof st);
     FILE *f = fopen(path, "r");
@@ -379,6 +385,7 @@ static void load_config(int force) {
             int code = atoi(val);
             for (int i = 0; i < NBUTTONS; i++) if (!strcmp(key + 5, k_buttons[i].key) && k_buttons[i].bit <= B_DOWN && code > 0 && code < NKEYS) { bind[k_buttons[i].bit] = code; bound++; }
             if (!strcmp(key + 5, "LS") && code > 0 && code < NKEYS) { bind[B_LS] = code; bound++; }
+            if (!strcmp(key + 5, "EXIT") && code > 0 && code < NKEYS) { exit_key = code; bound++; }
             continue;
         }
         if (!strcmp(key, "layout")) g_cfg.layout_labels = !strcmp(val, "labels");
@@ -393,6 +400,7 @@ static void load_config(int force) {
     if (f) fclose(f);
     pthread_mutex_lock(&g_lock);
     memcpy(g_btn, btn, sizeof g_btn);
+    g_exit_key = exit_key;
     memcpy(g_stick, st, sizeof g_stick);
     memcpy(g_bind, bind, sizeof g_bind);
     pthread_mutex_unlock(&g_lock);

@@ -49,6 +49,8 @@ The goal is to run well on Snapdragon and Mali with the phone's own driver. Cust
 **Controls**
 - On-screen touch controls with a layout editor: move and resize every button and stick.
 - Controllers that Android sees as gamepads, with button rebinding in the app.
+- Leave the game from the house button in the touch controls or the controller's Home button (rebindable): it asks
+  first, waits for any save in progress, and returns to the app's menu.
 - The phone's motion sensors for motion controls.
 
 **Problem reports**

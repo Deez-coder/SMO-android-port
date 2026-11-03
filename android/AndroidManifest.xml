@@ -44,9 +44,11 @@
             android:exported="false"
             android:screenOrientation="sensorLandscape"
             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation" />
-        <!-- the game (GameActivity.java: android.app.NativeActivity with the system bars hidden) -->
+        <!-- the game (GameActivity.java: android.app.NativeActivity with the system bars hidden), in a process of its own:
+             leaving the game ends that process, and this app stays -->
         <activity
             android:name="com.mobileodyssey.game.GameActivity"
+            android:process=":game"
             android:exported="true"
             android:launchMode="singleTask"
             android:screenOrientation="sensorLandscape"

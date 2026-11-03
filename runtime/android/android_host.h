@@ -4,6 +4,7 @@
 
 /* android_main.c -> nnpad_android.c, on the activity's thread */
 #define ANDROID_PAD_BACK_GESTURE (-0x7ffffff0)    /* android_pad_key's device for the touch pad's back gesture (-1 is a real id: virtual devices, injected input) */
+void android_exit_request(void);      /* android_main.c: the player asked to leave the game (the touch EXIT button, bind_EXIT): GameActivity asks */
 int android_pad_key(int device, int keycode, int down);         /* a controller's key (device ANDROID_PAD_BACK_GESTURE: the touch pad's back gesture); 1 = used */
 void android_pad_axes(int device, const float *axes, int count); /* AMOTION_EVENT_AXIS_* values of a controller */
 void android_touch(int pointer, float x, float y, int down);    /* a finger, x and y 0..1 of the window */

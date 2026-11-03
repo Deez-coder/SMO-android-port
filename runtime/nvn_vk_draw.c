@@ -3899,7 +3899,7 @@ static struct { VkDescriptorSetLayout dsl; VkPipelineLayout layout; VkDescriptor
  * info (count, fps, aspect of the window, opacity) */
 #define OV_SHAPES 24
 #define OV_BYTES 1024
-typedef struct { float sh[OV_SHAPES][4], col[OV_SHAPES][4], info[4], info2[4]; } OvBlock;      /* info2.x: sharpening 0..1 */
+typedef struct { float sh[OV_SHAPES][4], col[OV_SHAPES][4], info[4], info2[4], glyph[OV_SHAPES]; } OvBlock;      /* info2.x: sharpening 0..1; glyph: 0 none, 1-4 A B X Y, 5 a house (EXIT) */
 static VkPipeline pp_pipeline(VkFormat fmt) {
     for (int i = 0; i < g_pp.npipe; i++) if (g_pp.pipe[i].fmt == fmt) return g_pp.pipe[i].p;
     if (g_pp.npipe >= 4) return VK_NULL_HANDLE;
@@ -3933,7 +3933,7 @@ static VkPipeline pp_pipeline(VkFormat fmt) {
             "#version 460\n"
             "layout(push_constant) uniform PC { vec4 rect; vec4 crop; vec2 ext; int rot; } pc;\n"   /* rect: the picture in the window (0..1), crop: its part of the texture (uv) */
             "layout(set = 0, binding = 0) uniform sampler2D src;\n"
-            "layout(std140, set = 0, binding = 1) uniform OV { vec4 sh[24]; vec4 col[24]; vec4 info; vec4 info2; } ov;\n"   /* the overlay: touch controls, fps */
+            "layout(std140, set = 0, binding = 1) uniform OV { vec4 sh[24]; vec4 col[24]; vec4 info; vec4 info2; vec4 glyph[6]; } ov;\n"   /* the overlay: touch controls, fps */
             "layout(location = 0) out vec4 o;\n"
             "const int SEG[10] = int[10](0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F);\n"
             "bool seg7(int d, vec2 p) {\n"                                                      /* p: 0..1 in the digit's box */
@@ -3942,6 +3942,22 @@ static VkPipeline pp_pipeline(VkFormat fmt) {
             "  return ((m & 1) != 0 && p.y < t && h) || ((m & 2) != 0 && p.x > 1.0 - t && up) || ((m & 4) != 0 && p.x > 1.0 - t && lo) ||\n"
             "         ((m & 8) != 0 && p.y > 1.0 - t && h) || ((m & 16) != 0 && p.x < t && lo) || ((m & 32) != 0 && p.x < t && up) ||\n"
             "         ((m & 64) != 0 && abs(p.y - 0.5) < t * 0.5 && h);\n"
+            "}\n"
+            "const vec4 GS[23] = vec4[23](\n"                                          /* strokes (x0 y0 x1 y1) in a button of radius 1, y down */
+            "  vec4(-0.32, 0.42, 0.0, -0.42), vec4(0.0, -0.42, 0.32, 0.42), vec4(-0.19, 0.1, 0.19, 0.1),\n"   /* A */
+            "  vec4(-0.24, -0.42, -0.24, 0.42), vec4(-0.24, -0.42, 0.1, -0.42), vec4(0.1, -0.42, 0.24, -0.3), vec4(0.24, -0.3, 0.24, -0.12),\n"   /* B */
+            "  vec4(0.24, -0.12, 0.1, 0.0), vec4(-0.24, 0.0, 0.12, 0.0), vec4(0.12, 0.0, 0.28, 0.13), vec4(0.28, 0.13, 0.28, 0.29),\n"
+            "  vec4(0.28, 0.29, 0.12, 0.42), vec4(0.12, 0.42, -0.24, 0.42),\n"
+            "  vec4(-0.3, -0.42, 0.3, 0.42), vec4(0.3, -0.42, -0.3, 0.42),\n"   /* X */
+            "  vec4(-0.3, -0.42, 0.0, 0.0), vec4(0.3, -0.42, 0.0, 0.0), vec4(0.0, 0.0, 0.0, 0.42),\n"   /* Y */
+            "  vec4(-0.48, 0.02, 0.0, -0.44), vec4(0.0, -0.44, 0.48, 0.02), vec4(-0.3, -0.14, -0.3, 0.4), vec4(0.3, -0.14, 0.3, 0.4), vec4(-0.3, 0.4, 0.3, 0.4));\n"   /* a house */
+            "const ivec2 GR[5] = ivec2[5](ivec2(0, 3), ivec2(3, 10), ivec2(13, 2), ivec2(15, 3), ivec2(18, 5));\n"   /* first stroke, count */
+            "float glyph(int g, vec2 p) {\n"                                          /* the distance to the glyph's nearest stroke */
+            "  ivec2 r = GR[g - 1]; float d = 1e9;\n"
+            "  for (int k = 0; k < 10; k++) { if (k >= r.y) break;\n"
+            "    vec4 s = GS[r.x + k]; vec2 pa = p - s.xy, ba = s.zw - s.xy;\n"
+            "    d = min(d, length(pa - ba * clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0))); }\n"
+            "  return d;\n"
             "}\n"
             "float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }\n"
             "vec3 fxaa(vec2 uv) {\n"                                                       /* anti_aliasing = fxaa: blend along an edge found from the luma of the neighbours */
@@ -3982,6 +3998,11 @@ static VkPipeline pp_pipeline(VkFormat fmt) {
             "    if (d > s.z) continue;\n"
             "    float a = s.w > 1.5 ? (d > s.z * 0.88 ? op : 0.0) : (d > s.z * 0.85 ? min(1.0, op * 1.6) : op * ov.col[i].a);\n"
             "    c = mix(c, ov.col[i].rgb, a);\n"
+            "    int g = int(ov.glyph[i / 4][i % 4]);\n"
+            "    if (g > 0) {\n"                                                    /* its letter, white; px: one pixel in the button's units */
+            "      float px = 1.0 / (s.z * (pc.rot % 2 == 1 ? pc.ext.x : pc.ext.y)), dg = glyph(g, vec2((l.x - s.x) * asp, l.y - s.y) / s.z);\n"
+            "      c = mix(c, vec3(1.0), min(1.0, op * 2.0) * clamp((0.08 - dg) / px + 0.5, 0.0, 1.0));\n"
+            "    }\n"
             "  }\n"
             "  int fps = int(ov.info.y);\n"                                                       /* the fps counter, top left */
             "  if (fps >= 0) {\n"
@@ -4066,6 +4087,7 @@ static int present_pass(uint32_t index, VTex *vt, const int *s4) {
             else if (!strcmp(lb, "X")) { r = 0.3f; g = 0.5f; b = 1.0f; } else if (!strcmp(lb, "Y")) { r = 0.3f; g = 0.85f; b = 0.35f; }
             else if (!strcmp(lb, "T")) { r = g = b = ts[i].pressed ? 0.9f : 0.45f; ts[i].pressed = 0; }      /* the touch controls' on/off ring: bright on, faint off */
             ob.sh[i][0] = ts[i].x; ob.sh[i][1] = ts[i].y; ob.sh[i][2] = ts[i].r; ob.sh[i][3] = (float)ts[i].round;
+            ob.glyph[i] = !strcmp(lb, "A") ? 1.0f : !strcmp(lb, "B") ? 2.0f : !strcmp(lb, "X") ? 3.0f : !strcmp(lb, "Y") ? 4.0f : !strcmp(lb, "EX") ? 5.0f : 0.0f;
             ob.col[i][0] = ts[i].pressed ? 1.0f : r; ob.col[i][1] = ts[i].pressed ? 1.0f : g; ob.col[i][2] = ts[i].pressed ? 1.0f : b; ob.col[i][3] = ts[i].pressed ? 1.6f : 1.0f;
         }
         int64_t now = tk();

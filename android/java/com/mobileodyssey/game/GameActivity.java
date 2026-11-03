@@ -2,18 +2,34 @@
  * with the system bars hidden. The theme alone hides only the status bar; phones with button navigation then keep
  * the navigation bar over the right edge in landscape, on top of the touch controls there (A, ZR, R). Immersive:
  * the bars come back for a moment with a swipe from the edge. The layout editor uses the same window (fullScreen()),
- * so a place there is the same place in the game. */
+ * so a place there is the same place in the game.
+ * Leaving the game: askExit (the touch Exit button, the controller's Exit key) asks first, with the game held; Exit
+ * waits for any save in progress, then ends this process (":game" in the manifest) and the app's menu comes back. */
 package com.mobileodyssey.game;
 
 import android.app.Activity;
+import android.app.Dialog;
+import android.content.Intent;
+import android.graphics.Color;
+import android.graphics.Typeface;
+import android.graphics.drawable.ColorDrawable;
+import android.graphics.drawable.GradientDrawable;
 import android.app.NativeActivity;
 import android.os.Bundle;
+import android.view.Gravity;
 import android.view.Window;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 import android.view.WindowManager;
+import android.widget.Button;
+import android.widget.LinearLayout;
+import android.widget.TextView;
 
 public class GameActivity extends NativeActivity {
+    native void nativeHold(boolean on);                    /* android_main.c: the game stands still (as in the menus) */
+    native void nativeQuiesce();                           /* android_main.c: waits for a save in progress, then no more file writes */
+    private Dialog exitDialog;
+
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
         fullScreen(this);
@@ -21,6 +37,93 @@ public class GameActivity extends NativeActivity {
     @Override public void onWindowFocusChanged(boolean focus) {
         super.onWindowFocusChanged(focus);
         if (focus) fullScreen(this);                       /* again after a dialog, the notification shade, another app */
+    }
+
+    /* Called by the game's input thread. A popup of the app's own look (LauncherActivity's colours) in the middle of the
+     * screen; outside it or the back gesture keeps playing. */
+    public void askExit() {
+        runOnUiThread(() -> {
+            if (exitDialog != null || isFinishing()) return;
+            nativeHold(true);
+            LinearLayout card = new LinearLayout(this);
+            card.setOrientation(LinearLayout.VERTICAL);
+            card.setPadding(px(24), px(22), px(24), px(20));
+            card.setBackground(round(LauncherActivity.CARD, 22));
+            TextView title = new TextView(this);
+            title.setText("Leave the game?");
+            title.setTextSize(21);
+            title.setTypeface(Typeface.DEFAULT_BOLD);
+            title.setTextColor(LauncherActivity.TEXT);
+            card.addView(title);
+            TextView msg = new TextView(this);
+            msg.setText("You go back to the app's menu. Progress since the game last saved is lost; a save in progress is "
+                    + "finished first.");
+            msg.setTextSize(14);
+            msg.setTextColor(LauncherActivity.DIM);
+            msg.setLineSpacing(0, 1.15f);
+            msg.setPadding(0, px(8), 0, px(20));
+            card.addView(msg);
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            Button stay = button("Keep playing", LauncherActivity.CARD2);
+            Button exit = button("Exit to the menu", LauncherActivity.ACCENT);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, px(50), 1);
+            row.addView(stay, lp);
+            lp = new LinearLayout.LayoutParams(0, px(50), 1);
+            lp.setMargins(px(10), 0, 0, 0);
+            row.addView(exit, lp);
+            card.addView(row);
+
+            Dialog d = new Dialog(this);
+            d.requestWindowFeature(Window.FEATURE_NO_TITLE);
+            d.setContentView(card);
+            d.setCanceledOnTouchOutside(true);
+            Window w = d.getWindow();
+            w.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+            w.setLayout(Math.min(px(440), getResources().getDisplayMetrics().widthPixels - px(32)), WindowManager.LayoutParams.WRAP_CONTENT);
+            w.setGravity(Gravity.CENTER);
+            w.addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
+            w.setDimAmount(0.6f);
+            stay.setOnClickListener(v -> d.dismiss());
+            exit.setOnClickListener(v -> { leaving = true; exit.setText("Leaving…"); exit.setEnabled(false); stay.setEnabled(false); leave(); });
+            d.setOnDismissListener(x -> {
+                if (leaving) return;
+                exitDialog = null;
+                nativeHold(false);
+                fullScreen(this);
+            });
+            exitDialog = d;
+            /* not focusable while it is shown, or the system bars come back with it; the bars of its own window hidden */
+            w.addFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE);
+            d.show();
+            WindowInsetsController c = w.getDecorView().getWindowInsetsController();
+            if (c != null) { c.hide(WindowInsets.Type.systemBars()); c.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE); }
+            w.clearFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE);
+        });
+    }
+    private boolean leaving;
+    private void leave() {
+        new Thread(() -> {
+            nativeQuiesce();
+            runOnUiThread(() -> {
+                if (isTaskRoot()) startActivity(new Intent(this, LauncherActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                finish();                                  /* the app's menu is under the game */
+                /* android_main.c ends this process (the game's only, the app stays) once the activity is destroyed */
+            });
+        }, "smo-exit").start();
+    }
+    private int px(int v) { return Math.round(v * getResources().getDisplayMetrics().density); }
+    private GradientDrawable round(int col, int r) { GradientDrawable g = new GradientDrawable(); g.setColor(col); g.setCornerRadius(px(r)); return g; }
+    private Button button(String s, int col) {
+        Button b = new Button(this);
+        b.setText(s);
+        b.setAllCaps(false);
+        b.setTextColor(Color.WHITE);
+        b.setTextSize(15);
+        b.setTypeface(Typeface.DEFAULT_BOLD);
+        b.setStateListAnimator(null);
+        b.setBackground(round(col, 14));
+        return b;
     }
 
     /* The whole display: under the system bars and the camera cutout, the bars hidden until a swipe. */

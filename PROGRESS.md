@@ -389,6 +389,22 @@ sharpening 75):
   files and 199 sampled game files have the same MD5. The game plays on the imported files. The earlier pushed copy
   had 4 files fewer.
 
+## Leaving the game, button letters (2026-11-03)
+
+- **Exit**: a house button at the top of the touch controls (movable in the layout editor) and a controller key
+  (Controls tab, "Exit the game (asks first)", Home / Guide by default, `bind_EXIT`) open a popup in the app's own style:
+  Keep playing or Exit to the menu. The game is held while it is open (display_menu_hold). Exit waits for a save
+  commit in progress (`fs_quiesce`, nnfs.c: the fs lock fs_Commit holds, then the commit lock the launcher's save
+  import uses), then the activity finishes and android_main ends the process.
+- The game now runs in a process of its own (`:game`), so leaving it ends only the game and the app's menu stays.
+  The launcher finds the game by that process ("Close the game" in the save-import warning ends it).
+- A, B, X and Y show their letters (white strokes drawn in the present-pass shader, glyph ids in the overlay block).
+- Checked on the S24 Ultra: the house opens the popup over the title screen, the picture stands still while it is open
+  and moves again after Keep playing, Exit to the menu brings the app back with only the `:game` process gone and the
+  log shows the save wait; the controller Home key (`input gamepad keyevent BUTTON_MODE`) opens it too. Rebinding
+  Exit on the emulator writes `bind_EXIT`. Touches during the black boot screen do nothing: the touch controls start
+  when the game sets up its controllers.
+
 ## Open problems, most important first
 
 1. **BC textures on phones without BC (Mali, PowerVR): decoded on the CPU since 2026-10-28.**

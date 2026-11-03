@@ -329,9 +329,9 @@ public class LauncherActivity extends Activity {
 
     /* ------------------------------------------------------------ controller bindings
      * bind_<button> = <Android key code> in controls.ini (nnpad_android.c key_bit): the key replaces the button's own. */
-    static final String[] BIND_KEYS = {"A", "B", "X", "Y", "L", "R", "ZL", "ZR", "LS", "R3", "PLUS", "MINUS", "UP", "DOWN", "LEFT", "RIGHT"};
+    static final String[] BIND_KEYS = {"A", "B", "X", "Y", "L", "R", "ZL", "ZR", "LS", "R3", "PLUS", "MINUS", "UP", "DOWN", "LEFT", "RIGHT", "EXIT"};
     static final String[] BIND_NAMES = {"A", "B", "X", "Y", "L", "R", "ZL", "ZR", "Left stick click", "Right stick click", "+ (Plus)", "- (Minus)",
-                                        "D-pad up", "D-pad down", "D-pad left", "D-pad right"};
+                                        "D-pad up", "D-pad down", "D-pad left", "D-pad right", "Exit the game (asks first)"};
     static int defaultKey(int b, boolean labels) {         /* key_bit_default in nnpad_android.c */
         switch (BIND_KEYS[b]) {
             case "A": return labels ? KeyEvent.KEYCODE_BUTTON_A : KeyEvent.KEYCODE_BUTTON_B;     /* by position: the right button */
@@ -349,6 +349,7 @@ public class LauncherActivity extends Activity {
             case "UP": return KeyEvent.KEYCODE_DPAD_UP;
             case "DOWN": return KeyEvent.KEYCODE_DPAD_DOWN;
             case "LEFT": return KeyEvent.KEYCODE_DPAD_LEFT;
+            case "EXIT": return KeyEvent.KEYCODE_BUTTON_MODE;      /* not a console button: nnpad_android.c g_exit_key */
             default: return KeyEvent.KEYCODE_DPAD_RIGHT;
         }
     }
@@ -366,6 +367,7 @@ public class LauncherActivity extends Activity {
             case "BUTTON_R1": return "R1";
             case "BUTTON_L2": return "L2";
             case "BUTTON_R2": return "R2";
+            case "BUTTON_MODE": return "Home / Guide";
         }
         if (s.startsWith("BUTTON_") && s.length() == 8) return "Button " + s.charAt(7);
         s = s.replace("BUTTON_", "").replace("DPAD_", "D-pad ").replace('_', ' ').toLowerCase(java.util.Locale.ROOT);
@@ -517,17 +519,19 @@ public class LauncherActivity extends Activity {
         return out.toArray(new File[0]);
     }
     /* The game runs in this app's process: libsmo.so is loaded once it has started, until the app is closed. */
-    static boolean gameRunning() {
-        try (BufferedReader r = new BufferedReader(new InputStreamReader(new FileInputStream("/proc/self/maps"), StandardCharsets.UTF_8))) {
-            for (String s; (s = r.readLine()) != null; ) if (s.endsWith("/libsmo.so")) return true;
-        } catch (Exception ignored) { }
-        return false;
+    /* The game runs in its own process (":game", GameActivity in the manifest), so it can end while this app stays. */
+    int gamePid() {
+        java.util.List<android.app.ActivityManager.RunningAppProcessInfo> l = getSystemService(android.app.ActivityManager.class).getRunningAppProcesses();
+        if (l != null) for (android.app.ActivityManager.RunningAppProcessInfo p : l) if (p.processName.endsWith(":game")) return p.pid;
+        return 0;
     }
+    boolean gameRunning() { return gamePid() != 0; }
     void gameRunningDialog() {
         new AlertDialog.Builder(this).setTitle("The game is still running")
-                .setMessage("A save can only be replaced while the game is closed, or the game would write over it. Close the "
-                        + "app, open it again and import the save before pressing Play.")
-                .setPositiveButton("Close the app", (d, w) -> { finishAffinity(); System.exit(0); })
+                .setMessage("A save can only be replaced while the game is closed, or the game would write over it. Leave the "
+                        + "game with its Exit button (the house at the top of the touch controls), or close it here. Closing "
+                        + "it here is like switching the console off: progress since the game last saved is lost.")
+                .setPositiveButton("Close the game", (d, w) -> { int pid = gamePid(); if (pid != 0) android.os.Process.killProcess(pid); toast("Game closed"); })
                 .setNegativeButton("Cancel", null).show();
     }
     void exportSave(Uri out) throws Exception {

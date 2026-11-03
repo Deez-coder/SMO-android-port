@@ -417,6 +417,13 @@ static CommitLock commit_mutex(void) {
 }
 static void commit_done(CommitLock fd) { if (fd >= 0) { flock(fd, LOCK_UN); close(fd); } }
 #endif
+/* Leaving the game (Android: GameActivity's Exit, android_main.c): waits for a commit in progress and for any file
+ * operation, then keeps new ones from starting. The process ends next, so neither lock is given back; the committed
+ * save is whole, and changes the game had not committed are dropped, as on the console when it is switched off. */
+void fs_quiesce(void) {
+    fs_lock();                                            /* fs_Commit holds it through the whole commit */
+    (void)commit_mutex();                                 /* and the launcher's save import (another process) */
+}
 static void journal_list(FILE *j, const char *work, const char *rel) {     /* every file of the working folder, depth first */
     char dir[PLAT_MAX_PATH], sub[PLAT_MAX_PATH];
     join(dir, work, rel);

@@ -87,6 +87,34 @@ static JNIEnv *jni_env(void) {
     if ((*vm)->GetEnv(vm, (void **)&env, JNI_VERSION_1_6) == JNI_EDETACHED) (*vm)->AttachCurrentThread(vm, &env, NULL);
     return env;
 }
+/* Leaving the game: GameActivity.askExit shows the question (on the UI thread) and holds the game meanwhile
+ * (nativeHold); Exit waits for any save in progress (nativeQuiesce) before the activity goes. */
+void android_exit_request(void) {                    /* the looper thread (input) */
+    JNIEnv *env = jni_env();
+    jobject act = g_app->activity->clazz;
+    jclass c = (*env)->GetObjectClass(env, act);
+    jmethodID m = (*env)->GetMethodID(env, c, "askExit", "()V");
+    if (m) (*env)->CallVoidMethod(env, act, m);
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);      /* started as plain NativeActivity (no askExit) */
+    (*env)->DeleteLocalRef(env, c);
+}
+void display_menu_hold(int on);                       /* display.c */
+void fs_quiesce(void);                                /* nnfs.c */
+static void JNICALL native_hold(JNIEnv *env, jobject self, jboolean on) { (void)env; (void)self; display_menu_hold(on ? 1 : 0); }
+static void JNICALL native_quiesce(JNIEnv *env, jobject self) {
+    (void)env; (void)self;
+    printf("smo: leaving the game: waiting for any save in progress%c", 10);
+    fs_quiesce();
+    printf("smo: leaving the game: no save in progress%c", 10);
+    fflush(stdout);
+}
+static void register_natives(void) {
+    JNIEnv *env = jni_env();
+    jclass c = (*env)->GetObjectClass(env, g_app->activity->clazz);
+    JNINativeMethod m[2] = {{"nativeHold", "(Z)V", (void *)native_hold}, {"nativeQuiesce", "()V", (void *)native_quiesce}};
+    if ((*env)->RegisterNatives(env, c, m, 2) != 0) { (*env)->ExceptionClear(env); printf("smo: no GameActivity: no Exit button%c", 10); }
+    (*env)->DeleteLocalRef(env, c);
+}
 static int display_rotation(void) {                  /* Surface.ROTATION_0 .. 270 as 0..3 */
     JNIEnv *env = jni_env();
     jobject act = g_app->activity->clazz;
@@ -343,6 +371,7 @@ void android_main(struct android_app *app) {
         plat_log_init(p);
     }
     set_language(app);
+    register_natives();
     {   /* <files>/config/env.txt: KEY=VALUE lines (# comments) set before the game starts, the Android stand-in for the
          * environment variables of the Windows build (SMO_SHOT, SMO_VK_DEBUG, ...: see the runtime's sources) */
         char p[PLAT_MAX_PATH], line[512];
