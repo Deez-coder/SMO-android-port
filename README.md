@@ -1,3 +1,4 @@
+the one official source of this mod, anywhere else is NOT done by me
 # SMO Android Port
 
 A native Android port of *Super Mario Odyssey* (version 1.0.0), built on the static recompilation from
