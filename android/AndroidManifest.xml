@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Super Mario Odyssey, Android port (tools/android/build_apk.py). The game is android.app.NativeActivity running
+     libsmo.so (runtime/android/android_main.c). The APK holds no game data: the player's own files are pushed into the
+     app's external files folder (tools/android/push_data.py). A private build for the owner of the game. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.mobileodyssey.game"
+    android:versionCode="1"
+    android:versionName="0.1.0">
+
+    <uses-sdk android:minSdkVersion="30" android:targetSdkVersion="35" />
+    <!-- Vulkan 1.3: what the renderer asks of a device (runtime/nvn_vk.c) -->
+    <uses-feature android:name="android.hardware.vulkan.version" android:version="0x403000" android:required="true" />
+    <uses-feature android:name="android.hardware.gamepad" android:required="false" />
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+    <uses-feature android:name="android.hardware.sensor.gyroscope" android:required="false" />
+
+    <application
+        android:label="Odyssey"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:hasCode="true"
+        android:allowBackup="false"
+        android:extractNativeLibs="true"
+        android:isGame="true"
+        android:appCategory="game"
+        android:largeHeap="true"
+        android:debuggable="true"
+        android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen">
+        <!-- simpleperf from adb may profile a release build too (performance work on the phone; no debugging access) -->
+        <profileable android:shell="true" />
+        <!-- the launcher (android/java/com/mobileodyssey/game/LauncherActivity.java): game files, settings, driver, mods, Play -->
+        <activity
+            android:name="com.mobileodyssey.game.LauncherActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <!-- the touch controls' editor (LayoutEditorActivity.java): the same full-screen landscape window as the game -->
+        <activity
+            android:name="com.mobileodyssey.game.LayoutEditorActivity"
+            android:exported="false"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation" />
+        <!-- the game (GameActivity.java: android.app.NativeActivity with the system bars hidden) -->
+        <activity
+            android:name="com.mobileodyssey.game.GameActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:screenOrientation="sensorLandscape"
+            android:resizeableActivity="false"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density">
+            <meta-data android:name="android.app.lib_name" android:value="smo" />
+        </activity>
+    </application>
+</manifest>
