@@ -47,7 +47,7 @@ The goal is to run well on Snapdragon and Mali with the phone's own driver. Cust
 - The phone's own Vulkan driver by default; custom AdrenoTools driver packages (such as Mesa Turnip) on Snapdragon.
 
 **Controls**
-- On-screen touch controls with a layout editor: move and resize every button and stick.
+- On-screen touch controls with Switch-style button icons and a layout editor: move and resize every button and stick.
 - Controllers that Android sees as gamepads, with button rebinding in the app.
 - Leave the game from the house button in the touch controls or the controller's Home button (rebindable): it asks
   first, waits for any save in progress, and returns to the app's menu.

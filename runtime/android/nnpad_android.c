@@ -196,7 +196,7 @@ int android_touch_shapes(TouchShape *out, int max, float *opacity) {
         }
         if (n + 2 <= max) {
             out[n].x = bx; out[n].y = by; out[n].r = STICK_R(0); out[n].round = 2; out[n].pressed = 0; out[n].label[0] = 0; n++;
-            out[n].x = kx; out[n].y = ky; out[n].r = KNOB_R(0); out[n].round = 1; out[n].pressed = kx != bx || ky != by; out[n].label[0] = 0; n++;
+            out[n].x = kx; out[n].y = ky; out[n].r = KNOB_R(0); out[n].round = 1; out[n].pressed = kx != bx || ky != by; snprintf(out[n].label, sizeof out[n].label, "LS"); n++;
         }
         if (g_cfg.camera_stick && n + 2 <= max) {      /* the camera stick: at rest between the d-pad and the face buttons, or where the finger landed */
             float cbx = g_stick[1][0], cby = g_stick[1][1], ckx, cky;
@@ -208,7 +208,7 @@ int android_touch_shapes(TouchShape *out, int max, float *opacity) {
                 ckx = cbx + dx / g_aspect; cky = cby + dy;
             }
             out[n].x = cbx; out[n].y = cby; out[n].r = STICK_R(1); out[n].round = 2; out[n].pressed = 0; out[n].label[0] = 0; n++;
-            out[n].x = ckx; out[n].y = cky; out[n].r = KNOB_R(1); out[n].round = 1; out[n].pressed = ckx != cbx || cky != cby; out[n].label[0] = 0; n++;
+            out[n].x = ckx; out[n].y = cky; out[n].r = KNOB_R(1); out[n].round = 1; out[n].pressed = ckx != cbx || cky != cby; snprintf(out[n].label, sizeof out[n].label, "RS"); n++;
         }
     }
     *opacity = g_cfg.opacity;

@@ -398,7 +398,10 @@ sharpening 75):
   import uses), then the activity finishes and android_main ends the process.
 - The game now runs in a process of its own (`:game`), so leaving it ends only the game and the app's menu stays.
   The launcher finds the game by that process ("Close the game" in the save-import warning ends it).
-- A, B, X and Y show their letters (white strokes drawn in the present-pass shader, glyph ids in the overlay block).
+- Button icons in the style of the console's own button glyphs, drawn by our own code (signed distances in the
+  present-pass shader, no image): circled A B X Y, L R ZL ZR tabs, hollow + and -, arrow d-pad, a stick-press R3, L and R
+  in the sticks' knobs, the house for Exit. A dark fill with a white outline and icon; white with a dark icon while
+  pressed. On the S24 Ultra the title screen holds 30.0 fps with the controls drawn and with them off.
 - Checked on the S24 Ultra: the house opens the popup over the title screen, the picture stands still while it is open
   and moves again after Keep playing, Exit to the menu brings the app back with only the `:game` process gone and the
   log shows the save wait; the controller Home key (`input gamepad keyevent BUTTON_MODE`) opens it too. Rebinding

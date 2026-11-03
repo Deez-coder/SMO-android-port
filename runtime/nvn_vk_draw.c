@@ -3899,7 +3899,7 @@ static struct { VkDescriptorSetLayout dsl; VkPipelineLayout layout; VkDescriptor
  * info (count, fps, aspect of the window, opacity) */
 #define OV_SHAPES 24
 #define OV_BYTES 1024
-typedef struct { float sh[OV_SHAPES][4], col[OV_SHAPES][4], info[4], info2[4], glyph[OV_SHAPES]; } OvBlock;      /* info2.x: sharpening 0..1; glyph: 0 none, 1-4 A B X Y, 5 a house (EXIT) */
+typedef struct { float sh[OV_SHAPES][4], col[OV_SHAPES][4], info[4], info2[4], glyph[OV_SHAPES]; } OvBlock;      /* info2.x: sharpening 0..1; glyph: 0 a plain disc, else the icon (the shader's glyph()) */
 static VkPipeline pp_pipeline(VkFormat fmt) {
     for (int i = 0; i < g_pp.npipe; i++) if (g_pp.pipe[i].fmt == fmt) return g_pp.pipe[i].p;
     if (g_pp.npipe >= 4) return VK_NULL_HANDLE;
@@ -3943,21 +3943,50 @@ static VkPipeline pp_pipeline(VkFormat fmt) {
             "         ((m & 8) != 0 && p.y > 1.0 - t && h) || ((m & 16) != 0 && p.x < t && lo) || ((m & 32) != 0 && p.x < t && up) ||\n"
             "         ((m & 64) != 0 && abs(p.y - 0.5) < t * 0.5 && h);\n"
             "}\n"
-            "const vec4 GS[23] = vec4[23](\n"                                          /* strokes (x0 y0 x1 y1) in a button of radius 1, y down */
+            "const vec4 GS[43] = vec4[43](\n"   /* strokes (x0 y0 x1 y1) of the letters, in a button of radius 1, y down */
             "  vec4(-0.32, 0.42, 0.0, -0.42), vec4(0.0, -0.42, 0.32, 0.42), vec4(-0.19, 0.1, 0.19, 0.1),\n"   /* A */
-            "  vec4(-0.24, -0.42, -0.24, 0.42), vec4(-0.24, -0.42, 0.1, -0.42), vec4(0.1, -0.42, 0.24, -0.3), vec4(0.24, -0.3, 0.24, -0.12),\n"   /* B */
-            "  vec4(0.24, -0.12, 0.1, 0.0), vec4(-0.24, 0.0, 0.12, 0.0), vec4(0.12, 0.0, 0.28, 0.13), vec4(0.28, 0.13, 0.28, 0.29),\n"
-            "  vec4(0.28, 0.29, 0.12, 0.42), vec4(0.12, 0.42, -0.24, 0.42),\n"
+            "  vec4(-0.24, -0.42, -0.24, 0.42), vec4(-0.24, -0.42, 0.1, -0.42), vec4(0.1, -0.42, 0.24, -0.3), vec4(0.24, -0.3, 0.24, -0.12), vec4(0.24, -0.12, 0.1, 0.0), vec4(-0.24, 0.0, 0.12, 0.0), vec4(0.12, 0.0, 0.28, 0.13), vec4(0.28, 0.13, 0.28, 0.29), vec4(0.28, 0.29, 0.12, 0.42), vec4(0.12, 0.42, -0.24, 0.42),\n"   /* B */
             "  vec4(-0.3, -0.42, 0.3, 0.42), vec4(0.3, -0.42, -0.3, 0.42),\n"   /* X */
             "  vec4(-0.3, -0.42, 0.0, 0.0), vec4(0.3, -0.42, 0.0, 0.0), vec4(0.0, 0.0, 0.0, 0.42),\n"   /* Y */
-            "  vec4(-0.48, 0.02, 0.0, -0.44), vec4(0.0, -0.44, 0.48, 0.02), vec4(-0.3, -0.14, -0.3, 0.4), vec4(0.3, -0.14, 0.3, 0.4), vec4(-0.3, 0.4, 0.3, 0.4));\n"   /* a house */
-            "const ivec2 GR[5] = ivec2[5](ivec2(0, 3), ivec2(3, 10), ivec2(13, 2), ivec2(15, 3), ivec2(18, 5));\n"   /* first stroke, count */
-            "float glyph(int g, vec2 p) {\n"                                          /* the distance to the glyph's nearest stroke */
-            "  ivec2 r = GR[g - 1]; float d = 1e9;\n"
-            "  for (int k = 0; k < 10; k++) { if (k >= r.y) break;\n"
-            "    vec4 s = GS[r.x + k]; vec2 pa = p - s.xy, ba = s.zw - s.xy;\n"
-            "    d = min(d, length(pa - ba * clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0))); }\n"
-            "  return d;\n"
+            "  vec4(-0.48, 0.02, 0.0, -0.44), vec4(0.0, -0.44, 0.48, 0.02), vec4(-0.3, -0.14, -0.3, 0.4), vec4(0.3, -0.14, 0.3, 0.4), vec4(-0.3, 0.4, 0.3, 0.4),\n"   /* a house */
+            "  vec4(-0.2, -0.42, -0.2, 0.42), vec4(-0.2, 0.42, 0.26, 0.42),\n"   /* L */
+            "  vec4(-0.24, -0.42, -0.24, 0.42), vec4(-0.24, -0.42, 0.1, -0.42), vec4(0.1, -0.42, 0.26, -0.28), vec4(0.26, -0.28, 0.26, -0.12), vec4(0.26, -0.12, 0.1, 0.0), vec4(0.1, 0.0, -0.24, 0.0), vec4(0.02, 0.0, 0.28, 0.42),\n"   /* R */
+            "  vec4(-0.24, -0.42, 0.24, -0.42), vec4(0.24, -0.42, -0.24, 0.42), vec4(-0.24, 0.42, 0.26, 0.42),\n"   /* Z */
+            "  vec4(-0.46, 0.0, -0.345, -0.092), vec4(-0.345, -0.092, -0.23, -0.13), vec4(-0.23, -0.13, -0.115, -0.092), vec4(-0.115, -0.092, 0.0, 0.0), vec4(0.0, 0.0, 0.115, 0.092), vec4(0.115, 0.092, 0.23, 0.13), vec4(0.23, 0.13, 0.345, 0.092), vec4(0.345, 0.092, 0.46, 0.0));\n"   /* ~ */
+            "const ivec2 GR[9] = ivec2[9](ivec2(0, 3), ivec2(3, 10), ivec2(13, 2), ivec2(15, 3), ivec2(18, 5), ivec2(23, 2), ivec2(25, 7), ivec2(32, 3), ivec2(35, 8));\n"   /* first stroke, count: A B X Y house L R Z ~ */
+            "float sg(vec2 p, vec4 s) { vec2 pa = p - s.xy, ba = s.zw - s.xy; return length(pa - ba * clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0)); }\n"
+            "float letter(int k, vec2 p, vec2 o, float sc) {\n"
+            "  ivec2 r = GR[k]; vec2 q = (p - o) / sc; float d = 1e9;\n"
+            "  for (int j = 0; j < 10; j++) { if (j >= r.y) break; d = min(d, sg(q, GS[r.x + j])); }\n"
+            "  return d * sc;\n"
+            "}\n"
+            "float rbox(vec2 p, vec2 b, vec4 r) {\n"   /* a rounded box, corner radii top left, top right, bottom left, bottom right */
+            "  float rr = p.x < 0.0 ? (p.y < 0.0 ? r.x : r.z) : (p.y < 0.0 ? r.y : r.w);\n"
+            "  vec2 q = abs(p) - b + rr; return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - rr;\n"
+            "}\n"
+            "float tri(vec2 p, vec2 p0, vec2 p1, vec2 p2) {\n"   /* signed distance to a triangle (after Inigo Quilez) */
+            "  vec2 e0 = p1 - p0, e1 = p2 - p1, e2 = p0 - p2, v0 = p - p0, v1 = p - p1, v2 = p - p2;\n"
+            "  vec2 q0 = v0 - e0 * clamp(dot(v0, e0) / dot(e0, e0), 0.0, 1.0), q1 = v1 - e1 * clamp(dot(v1, e1) / dot(e1, e1), 0.0, 1.0), q2 = v2 - e2 * clamp(dot(v2, e2) / dot(e2, e2), 0.0, 1.0);\n"
+            "  float sn = sign(e0.x * e2.y - e0.y * e2.x);\n"
+            "  vec2 d = min(min(vec2(dot(q0, q0), sn * (v0.x * e0.y - v0.y * e0.x)), vec2(dot(q1, q1), sn * (v1.x * e1.y - v1.y * e1.x))), vec2(dot(q2, q2), sn * (v2.x * e2.y - v2.y * e2.x)));\n"
+            "  return -sqrt(d.x) * sign(d.y);\n"
+            "}\n"
+            "float body(int g, vec2 p) {\n"   /* the button's outline, a signed distance: 6 7 the L R tabs, 8 9 ZL ZR, 10 11 + -, else a circle */
+            "  if (g == 6 || g == 7) return rbox(p, vec2(0.9, 0.62), vec4(0.22));\n"
+            "  if (g == 8) return rbox(p, vec2(0.9, 0.62), vec4(0.55, 0.18, 0.18, 0.18));\n"
+            "  if (g == 9) return rbox(p, vec2(0.9, 0.62), vec4(0.18, 0.55, 0.18, 0.18));\n"
+            "  if (g == 10) return min(rbox(p, vec2(0.82, 0.27), vec4(0.06)), rbox(p, vec2(0.27, 0.82), vec4(0.06)));\n"
+            "  if (g == 11) return rbox(p, vec2(0.82, 0.25), vec4(0.06));\n"
+            "  return length(p) - 0.86;\n"
+            "}\n"
+            "float glyph(int g, vec2 p) {\n"   /* the distance to its icon: 1-4 A B X Y, 5 a house, 6-9 L R ZL ZR, 12-15 arrows up right down left, 16 R3, 17 ~, 18 19 the sticks' knobs */
+            "  if (g <= 7) return letter(g - 1, p, vec2(0.0), 1.0);\n"
+            "  if (g <= 9) return min(letter(7, p, vec2(-0.27, 0.0), 0.8), letter(g - 3, p, vec2(0.29, 0.0), 0.8));\n"
+            "  if (g <= 11) return 1e9;\n"
+            "  if (g <= 15) { vec2 q = p; for (int k = 0; k < 3; k++) if (k < g - 12) q = vec2(q.y, -q.x); return tri(q, vec2(0.0, -0.42), vec2(0.4, 0.28), vec2(-0.4, 0.28)) + 0.075; }\n"
+            "  if (g == 16) return min(min(abs(length(p - vec2(0.0, 0.18)) - 0.44), letter(6, p, vec2(0.0, 0.18), 0.55)), tri(p, vec2(0.0, -0.33), vec2(0.2, -0.58), vec2(-0.2, -0.58)) + 0.075);\n"
+            "  if (g == 17) return letter(8, p, vec2(0.0), 1.0);\n"
+            "  return min(abs(length(p) - 0.56), letter(g == 18 ? 5 : 6, p, vec2(0.0), 0.62));\n"
             "}\n"
             "float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }\n"
             "vec3 fxaa(vec2 uv) {\n"                                                       /* anti_aliasing = fxaa: blend along an edge found from the luma of the neighbours */
@@ -3994,15 +4023,19 @@ static VkPipeline pp_pipeline(VkFormat fmt) {
             "vec3 overlay(vec3 c, vec2 l) {\n"                                                   /* l: the pixel in the window, 0..1 */
             "  float asp = ov.info.z, op = ov.info.w;\n"
             "  for (int i = 0; i < int(ov.info.x) % 100; i++) {\n"
-            "    vec4 s = ov.sh[i]; float d = length(vec2((l.x - s.x) * asp, l.y - s.y));\n"
-            "    if (d > s.z) continue;\n"
-            "    float a = s.w > 1.5 ? (d > s.z * 0.88 ? op : 0.0) : (d > s.z * 0.85 ? min(1.0, op * 1.6) : op * ov.col[i].a);\n"
-            "    c = mix(c, ov.col[i].rgb, a);\n"
+            "    vec4 s = ov.sh[i]; vec2 p = vec2((l.x - s.x) * asp, l.y - s.y) / s.z; float d = length(p);\n"
+            "    if (d > 1.15) continue;\n"
             "    int g = int(ov.glyph[i / 4][i % 4]);\n"
-            "    if (g > 0) {\n"                                                    /* its letter, white; px: one pixel in the button's units */
-            "      float px = 1.0 / (s.z * (pc.rot % 2 == 1 ? pc.ext.x : pc.ext.y)), dg = glyph(g, vec2((l.x - s.x) * asp, l.y - s.y) / s.z);\n"
-            "      c = mix(c, vec3(1.0), min(1.0, op * 2.0) * clamp((0.08 - dg) / px + 0.5, 0.0, 1.0));\n"
+            "    if (s.w > 1.5 || g == 0) {\n"   /* rings (the stick bases, the on/off ring) and plain discs */
+            "      if (d > 1.0) continue;\n"
+            "      c = mix(c, ov.col[i].rgb, s.w > 1.5 ? (d > 0.88 ? op : 0.0) : (d > 0.85 ? min(1.0, op * 1.6) : op * ov.col[i].a));\n"
+            "      continue;\n"
             "    }\n"
+            "    float px = 1.0 / (s.z * (pc.rot % 2 == 1 ? pc.ext.x : pc.ext.y)), db = body(g, p), io = min(1.0, op * 2.0);\n"   /* an icon button: a dark fill, a white outline and icon (dark on white while pressed); px: one pixel in its units */
+            "    vec3 ink = ov.col[i].a > 1.2 ? vec3(0.1) : vec3(1.0);\n"
+            "    c = mix(c, ov.col[i].rgb, clamp(0.5 - db / px, 0.0, 1.0) * op * ov.col[i].a);\n"
+            "    c = mix(c, ink, clamp((0.075 - abs(db)) / px + 0.5, 0.0, 1.0) * io);\n"
+            "    c = mix(c, ink, clamp((0.075 - glyph(g, p)) / px + 0.5, 0.0, 1.0) * io);\n"
             "  }\n"
             "  int fps = int(ov.info.y);\n"                                                       /* the fps counter, top left */
             "  if (fps >= 0) {\n"
@@ -4082,13 +4115,16 @@ static int present_pass(uint32_t index, VTex *vt, const int *s4) {
         int n = android_touch_shapes(ts, OV_SHAPES, &op);
         for (int i = 0; i < n; i++) {
             const char *lb = ts[i].label;
+            static const char *k_glyph[] = {"", "A", "B", "X", "Y", "EX", "L", "R", "ZL", "ZR", "+", "-", "^", ">", "v", "<", "R3", "~", "LS", "RS"};
+            int gl = 0;
+            for (int k = 1; k < (int)(sizeof k_glyph / sizeof k_glyph[0]); k++) if (!strcmp(lb, k_glyph[k])) gl = k;
             float r = 0.75f, g = 0.75f, b = 0.75f;
-            if (!strcmp(lb, "A")) { r = 0.95f; g = 0.25f; b = 0.25f; } else if (!strcmp(lb, "B")) { r = 0.95f; g = 0.85f; b = 0.2f; }
-            else if (!strcmp(lb, "X")) { r = 0.3f; g = 0.5f; b = 1.0f; } else if (!strcmp(lb, "Y")) { r = 0.3f; g = 0.85f; b = 0.35f; }
+            if (gl) r = g = b = ts[i].pressed ? 1.0f : 0.07f;      /* icon buttons (the shader's glyph()): a dark fill, white while pressed */
             else if (!strcmp(lb, "T")) { r = g = b = ts[i].pressed ? 0.9f : 0.45f; ts[i].pressed = 0; }      /* the touch controls' on/off ring: bright on, faint off */
+            else if (ts[i].pressed) r = g = b = 1.0f;
             ob.sh[i][0] = ts[i].x; ob.sh[i][1] = ts[i].y; ob.sh[i][2] = ts[i].r; ob.sh[i][3] = (float)ts[i].round;
-            ob.glyph[i] = !strcmp(lb, "A") ? 1.0f : !strcmp(lb, "B") ? 2.0f : !strcmp(lb, "X") ? 3.0f : !strcmp(lb, "Y") ? 4.0f : !strcmp(lb, "EX") ? 5.0f : 0.0f;
-            ob.col[i][0] = ts[i].pressed ? 1.0f : r; ob.col[i][1] = ts[i].pressed ? 1.0f : g; ob.col[i][2] = ts[i].pressed ? 1.0f : b; ob.col[i][3] = ts[i].pressed ? 1.6f : 1.0f;
+            ob.glyph[i] = (float)gl;
+            ob.col[i][0] = r; ob.col[i][1] = g; ob.col[i][2] = b; ob.col[i][3] = ts[i].pressed ? 1.6f : 1.0f;
         }
         int64_t now = tk();
         plat_li fq; ((fq).QuadPart = plat_qpf());
