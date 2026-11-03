@@ -34,7 +34,7 @@ typedef struct VStage {
 typedef struct { uint32_t magic; int32_t stage, code_len; uint32_t key[4], fo; uint64_t spv, hb; uint32_t cbufs, ssbos, ssbo_w, images, dep, tex_units, in_attr, out_attr; int32_t uses_alpha, nsmp; VSmp smp[64]; } StageRec;
 typedef struct { uint32_t magic, key[4], fo, dep, tex; uint64_t vh; } VarRec;      /* ..\cache\vk\stage\<stage>_<hb>.var: the variants of one code */
 #define STAGEREC_MAGIC (0x52545356u + MX_VK_VERSION)
-typedef struct { int stage, code_len, serial; const uint8_t *code, *cdata; uint32_t cdata_size, local[3], smem, lmem; int gprim; /* SMO: geometry stage, as VStage */ } SSrc;
+typedef struct { int stage, code_len, serial; const uint8_t *code, *cdata; uint32_t cdata_size, local[3], smem, lmem; int gprim; /* SMO: geometry stage, as VStage; a vertex stage: 1 when a geometry stage follows it (module_from_glsl_ex) */ } SSrc;
 static plat_mutex g_sh_lock;
 static plat_cond g_sh_cv, g_jq_cv;        /* g_sh_cv: something was finished; g_jq_cv: a job was queued */
 /* ---- Session 12: the freeze watchdog's wait registry (nvn_vk_wd.c writes the report). Every wait of ours that has no
@@ -125,6 +125,7 @@ static uint64_t ssrc_hb(const SSrc *o) {
     if (o->stage == 5) { h = fnv(h, o->local, sizeof o->local); h = fnv(h, &o->smem, 4); h = fnv(h, &o->lmem, 4); }
     if (o->cdata) h = fnv(h ^ o->cdata_size, o->cdata, o->cdata_size);
     if (o->stage == 2) h = fnv(h, &o->gprim, sizeof o->gprim);      /* SMO: a geometry stage is translated for the draw's primitive class */
+    if (!D.has_dcc && (o->stage == 2 || (o->stage == 0 && o->gprim))) h = fnv(h, "dz-last", 7);      /* Android port: where the depth remap goes (module_from_glsl_ex); records made before it are not used */
     if (o->stage == 1 && RS_ON) h = fnv(h, "rs1", 3);      /* track O: the fragment stages of a run with an internal resolution scale are another translation (MxIn.screen_scale); at 1.0 the hash is the one it always was */
     return fnv(h, &ver, 4);
 }
@@ -150,18 +151,39 @@ static VkShaderModule module_from_glsl_(int stage, const char *glsl, const char 
  * (the emulator, many phones): every vertex stage ends with z = (z + w) / 2, the same mapping to Vulkan's 0..w that
  * negativeOneToOne makes. Without it the near half of the depth range is clipped away (SMO's full-screen copy into the
  * window texture sits at z = -w: the picture was black). The text changes, so the SPIR-V hash and its cache file differ
- * from a GPU that has the extension. A geometry stage is left as it is: its positions come from the vertex stage's, and
- * the mapping is linear, so a stage that combines them keeps it. */
-static VkShaderModule module_from_glsl(int stage, const char *glsl, const char *what, uint64_t *spv_hash, int *on_disk) {
-    const char *m = stage == 0 && !D.has_dcc ? strstr(glsl, "\nvoid main() {") : NULL;
-    if (!m) return module_from_glsl_(stage, glsl, what, spv_hash, on_disk);
-    static const char tail[] = "\nvoid main() { mx_main_dz(); gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5; }\n";
+ * from a GPU that has the extension. Only the last stage before the rasterizer is remapped (2026-11-04): with a geometry
+ * stage it is that one, at every EmitVertex, and the vertex stage before it is left as it is (gs_next), because a
+ * geometry stage may make its positions from what the vertex stage wrote in gl_Position (a position in the world, say)
+ * instead of passing them on; remapping both was right only for a stage that passes them on. */
+static VkShaderModule module_from_glsl_ex(int stage, const char *glsl, const char *what, uint64_t *spv_hash, int *on_disk, int gs_next) {
+    const char *m = (stage == 0 && !gs_next) || stage == 2 ? strstr(glsl, "\nvoid main() {") : NULL;
+    if (D.has_dcc || !m) return module_from_glsl_(stage, glsl, what, spv_hash, on_disk);
     size_t n = strlen(glsl), at = (size_t)(m - glsl);
-    char *t = malloc(n + sizeof tail + 16);
-    memcpy(t, glsl, at); memcpy(t + at, "\nvoid mx_main_dz() {", 20); strcpy(t + at + 20, m + 14); strcat(t, tail);
+    char *t;
+    if (stage == 0) {
+        static const char tail[] = "\nvoid main() { mx_main_dz(); gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5; }\n";
+        t = malloc(n + sizeof tail + 16);
+        memcpy(t, glsl, at); memcpy(t + at, "\nvoid mx_main_dz() {", 20); strcpy(t + at + 20, m + 14); strcat(t, tail);
+    } else {                                       /* the position as the vertex is emitted, and back to what the code wrote (the code may emit it again) */
+        static const char fn[] = "\nvoid mx_emit_dz() { vec4 p = gl_Position; gl_Position.z = (p.z + p.w) * 0.5; EmitVertex(); gl_Position = p; }";
+        int emits = 0;
+        for (const char *q = m; (q = strstr(q, "EmitVertex();")) != NULL; q += 13) emits++;
+        t = malloc(n + sizeof fn + (size_t)emits * 2 + 16);
+        memcpy(t, glsl, at); memcpy(t + at, fn, sizeof fn - 1);
+        char *o = t + at + sizeof fn - 1;
+        for (const char *q = m, *e; ; q = e + 13) {
+            e = strstr(q, "EmitVertex();");
+            if (!e) { strcpy(o, q); break; }
+            memcpy(o, q, (size_t)(e - q)); o += e - q;
+            memcpy(o, "mx_emit_dz();", 13); o += 13;
+        }
+    }
     VkShaderModule mod = module_from_glsl_(stage, t, what, spv_hash, on_disk);
     free(t);
     return mod;
+}
+static VkShaderModule module_from_glsl(int stage, const char *glsl, const char *what, uint64_t *spv_hash, int *on_disk) {
+    return module_from_glsl_ex(stage, glsl, what, spv_hash, on_disk, 0);
 }
 static VkShaderModule module_from_glsl_(int stage, const char *glsl, const char *what, uint64_t *spv_hash, int *on_disk) {      /* any thread; *on_disk (may be NULL): the SPIR-V file is there to be read again */
     {   /* SMO port, debug aid SMO_VK_GLSLDUMP=<folder>: every freshly translated stage as <what>.glsl (stages found in the
@@ -288,7 +310,7 @@ static void vstage_build(VStage *v, const SSrc *src) {
         char what[64];
         memset(&in, 0, sizeof in); memset(&out, 0, sizeof out);
         in.stage = s; in.code = src->code; in.code_len = src->code_len; in.cdata = src->cdata; in.cdata_size = src->cdata ? src->cdata_size : 0;
-        in.int_attrs = v->key[0]; in.sint_attrs = v->key[1]; in.int_tex = v->key[2]; in.sint_tex = v->key[3]; in.force_out = v->fo; in.gs_in_prim = src->gprim;
+        in.int_attrs = v->key[0]; in.sint_attrs = v->key[1]; in.int_tex = v->key[2]; in.sint_tex = v->key[3]; in.force_out = v->fo; in.gs_in_prim = s == 2 ? src->gprim : 0;
         in.target = 1; in.binding_base = 40u * (unsigned)s; in.ssbo_base = 40u * (unsigned)s + 20; in.tex_base = 40u * (unsigned)s; in.image_base = 40u * (unsigned)s + 32; in.wmask_binding = 40u * (unsigned)s + 38;
         if (s == 5) {                              /* compute has a layout of its own (design, section 4): the bindings of stage 0 */
             in.binding_base = 0; in.ssbo_base = 20; in.tex_base = 0; in.image_base = 32; in.wmask_binding = 38; in.track_writes = 1;
@@ -312,7 +334,7 @@ static void vstage_build(VStage *v, const SSrc *src) {
             uint64_t spv_hash = 0;
             if (in.screen_scale) { plat_atomic_inc(&g_rs_stages); if (strstr(out.glsl, "mx_fcs)")) plat_atomic_inc(&g_rs_fcs); if (strstr(out.glsl, "mx_tf(")) plat_atomic_inc(&g_rs_tf); }
             int on_disk;
-            v->mod = module_from_glsl(s, out.glsl, what, &spv_hash, &on_disk);
+            v->mod = module_from_glsl_ex(s, out.glsl, what, &spv_hash, &on_disk, s == 0 && src->gprim);
             v->spv = on_disk ? spv_hash : 0;       /* no SPIR-V file: the module is kept (stage_mod_releasable) */
             v->cbufs = out.cbufs; v->ssbos = out.ssbos; v->ssbo_w = out.ssbo_written; v->images = out.images; v->in_attr = out.in_attr; v->out_attr = out.out_attr;
             v->images_w = out.images_written; memcpy(v->img_fmt, out.image_gl_format, sizeof v->img_fmt); memcpy(v->img_type, out.image_type, sizeof v->img_type);

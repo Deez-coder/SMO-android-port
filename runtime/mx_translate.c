@@ -186,10 +186,10 @@ static const char *FLOW(Mx *e, unsigned t) {
 static void setcc_int(Mx *e, const char *res) { e->uses_cc = 1; emit(e, " cz = %s == 0u; cs = int(%s) < 0; ccf = false; cov = false;", res, res); }
 
 /* ---------------------------------------------------------------- results */
-/* float result with optional saturation and condition code */
+/* float result with optional saturation and condition code; saturation as Maxwell does it, a NaN to 0 (clamp leaves it undefined) */
 static void fres(Mx *e, uint64_t i, const char *expr, int sat, int cc) {
     emit(e, "float f = %s;", expr);
-    if (sat) emit(e, " f = clamp(f, 0.0, 1.0);");
+    if (sat) emit(e, " f = f > 0.0 ? min(f, 1.0) : 0.0;");
     emit(e, " %s = U(f);", DST);
     if (cc) { e->uses_cc = 1; emit(e, " cz = f == 0.0 || isnan(f); cs = f < 0.0 || isnan(f); ccf = false; cov = false;"); }
 }
@@ -694,7 +694,7 @@ static const char *HX(Mx *e, const char *r, unsigned sw, int absv, int neg) {
 static void hres(Mx *e, uint64_t i, const char *expr, int sat, unsigned merge, int fmz_zero, const char *za, const char *zb, const char *zc) {
     emit(e, "vec2 h = %s;", expr);
     if (fmz_zero && !sat) emit(e, " h = mix(h, %s, bvec2(%s.x == 0.0 || %s.x == 0.0, %s.y == 0.0 || %s.y == 0.0));", zc, za, zb, za, zb);
-    if (sat) emit(e, " h = clamp(h, 0.0, 1.0);");
+    if (sat) emit(e, " h = mix(vec2(0.0), min(h, vec2(1.0)), greaterThan(h, vec2(0.0)));");
     unsigned rd = MXB(i, 0, 8);
     emit(e, " %s = HM(%s, h, %uu);", D(e, rd), X(e, rd), merge);
 }
@@ -867,7 +867,9 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
     case MXOP_FMNMX_reg: case MXOP_FMNMX_cbuf: case MXOP_FMNMX_imm: {
         b = op == MXOP_FMNMX_reg ? R20 : op == MXOP_FMNMX_cbuf ? CB(e, i) : F20(e, i);
         const char *fa = FN(e, A8, MXB(i, 46, 1), MXB(i, 48, 1)), *fb = FN(e, b, MXB(i, 49, 1), MXB(i, 45, 1));
-        fres(e, i, S(e, "%s ? min(%s, %s) : max(%s, %s)", PR(e, MXB(i, 39, 3), (int)MXB(i, 42, 1)), fa, fb, fa, fb), 0, MXB(i, 47, 1));
+        /* Maxwell's FMNMX gives the other operand when one is NaN (GLSL leaves min / max of a NaN undefined: Mali keeps the
+         * NaN, and a NaN in the HDR picture spreads through the bloom into white or black blocks; Android port, 2026-11-04) */
+        fres(e, i, S(e, "(isnan(%s) ? %s : isnan(%s) ? %s : %s ? min(%s, %s) : max(%s, %s))", fa, fb, fb, fa, PR(e, MXB(i, 39, 3), (int)MXB(i, 42, 1)), fa, fb, fa, fb), 0, MXB(i, 47, 1));
         break;
     }
     case MXOP_FSET_reg: case MXOP_FSET_cbuf: case MXOP_FSET_imm: {
@@ -919,7 +921,7 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
         if (MXB(i, 45, 1)) src = S(e, "(-%s)", src);
         emit(e, "float f = %s;", src);
         if (ssz == dsz && rop >= 8) emit(e, " f = %s(f);", rnd[rop & 3]);
-        if (MXB(i, 50, 1)) emit(e, " f = clamp(f, 0.0, 1.0);");
+        if (MXB(i, 50, 1)) emit(e, " f = f > 0.0 ? min(f, 1.0) : 0.0;");
         if (dsz == 1) emit(e, " %s = packHalf2x16(vec2(f, 0.0));", DST); else emit(e, " %s = U(f);", DST);
         if (MXB(i, 47, 1)) { e->uses_cc = 1; emit(e, " cz = f == 0.0 || isnan(f); cs = f < 0.0 || isnan(f); ccf = false; cov = false;"); }
         break;
@@ -1296,7 +1298,7 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
                 emit(e, " if ((ad >> 4) == %uu) f = in_attr%u[(ad >> 2) & 3u]%s;", (0x80 >> 4) + n, n, (eff == 2 || eff == 0) ? " * gl_FragCoord.w" : "");
             }
             if (mode == 1) emit(e, " f *= F(%s);", R20);
-            if (MXB(i, 51, 1)) emit(e, " f = clamp(f, 0.0, 1.0);");
+            if (MXB(i, 51, 1)) emit(e, " f = f > 0.0 ? min(f, 1.0) : 0.0;");
             emit(e, " %s = U(f);", DST);
             break;
         }
@@ -1308,7 +1310,7 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
             if (eff == 2 || eff == 0) emit(e, " f *= gl_FragCoord.w;");      /* hardware IPA returns attribute / w; the shader multiplies by w */
         }
         if (mode == 1) emit(e, " f *= F(%s);", R20);
-        if (MXB(i, 51, 1)) emit(e, " f = clamp(f, 0.0, 1.0);");
+        if (MXB(i, 51, 1)) emit(e, " f = f > 0.0 ? min(f, 1.0) : 0.0;");
         emit(e, " %s = U(f);", DST);
         break;
     }

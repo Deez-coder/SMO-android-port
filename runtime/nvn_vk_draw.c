@@ -1090,6 +1090,23 @@ static VTex *vt_get2(Tex *t, int sync) {
         ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE; ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         VkResult r = vkCreateImage(V.device, &ci, NULL, &vt->img);
         if (r != VK_SUCCESS) vkd_fail("vkCreateImage (NVN format 0x%x -> %d, target %d, %dx%dx%d, %d levels, %d layers, %d samples): %s", b->format, (int)vt->fmt, b->target, vt->w, vt->h, vt->d, vt->levels, vt->layers, vt->samples, vk_result_name(r));
+        {   /* Android port (2026-11-04): a format the GPU cannot filter, blend or draw into is used anyway (the game's samplers and
+             * blend states do not know the GPU), so the picture can differ from one GPU to the next. One line per format, for
+             * reports from phones without the tester's GPU (Mali: the fog and glow broken there). */
+            static int seen[64], nseen;
+            int k = 0;
+            while (k < nseen && seen[k] != (int)vt->fmt) k++;
+            if (k == nseen && nseen < 64 && vt->aspect == VK_IMAGE_ASPECT_COLOR_BIT) {
+                VkFormatProperties fp;
+                vkGetPhysicalDeviceFormatProperties(V.gpu, vt->fmt, &fp);
+                VkFlags have = fp.optimalTilingFeatures;
+                seen[nseen++] = (int)vt->fmt;
+                if (!(have & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) || (f.kind != 4 && !vt->decode && !(have & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT)))
+                    printf("nvn_vk_fmt: NVN format 0x%x (Vulkan %d)%s: linear filtering %s, colour target %s, blending %s, storage %s\n", b->format, (int)vt->fmt, vt->decode ? " (decoded on the CPU)" : "",
+                           have & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT ? "yes" : "NO", have & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT ? "yes" : "NO",
+                           have & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT ? "yes" : "NO", have & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT ? "yes" : "NO");
+            }
+        }
         VkMemoryRequirements rq;
         vkGetImageMemoryRequirements(V.device, vt->img, &rq);
         vt->mem = vmem_alloc(rq, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
@@ -1329,7 +1346,7 @@ typedef struct VStage {
 } VStage;
 /* M4 (design section 5): what a stage needs to become a module again without the translator and glslang, in
  * ..\cache\vk\stage\<stage>_<hash of machine code, constants, variant, translator version>.st */
-#define MX_VK_VERSION 8u                           /* part of the stage hash: change it when mx_translate's Vulkan text changes */
+#define MX_VK_VERSION 9u                           /* part of the stage hash: change it when mx_translate's Vulkan text changes */
 typedef struct { uint32_t magic; int32_t stage, code_len; uint32_t key[4], fo; uint64_t spv; uint32_t cbufs, ssbos, ssbo_w, images, dep, tex_units, in_attr, out_attr; int32_t uses_alpha, nsmp; VSmp smp[64]; } StageRec;
 static plat_mutex g_sh_lock;                 /* the stage and pipeline tables while the start-up workers run */
 static VkPipelineCache g_pcache;
@@ -2657,8 +2674,8 @@ static int draw_prepare(unsigned prim) {
         gs = vstage_get(R.prog[2], 2, keyg, gcur ? gcur->fo : 0, tclass[prim]);
         if (gs) { uint32_t need = fs ? fs->in_attr & ~(gs->out_attr & ~gs->fo) : 0; if (need != gs->fo) gs = vstage_get(R.prog[2], 2, keyg, need, tclass[prim]); }
     }
-    vs = vstage_get(R.prog[0], 0, key0, cur ? cur->fo : 0, 0);
-    if (vs) { uint32_t want = R.prog[2] ? (gs ? gs->in_attr : 0) : fs ? fs->in_attr : 0, need = want & ~(vs->out_attr & ~vs->fo); if (need != vs->fo) vs = vstage_get(R.prog[0], 0, key0, need, 0); }
+    vs = vstage_get(R.prog[0], 0, key0, cur ? cur->fo : 0, R.prog[2] != NULL);      /* a vertex stage before a geometry stage is a translation of its own (module_from_glsl_ex) */
+    if (vs) { uint32_t want = R.prog[2] ? (gs ? gs->in_attr : 0) : fs ? fs->in_attr : 0, need = want & ~(vs->out_attr & ~vs->fo); if (need != vs->fo) vs = vstage_get(R.prog[0], 0, key0, need, R.prog[2] != NULL); }
     if (g_skip_flag) { g_skip_flag = 0; if (!vs || (!depth_only && !fs) || (R.prog[2] && !gs)) return 0; }      /* shader_wait = skip: the draw is left out (counted in vstage_get) */
     if (!vs || (!depth_only && !fs) || (R.prog[2] && !gs)) { nvn_vk_missing("a draw whose vertex, fragment or geometry stage could not be translated or compiled (the log names the stage)"); return 0; }
     VStage *sv[3] = {vs, fs, gs};                  /* by NVN stage: the bindings of stage s are 40 * s + ... (mx_translate.h) */

@@ -498,6 +498,27 @@ sharpening 75):
   clocks 1.3-1.4 GHz. Not measured in the heavy view or for heat. `boost = off`: no spin.
 - In 60 fps mode the target is 16.7 ms, so auto turns on below ~57 fps. Not measured in 60 fps mode yet.
 
+## Mali testers: haze, white glow blobs, flashing (2026-11-04)
+- Two testers, both MediaTek with Mali and the system driver: MT6897 (Dimensity 8300, Mali-G615 MC6, Vulkan
+  1.3.247) and MT6899 (Dimensity 8400, Mali-G720 MC7). In Cap Kingdom: washed-out haze, large white glow blobs that
+  shouldn't be there, flashing; tester 1 also has blocky stair-step edges around objects. The Bowser cutscene looked
+  right on tester 2. A third tester (Poco F6, Adreno 735, stock driver, no log yet) needed Turnip for graphical issues.
+- What both Mali logs share and the S24 (Adreno 750) does not: no BC (CPU decode), no VK_EXT_depth_clip_control
+  (depth remap in the shaders). No error lines unique to Mali; no BC6H textures in use.
+- Emulator (gfxstream on an RTX 4060, also no depth_clip_control) with `SMO_VK_NO_BC=1`: the opening cutscene renders
+  correctly, so the CPU BC decode and the depth remap are not the cause; the BC4/BC5 snorm decoder also checks out
+  against the spec. What remains is the Mali driver itself.
+- Most likely cause: the translator emitted Maxwell FMNMX as GLSL `min`/`max` and `.SAT` as `clamp(f, 0.0, 1.0)`. Both
+  are undefined for a NaN in GLSL; Maxwell gives the other operand (FMNMX) and 0 (SAT). NVIDIA and Adreno happen to
+  return the non-NaN value; Mali keeps the NaN, and a NaN in the HDR picture spreads through the bloom into blobs.
+  Fixed in `mx_translate.c` (FMNMX with isnan checks, saturate as `f > 0.0 ? min(f, 1.0) : 0.0`, the half-float pair
+  likewise); MX_VK_VERSION 8 -> 9, so every phone translates its stages again once (a first start's shader work).
+  NOT tested on Mali: no Mali device here.
+- Also changed: with a geometry stage, the depth remap goes on that stage at every EmitVertex instead of on the
+  vertex stage before it (a geometry stage may build its positions from what the vertex stage left in gl_Position);
+  only SMO's lightning effects have one. And `nvn_vk_fmt:` log lines name every format the GPU cannot filter
+  linearly or blend (a format the game samples or blends anyway), for the next Mali reports.
+
 ## Open problems, most important first
 
 1. **BC textures on phones without BC (Mali, PowerVR): decoded on the CPU since 2026-10-28.**
