@@ -449,7 +449,7 @@ static VStage *vstage_get(Prog *p, int s, const uint32_t *key, uint32_t fo, int 
  * VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE), so a mesh with another stride does not make another pipeline. */
 typedef struct { uint32_t vs, fs, chanmask, sample_mask; int32_t cfmt[8], dfmt; uint8_t topo_class, ncolor, samples, poly, a2c, dclamp, logic, sshade, blend_on, pad[3]; uint8_t blend[8][8];
                  uint8_t vnb, vna, vrate[17], vpad; uint8_t vbind[16], vfmt[16]; uint16_t voff[16]; } PKey;
-typedef struct Pipe { PKey k; VkPipeline p, p_fast; /* p_fast: the pipeline linked at once, after the optimised one took its place */ VkPipelineLayout layout; VkDescriptorSetLayout dl[2]; int nb[2], push0; VStage *vs, *fs, *gs /* SMO: see gs_pipe_get */; volatile int32_t state; uint8_t recorded, predicted, used, libbed, lib_how; struct Pipe *next; } Pipe;      /* libbed: linked from libraries (layout and set layouts belong to the pair library); lib_how: 0 the pair library was there, 1 compiled by this build, 2 waited for */      /* state: 0 queued for a worker, 1 being made, 2 made */
+typedef struct Pipe { PKey k; VkPipeline p, p_fast; /* p_fast: the pipeline linked at once, after the optimised one took its place */ VkPipelineLayout layout; VkDescriptorSetLayout dl[2]; int nb[2], push0, dyn0 /* buffers of set 0 at dynamic offsets (dyn0_pick) */, dl0_shared /* 1: dl[0], 2: dl[1] from dl0_get */; uint64_t dynm[2] /* which of set 0's writes are dynamic */; VStage *vs, *fs, *gs /* SMO: see gs_pipe_get */; volatile int32_t state; uint8_t recorded, predicted, used, libbed, lib_how; struct Pipe *next; } Pipe;      /* libbed: linked from libraries (layout and set layouts belong to the pair library); lib_how: 0 the pair library was there, 1 compiled by this build, 2 waited for */      /* state: 0 queued for a worker, 1 being made, 2 made */
 static Pipe *g_pipes[1024];
 static VkShaderModule g_gs_dbg_fs;                 /* SMO_VK_GS_DEBUG=3 (gs_pipe_get): the fragment stage of draws with a geometry stage */
 /* SMO debug aid SMO_VK_GS_DEBUG=<mode> for the draws with a geometry stage (the lightning): 1 measures them (nvn_vk_draw.c
@@ -473,6 +473,38 @@ static void layout_bindings(VStage *v, int s, VkDescriptorSetLayoutBinding *b0, 
     for (unsigned n = 1; n < 18; n++) if (v->cbufs >> n & 1) { VkDescriptorSetLayoutBinding b = {40u * (unsigned)s + n, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, sf, NULL}; b0[(*n0)++] = b; }
     for (unsigned k = 0; k < 16; k++) if (v->ssbos >> k & 1) { VkDescriptorSetLayoutBinding b = {40u * (unsigned)s + 20 + k, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, sf, NULL}; b0[(*n0)++] = b; }
     for (int i = 0; i < v->nsmp; i++) { VkDescriptorSetLayoutBinding b = {v->smp[i].binding, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, sf, NULL}; b1[(*n1)++] = b; }
+}
+/* Android port: on a device without push descriptors (Mali-G615's driver, the emulator) set 0 used to be allocated and
+ * written at every draw (on the emulator vkAllocateDescriptorSets was 44% of the render thread). Now up to D.dyn0 of its
+ * buffers are dynamic: the draw passes their offsets, and a set is reused for every draw with the same layout, buffers and
+ * ranges (draw_prepare). All of them when the device allows that many, else the uniform slots and storage buffers first
+ * (binding % 40 >= 3), then c1 and c2. m: which of the n bindings (in order, = the draw's writes) are dynamic. */
+static int dyn0_pick(VkDescriptorSetLayoutBinding *b, int n, uint64_t *m) {
+    int nd = 0;
+    m[0] = m[1] = 0;
+    for (int pass = 0; pass < 2; pass++)
+        for (int i = 0; i < n && i < 128; i++)
+            if (nd < D.dyn0 && !(m[i >> 6] >> (i & 63) & 1) && (pass || b[i].binding % 40 >= 3)) { b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC; m[i >> 6] |= 1ull << (i & 63); nd++; }
+    return nd;
+}
+/* Pipelines with the same set 0 bindings (without push descriptors), or the same set 1 bindings (every device), share
+ * one layout (made once), so the draws of different pipelines can share sets (draw_prepare). Any thread. */
+static plat_mutex g_dl0_lock;
+static struct Dl0 { VkDescriptorSetLayout dl; int n; VkDescriptorSetLayoutBinding *b; struct Dl0 *next; } *g_dl0[512];
+static int64_t g_dl0_made;
+static VkDescriptorSetLayout dl0_get(const VkDescriptorSetLayoutCreateInfo *li) {
+    uint64_t h = fnv(0xcbf29ce484222325ULL, li->pBindings, sizeof li->pBindings[0] * li->bindingCount);
+    struct Dl0 *e;
+    plat_mutex_lock(&g_dl0_lock);
+    for (e = g_dl0[h & 511]; e; e = e->next) if (e->n == (int)li->bindingCount && !memcmp(e->b, li->pBindings, sizeof e->b[0] * (size_t)e->n)) break;
+    if (!e) {
+        e = calloc(1, sizeof *e);
+        e->n = (int)li->bindingCount; e->b = malloc(sizeof e->b[0] * (size_t)(e->n ? e->n : 1)); memcpy(e->b, li->pBindings, sizeof e->b[0] * (size_t)e->n);
+        VKC(vkCreateDescriptorSetLayout(V.device, li, NULL, &e->dl));
+        e->next = g_dl0[h & 511]; g_dl0[h & 511] = e; g_dl0_made++;
+    }
+    plat_mutex_unlock(&g_dl0_lock);
+    return e->dl;
 }
 static Pipe *pipe_find(const PKey *k, uint64_t h) { for (Pipe *p = g_pipes[h & 1023]; p; p = p->next) if (!memcmp(&p->k, k, sizeof *k)) return p; return NULL; }      /* g_sh_lock held */
 static Pipe *pipe_new(const PKey *k, VStage *vs, VStage *fs, uint64_t h, int state) {                                                                                 /* g_sh_lock held */
@@ -849,6 +881,8 @@ static double pipe_build(Pipe *p) {
         VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
         li.bindingCount = (uint32_t)p->nb[i]; li.pBindings = i ? b1 : b0;
         if (i == 0 && D.has_push && p->nb[0] <= 32) { li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR; p->push0 = 1; }      /* 32: the smallest maxPushDescriptors a device may have */
+        if (i == 0 && !p->push0) { p->dyn0 = dyn0_pick(b0, p->nb[0], p->dynm); p->dl[0] = dl0_get(&li); p->dl0_shared |= 1; continue; }
+        if (i == 1) { p->dl[1] = dl0_get(&li); p->dl0_shared |= 2; continue; }
         VKC(vkCreateDescriptorSetLayout(V.device, &li, NULL, &p->dl[i]));
     }
     VkPushConstantRange pc = {VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16};
@@ -1784,7 +1818,7 @@ static int hold_scan(void) {
     return on;
 }
 static void prewarm_start(void) {
-    plat_mutex_init(&g_sh_lock); plat_mutex_init(&g_gpl_lock);
+    plat_mutex_init(&g_sh_lock); plat_mutex_init(&g_gpl_lock); plat_mutex_init(&g_dl0_lock);
     plat_cond_init(&g_sh_cv); plat_cond_init(&g_jq_cv);
     plat_mkdirs(vkc_dir()); plat_mkdirs(vkc_file("spv")); plat_mkdirs(vkc_file("stage"));
     if (getenv("SMO_VK_CACHE")) printf("nvn_vk: cache folder %s (SMO_VK_CACHE)\n", vkc_dir());
@@ -1990,6 +2024,7 @@ static void m4_report(void) {
     int64_t n = 0, t = 0;
     for (int i = 0; i < H_N; i++) { n += g_hold_n[i]; t += g_hold_tk[i]; }
     printf("nvn_vk: texture descriptor sets: %lld reused after a full comparison of their lists, %lld hash hits with a different list (given a set of their own); samplers given a dummy because the texture is of another kind than the shader declares: %lld\n", (long long)R.sets_reused, (long long)R.tset_collisions, (long long)R.dummy_kind);
+    if (!D.has_push) printf("nvn_vk: buffer descriptor sets (no push descriptors, %d dynamic at most): %lld made, %lld reused (counted in the reuses above as well); %lld set layouts shared by the pipelines\n", D.dyn0, (long long)g_bset_made, (long long)g_bset_hits, (long long)g_dl0_made);
     printf("nvn_vk_m4: holds of the render thread at a draw: %lld, %.0f ms in all, longest %.1f ms (stage made at the draw %lld / %.0f ms, stage waited for %lld / %.0f ms, pipeline made at the draw %lld / %.0f ms, pipeline waited for %lld / %.0f ms)\n",
            (long long)n, (double)t * k, (double)g_hold_max * k, (long long)g_hold_n[0], (double)g_hold_tk[0] * k, (long long)g_hold_n[1], (double)g_hold_tk[1] * k, (long long)g_hold_n[2], (double)g_hold_tk[2] * k, (long long)g_hold_n[3], (double)g_hold_tk[3] * k);
     printf("nvn_vk_m4: workers: %lld programs handed over, %lld stages made by them, %lld pipelines made by them; look-ahead: %lld pipelines and %lld draws with stages still to make sent ahead, %.0f ms of reading in all; blind prediction: %lld keys, %lld used; pass signatures %d; nvnProgramSetShaders held its caller %lld times, %.0f ms in all\n",
@@ -2746,7 +2781,7 @@ int nvn_vk_prepare_shaders(const char *dir) {
     long long vars = 0, jobs = 0;
     if (!dir) dir = "../cache/vk_containers";
     g_offline = 1; g_game_tables = 0; g_cpredict = 0;
-    plat_mutex_init(&g_sh_lock); plat_mutex_init(&g_gpl_lock);
+    plat_mutex_init(&g_sh_lock); plat_mutex_init(&g_gpl_lock); plat_mutex_init(&g_dl0_lock);
     plat_cond_init(&g_sh_cv); plat_cond_init(&g_jq_cv);
     plat_mkdirs("../cache"); plat_mkdirs(vkc_dir()); plat_mkdirs(vkc_file("spv")); plat_mkdirs(vkc_file("stage"));
     {   smo_glsl_bind(&g_glsl_to_spirv, &g_spirv_free);

@@ -53,6 +53,7 @@ static struct {
     int has_vids, has_cbc, has_pv, has_iu8, has_plr, has_vad, has_push, has_eds3, debug;
     int has_gpl, ext_gpl, ext_so;
     int has_dcc;                                   /* SMO: VK_EXT_depth_clip_control (NVN depth mode NEAR_IS_MINUS_W) */
+    int dyn0;                                      /* Android port: without push descriptors, up to dyn0 buffers of set 0 are dynamic (dyn0_is); 0 = none */
     VkPhysicalDeviceMemoryProperties mp;
 } D;
 /* SMO: NVN's depth mode is honoured, read when a pipeline is made (the game sets it on the device after nvnDeviceInitialize, which
@@ -408,11 +409,13 @@ static void slot_wait(Slot *s) {
 static void garbage_collect(void);
 static uint32_t g_tset_gen = 1;                   /* texture descriptor sets live as long as the command buffer whose pools they come from */
 static int g_tset_used, g_tset_list_used;
+static int g_bset_used, g_bset_list_used;      /* the same for the buffer sets of devices without push descriptors (draw_prepare, dyn0_pick) */
+static int64_t g_bset_hits, g_bset_made;
 static int64_t g_sub_draws0, g_chunk_submits;    /* Android port: the frame's draw count when this command buffer began (submit_chunk) */
 static void cmd_begin(void) {
     if (R.recording) return;
     g_sub_draws0 = R.frame_draws;
-    g_tset_gen++; g_tset_used = 0; g_tset_list_used = 0;
+    g_tset_gen++; g_tset_used = 0; g_tset_list_used = 0; g_bset_used = 0; g_bset_list_used = 0;
     R.cur = (R.cur + 1) % NSLOT;
     Slot *s = &R.slot[R.cur];
     slot_wait(s);
@@ -1752,9 +1755,9 @@ static VkDescriptorSet set_alloc(VkDescriptorSetLayout layout) {
             continue;
         }
         if (s->npool == 16) vkd_fail("more than 16 descriptor pools in one command buffer");
-        VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 32768}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32768}};
+        VkDescriptorPoolSize ps[3] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 32768}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32768}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 16384}};
         VkDescriptorPoolCreateInfo pi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        pi.maxSets = 8192; pi.poolSizeCount = 2; pi.pPoolSizes = ps;
+        pi.maxSets = 8192; pi.poolSizeCount = D.dyn0 ? 3 : 2; pi.pPoolSizes = ps;
         VKC(vkCreateDescriptorPool(V.device, &pi, NULL, &s->pool[s->npool++]));
     }
 }
@@ -1762,6 +1765,8 @@ static struct { uint64_t key; VkDescriptorSet set; uint32_t gen; VkDescriptorSet
 static struct { VTex *d2, *d1, *d3; VkImageView v[7]; } g_dummy;
 static struct { VkImageView view; VkSampler smp; VkImageLayout layout; } g_dtex[200], g_tset_list[32768];      /* g_tset_list: the lists of the cached sets, for the full comparison */
 static int g_ndtex;
+static struct { uint64_t key; VkDescriptorSet set; uint32_t gen; VkDescriptorSetLayout dl; int n, off; } g_bset[4096];      /* buffer sets (set 0) of the command buffer being recorded, without push descriptors */
+static VkDescriptorBufferInfo g_bset_list[32768];  /* their lists (dynamic ones at offset 0), for the full comparison */
 /* The image view and sampler of one declared sampler of stage s. May end the pass (upload, layout change). */
 static size_t read_region(Tex *t, const View *vp, const int *r, void *out, int64_t row_stride, int64_t image_stride);
 /* SMO, 1.4.1: a sampler whose handle the game keeps in one of its uniform buffers (mx_translate.c bindless_unit: unit
@@ -2823,8 +2828,8 @@ static int draw_prepare(unsigned prim) {
         /* M4: buffers change with every draw: pushed into the command buffer (no set, no pool) when the device can; the
          * textures of a draw repeat: one set per distinct list (layout, views, samplers, image layouts) per command buffer */
         VkDescriptorSet sets[2] = {NULL, NULL};
-        int nw = 0, ib = 0, it = 0;
-        if (!p->push0 && p->nb[0]) sets[0] = set_alloc(p->dl[0]);
+        int nw = 0, ib = 0, it = 0, nd = 0;
+        uint32_t doff[64];
         memset(w, 0, sizeof w[0] * (size_t)(p->nb[0] + p->nb[1]));
         for (int s = 0; s < 3; s++) {
             VStage *v = sv[s];
@@ -2835,11 +2840,36 @@ static int draw_prepare(unsigned prim) {
                 BufRef *b = &bufs[ib];
                 bi[ib].buffer = b->zero ? R.zero : b->buf; bi[ib].offset = b->zero ? 0 : b->off; bi[ib].range = b->zero ? 65536 : b->size;
                 w[nw].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[nw].dstSet = sets[0]; w[nw].dstBinding = 40u * (unsigned)s + (n < 18 ? n : 20 + n - 18); w[nw].descriptorCount = 1;
-                w[nw].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[nw].pBufferInfo = &bi[ib]; nw++; ib++;
+                w[nw].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[nw].pBufferInfo = &bi[ib];
+                if (nw < 128 && (p->dynm[nw >> 6] >> (nw & 63) & 1)) {      /* dynamic (dyn0_pick: the writes are the layout's bindings in its order): the offset goes to the bind */
+                    w[nw].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC; doff[nd++] = (uint32_t)bi[ib].offset; bi[ib].offset = 0;
+                }
+                nw++; ib++;
             }
         }
         if (p->push0) { if (nw) vkCmdPushDescriptorSetKHR(R.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p->layout, 0, (uint32_t)nw, w); }
-        else if (sets[0]) { vkUpdateDescriptorSets(V.device, (uint32_t)nw, w, 0, NULL); vkCmdBindDescriptorSets(R.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p->layout, 0, 1, &sets[0], 0, NULL); }
+        else if (p->nb[0]) {                       /* without push descriptors: one set per distinct list (layout, buffers, offsets of the others, ranges) per command buffer;
+                                                    * not for the one layout of every library pipeline (g_udl), whose lists hold other bindings */
+            uint64_t key = fnv(fnv(0xcbf29ce484222325ULL, &p->dl[0], sizeof p->dl[0]), bi, sizeof bi[0] * (size_t)nw);
+            unsigned slot;
+            if (!key) key = 1;
+            for (slot = (unsigned)key & 4095; g_bset[slot].gen == g_tset_gen && g_bset[slot].key != key; slot = (slot + 1) & 4095) {}
+            int hit = g_bset[slot].gen == g_tset_gen && g_bset[slot].key == key;
+            if (p->dl[0] == g_udl[0]) { hit = 0; slot = 4096; }
+            if (hit && (g_bset[slot].dl != p->dl[0] || g_bset[slot].n != nw || memcmp(&g_bset_list[g_bset[slot].off], bi, sizeof bi[0] * (size_t)nw))) { hit = 0; R.tset_collisions++; slot = 4096; }
+            if (hit) { sets[0] = g_bset[slot].set; R.sets_reused++; g_bset_hits++; }
+            else {
+                sets[0] = set_alloc(p->dl[0]); g_bset_made++;
+                for (int i = 0; i < nw; i++) w[i].dstSet = sets[0];
+                vkUpdateDescriptorSets(V.device, (uint32_t)nw, w, 0, NULL);
+                if (slot < 4096 && g_bset_used < 3000 && g_bset_list_used + nw <= (int)(sizeof g_bset_list / sizeof g_bset_list[0])) {
+                    g_bset[slot].key = key; g_bset[slot].set = sets[0]; g_bset[slot].gen = g_tset_gen; g_bset[slot].dl = p->dl[0]; g_bset[slot].n = nw; g_bset[slot].off = g_bset_list_used;
+                    memcpy(&g_bset_list[g_bset_list_used], bi, sizeof bi[0] * (size_t)nw);
+                    g_bset_list_used += nw; g_bset_used++;
+                }
+            }
+            vkCmdBindDescriptorSets(R.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p->layout, 0, 1, &sets[0], (uint32_t)nd, doff);
+        }
         if (p->nb[1]) {
             uint64_t key = fnv(0xcbf29ce484222325ULL, &p->dl[1], sizeof p->dl[1]);
             unsigned slot;
@@ -4878,7 +4908,9 @@ static void vkd_init(void) {
         if (D.f2.features.depthClamp) { X3(vkCmdSetDepthClampEnableEXT) }
 #undef X3
     }
-    printf("nvn_vk: descriptors: buffers (set 0) %s, textures (set 1) one set per distinct binding list per command buffer\n", D.has_push ? "pushed (VK_KHR_push_descriptor)" : "one allocated set per draw");
+    if (!D.has_push && !(getenv("SMO_VK_DYN0") && !atoi(getenv("SMO_VK_DYN0")))) D.dyn0 = (int)(V.props.limits.maxDescriptorSetStorageBuffersDynamic < 64 ? V.props.limits.maxDescriptorSetStorageBuffersDynamic : 64);
+    if (D.dyn0) printf("nvn_vk: descriptors: buffers (set 0) one set per distinct buffer list per command buffer, up to %d of them at dynamic offsets (the device allows %u), textures (set 1) one set per distinct binding list per command buffer\n", D.dyn0, V.props.limits.maxDescriptorSetStorageBuffersDynamic);
+    else printf("nvn_vk: descriptors: buffers (set 0) %s, textures (set 1) one set per distinct binding list per command buffer\n", D.has_push ? "pushed (VK_KHR_push_descriptor)" : "one allocated set per draw");
     vkGetPhysicalDeviceMemoryProperties(V.gpu, &D.mp);
     for (int i = 0; i < NSLOT; i++) {
         VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
@@ -4964,7 +4996,7 @@ static void vkd_shutdown(void) {
     for (int i = 0; i < NSLOT; i++) slot_wait(&R.slot[i]);
     R.done = ~0ull; garbage_collect();
     while (g_vtex_all) { VTex *vt = g_vtex_all; if (vt->t) vt->t->vk = NULL; vt_destroy(vt); }
-    for (int i = 0; i < 1024; i++) for (Pipe *p = g_pipes[i], *n; p; p = n) { n = p->next; vkDestroyPipeline(V.device, p->p, NULL); if (p->p_fast) vkDestroyPipeline(V.device, p->p_fast, NULL); if (!p->libbed) { vkDestroyPipelineLayout(V.device, p->layout, NULL); vkDestroyDescriptorSetLayout(V.device, p->dl[0], NULL); vkDestroyDescriptorSetLayout(V.device, p->dl[1], NULL); } free(p); }
+    for (int i = 0; i < 1024; i++) for (Pipe *p = g_pipes[i], *n; p; p = n) { n = p->next; vkDestroyPipeline(V.device, p->p, NULL); if (p->p_fast) vkDestroyPipeline(V.device, p->p_fast, NULL); if (!p->libbed) { vkDestroyPipelineLayout(V.device, p->layout, NULL); if (!(p->dl0_shared & 1)) vkDestroyDescriptorSetLayout(V.device, p->dl[0], NULL); if (!(p->dl0_shared & 2)) vkDestroyDescriptorSetLayout(V.device, p->dl[1], NULL); } free(p); }
     gpl_destroy();
     for (int i = 0; i < 8; i++) for (int k = 0; k < 2; k++) if (g_sem[i][k]) { vkDestroySemaphore(V.device, g_sem[i][k], NULL); g_sem[i][k] = NULL; }
     for (int i = 0; i < 16; i++) if (g_sem_img[i]) { vkDestroySemaphore(V.device, g_sem_img[i], NULL); g_sem_img[i] = NULL; }

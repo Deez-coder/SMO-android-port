@@ -519,6 +519,27 @@ sharpening 75):
   only SMO's lightning effects have one. And `nvn_vk_fmt:` log lines name every format the GPU cannot filter
   linearly or blend (a format the game samples or blends anyway), for the next Mali reports.
 
+## Draw preparation without push descriptors (2026-11-04)
+- Mali-G615's driver (tester 1) and the emulator have no VK_KHR_push_descriptor, so set 0 (the buffers) was allocated
+  and written at every draw: 1337 sets a frame on tester 1, draw preparation 10.5 ms of an 18 ms replay. On the
+  emulator, a profile of the render thread (simpleperf) put 44% in vkAllocateDescriptorSets and 12% in
+  vkUpdateDescriptorSets.
+- Now (`dyn0_pick`, `dl0_get`, draw_prepare):
+  - up to `maxDescriptorSetStorageBuffersDynamic` of set 0's buffers are STORAGE_BUFFER_DYNAMIC: all of them when the
+    device allows that many, else the uniform slots and storage buffers first;
+  - the draw passes their offsets at the bind, and a set is reused for every draw of the command buffer with the same
+    layout, buffers, ranges and remaining offsets (full list comparison, as for the texture sets);
+  - pipelines with the same bindings share one set layout (set 0 without push descriptors, set 1 on every device),
+    so draws of different pipelines share sets too. The one layout of library pipelines (GPL) is left as it was.
+  - `SMO_VK_DYN0=0` turns the dynamic buffers off (sets are still reused when the whole list matches).
+- Emulator, same Cap Kingdom play view (481 sets a frame before): draw preparation 54 -> 36 ms a frame, batch replay
+  58.5 -> 39.9 ms, 14 -> 20 fps; sets allocated 426 -> 194 a frame. The frames match the old build's within the
+  run-to-run differences of that view (an idle animation; mean difference 0.2-0.8 of 255 against the old build and
+  between two runs of the new one).
+- NOT measured on a phone. Devices with push descriptors (Adreno, Mali-G720) change only in the shared set 1 layouts.
+  Without push descriptors the set layouts differ from before, so the driver's pipeline cache misses once (first start
+  after the update makes its pipelines again).
+
 ## Open problems, most important first
 
 1. **BC textures on phones without BC (Mali, PowerVR): decoded on the CPU since 2026-10-28.**
