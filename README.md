@@ -17,14 +17,14 @@ translated to C ahead of time and compiled for Android with the NDK. The console
 
 ## Status: beta
 
-The game boots, plays and saves. It has been played through the early kingdoms on one phone so far, a Galaxy S24
+The game boots, plays and saves. It has been played on one phone so far, a Galaxy S24
 Ultra (Snapdragon 8 Gen 3). Other phones, including Mali (Exynos, MediaTek, Tensor) and lower-end chips, are untested.
 
 **Performance is not where we want it yet, and we are working on it.** On the S24 Ultra:
 
 - The **30 fps mode** (recommended) runs the game at full speed and holds 30 fps most of the time, with 1% lows of
-  about 22–27 fps, on both the phone's own driver and Turnip.
-- The **60 fps mode** runs at about 30–45 fps, so the game plays slower than normal there.
+  about 22–27 fps, on both the phone's own driver and Turnip. (you can use a custom driver if you would like for a lil more frames but it is NOT required.
+- The **60 fps mode** runs at about 30–45 fps on my phone, so the game plays slower than normal there.
 - The limit is the CPU (the game's main thread and the threads it waits on) and how Android clocks the CPU for this
   kind of workload, not the GPU. The work in progress is described in [PROGRESS.md](PROGRESS.md).
 - The first start of each area is slower while shaders are compiled for your phone.
@@ -96,7 +96,7 @@ assets, keys or firmware, and it does not help anyone obtain them. You must own 
 
 ## Credits
 
-- **holdup.lethimcook** (Discord): creator of the Android port. Direction, design, testing and play-testing.
+- **holdup.lethimcook** (Discord),quandaile (reddit): creator of the Android port. Direction, design, testing and play-testing.
 - **Claude** (Anthropic's AI assistant, used through Claude Code): co-developer. Wrote much of the Android port's code
   (the Android host, the Vulkan renderer's work for phones, the launcher, the 30 fps mode, the graphics options) and
   the measurements in PROGRESS.md.
