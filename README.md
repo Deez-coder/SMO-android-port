@@ -1,88 +1,90 @@
 the one official source of this port, anywhere else is NOT done by me
 # SMO Android Port
 
-A native Android port of *Super Mario Odyssey* (version 1.0.0), built on the static recompilation from
+*Super Mario Odyssey* (version 1.0.0) running natively on Android, built on the static recompilation from
 [smo-recomp](https://github.com/Coz-0/smo-recomp).
 
-This is **not an emulator**. There is no CPU interpreter, no JIT and no compatibility layer: the game's ARM64 code is
-translated to C ahead of time and compiled for Android with the NDK. The console's system libraries, NVN graphics
-(on Vulkan), shaders, audio, input and file system are re-implemented by this project's runtime.
+And no, it's **not an emulator**. No CPU interpreter, no JIT, no compatibility layer. The game's ARM64 code gets translated
+to C ahead of time and compiled for Android with the NDK, and this project's runtime takes care of the rest: the console's
+system libraries, NVN graphics (on Vulkan), shaders, audio, input and the file system.
 
-> **This repository contains no game code, no game assets, no keys and no firmware.**
-> You need your own copy of the game and the keys dumped from your own console.
+> **There's no game code, no game assets, no keys and no firmware in this repo.**
+> You need your own copy of the game and keys dumped from your own console.
 
-> **Made with AI.** Most of this port's code was written by Claude, Anthropic's AI assistant (through Claude Code),
-> directed, reviewed and tested on a real phone by the project's creator. Expect rough edges, and please report
-> problems with logs (see below).
+> **Made with AI.** Most of the code was written by Claude, Anthropic's AI assistant (through Claude Code), with the
+> project's creator directing it, reviewing it and testing it on a real phone. Expect some rough edges, and if something
+> breaks, please send logs (see below).
 
 ## Status: beta 0.2
 
-The game boots, plays and saves. On the dev's Galaxy S24 Ultra (Snapdragon 8 Gen 3, the phone's own driver):
+The game boots, plays and saves! Here's how it runs on the dev's Galaxy S24 Ultra (Snapdragon 8 Gen 3, the phone's own driver):
 
 - **60 fps mode:** 60 fps in small and medium areas, about 40–45 fps in some heavy areas. The picture gets softer when
   the game lowers its render size, and under 60 fps the game plays a little slower than normal.
 - **30 fps mode:** full game speed, holds 30 fps most of the time.
 
-u/CAPELINI_W, testing on a Mali-G615 phone, reports no graphical issues and good performance. Other phones are untested. Custom
-drivers are optional. The first start builds the graphics for your phone (about 2-3 minutes, once).
+u/CAPELINI_W tested it on a Mali-G615 phone and reports no graphical issues and good performance. Other phones are untested,
+so we'd love to hear how yours does. Custom drivers are optional. The first start builds the graphics for your phone, which
+takes about 2-3 minutes, but only once.
 
-## Features
+## What you get
 
 **Game**
-- Import your own game in the app: your `prod.keys`, then your NSP or XCI of 1.0.0 (base game, no update). The
-  keys stay in the app's private storage until you remove them.
+- Import your own game right in the app: your `prod.keys`, then your NSP or XCI of 1.0.0 (base game, no update). The keys
+  stay in the app's private storage until you remove them.
 - 30 fps mode (full game speed) and 60 fps mode.
-- Save export and import as a .zip (the current save is kept as a backup).
-- RomFS mods, turned on and off in the app.
+- Save export and import as a .zip (your current save is kept as a backup).
+- RomFS mods you can turn on and off in the app.
 
 **Graphics**
 - Vulkan 1.3 renderer.
-- Docked (1080p) or handheld (720p) resolution, scale presets, or a custom resolution scale.
+- Docked (1080p) or handheld (720p) resolution, scale presets, or your own resolution scale.
 - FXAA, sharpening, anisotropic filtering, FPS counter, FPS limit.
-- The phone's own Vulkan driver by default; custom AdrenoTools driver packages (such as Mesa Turnip) on Snapdragon.
+- Uses your phone's own Vulkan driver by default. On Snapdragon you can also load custom AdrenoTools driver packages (like
+  Mesa Turnip).
 
 **Controls**
-- On-screen touch controls with Switch-style button icons and a layout editor: move and resize every button and stick.
-- Controllers that Android sees as gamepads, with button rebinding in the app.
-- Leave the game from the house button in the touch controls or the controller's Home button (rebindable): it asks
-  first, waits for any save in progress, and returns to the app's menu.
-- The phone's motion sensors for motion controls.
+- On-screen touch controls with Switch-style button icons, plus a layout editor to move and resize every button and stick.
+- Any controller Android sees as a gamepad, with button rebinding in the app.
+- To leave the game, use the house button on the touch controls or the controller's Home button (rebindable). It asks
+  first, waits for any save in progress, then takes you back to the app's menu.
+- Motion controls through your phone's sensors.
 
-**Problem reports**
-- **Advanced → Export logs** makes a .zip with the game's logs, a crash log, your settings and your phone model. The
-  log has a speed line every 10 seconds (fps, 1% low, CPU clocks, thermal state, and the GPU clock on Snapdragon), so it shows how the game runs on
-  your phone. It contains no save, keys or game files.
+**When something goes wrong**
+- **Advanced → Export logs** makes a .zip with the game's logs, a crash log, your settings and your phone model. There's a
+  speed line every 10 seconds (fps, 1% low, CPU clocks, thermal state, and the GPU clock on Snapdragon), so it shows how the
+  game runs on your phone. No saves, keys or game files in there.
 
-## Requirements
+## What you need
 
 - Android 11 or newer, 64-bit ARM
 - Vulkan 1.3
 - About 8 GB of free space for the game files
 - Your own *Super Mario Odyssey* 1.0.0 dump and `prod.keys` from your own console
 
-## Using the app
+## Getting started
 
 1. Install the APK and open it.
 2. **Game** tab: **Import prod.keys…**, then **Import from NSP / XCI…**.
-3. Press **Play**.
+3. Press **Play**. That's it!
 
-Settings are on the **Graphics**, **Controls**, **Advanced** and **Mods** tabs.
+The settings live on the **Graphics**, **Controls**, **Advanced** and **Mods** tabs.
 
-## Building from source
+## Building it yourself
 
-See [BUILDING.md](BUILDING.md). In short:
+The full steps are in [BUILDING.md](BUILDING.md). The short version:
 
 1. Extract your dump with `scripts/setup.py` (your own keys and game).
 2. Lift the game's code to C with `tools/lifter`, using `SMO_LAYOUT=android`.
 3. Compile and package it with `tools/android/build_game.py`, `build_runtime.py` and `build_apk.py` (`--release` gives
-   a signed release APK).
+   you a signed release APK).
 
 The lifted code is made from your own copy of the game, so an APK built this way contains code derived from the game.
 
-## Reporting problems
+## Found a problem?
 
-Open an issue with your phone model, what happened, and the .zip from **Advanced → Export logs**. Reports from phones
-other than the S24 Ultra, especially Mali ones, help the most.
+Open an issue with your phone model, what happened, and the .zip from **Advanced → Export logs**. Reports from phones other
+than the S24 Ultra help the most, especially Mali ones.
 
 ## Legal
 
@@ -92,6 +94,8 @@ source code and documentation under GPL-3.0-or-later (see [LICENSE](LICENSE)). I
 assets, keys or firmware, and it does not help anyone obtain them. You must own the game and dump it yourself.
 
 ## Credits
+
+Big thanks to everyone here:
 
 - **holdup.lethimcook** (Discord),quandaile (reddit): creator of the Android port. Direction, design, testing and play-testing.
 - **u/CAPELINI_W** (reddit): extensive testing on Mali, and patience with me.
