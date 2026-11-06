@@ -12,10 +12,26 @@
 #include <string.h>
 #include "gfx_options.h"
 
+/* 0.2, Android: the settings the 60 fps mode was measured with on a Galaxy S24 Ultra (Cascade, one run each: 58.1 fps at 310 MHz against 44.6 at
+ * 231 MHz with the old defaults, which stay on the other platforms). None of them needs a particular chipset: mailbox falls back when a GPU
+ * does not offer it. An existing graphics.ini keeps its values. */
+#ifdef __ANDROID__
+#define DEF_VSYNC "mailbox"
+#define DEF_SCALE "1.00"
+#define DEF_BOOST "on"
+#define DEF_AA "fxaa"
+#define DEF_SHARPEN "75"
+#else
+#define DEF_VSYNC "clock"
+#define DEF_SCALE "auto"
+#define DEF_BOOST "auto"
+#define DEF_AA "off"
+#define DEF_SHARPEN "0"
+#endif
 static const char *const k_default_ini =
 "; graphics.ini: display and rendering options of the native build (read once at start by gfx_options.c).\r\n"
 "; Delete the file to get it written again with these defaults. A line starting with ';' is a comment.\r\n"
-"; Every value below is the default; the defaults draw exactly what the game draws on the console.\r\n"
+"; Every value below is the default.\r\n"
 "\r\n"
 "; renderer = vulkan | opengl\r\n"
 ";   vulkan: the default since 2026-10-09. opengl: the first renderer (NVIDIA only), kept as a fallback.\r\n"
@@ -39,7 +55,7 @@ static const char *const k_default_ini =
 ";   on:      the display's own vertical sync (FIFO). No tearing; on a display that is not 60 Hz the two clocks drift.\r\n"
 ";   off:     immediate presentation, tearing allowed. The game still runs at 60 frames per second.\r\n"
 ";   mailbox: mailbox or nothing (falls back to clock's choice with a message when the GPU does not offer it).\r\n"
-"vsync = clock\r\n"
+"vsync = " DEF_VSYNC "\r\n"
 "\r\n"
 "; gpu = auto | <number> | <part of the name>      (Vulkan)\r\n"
 ";   auto: a discrete GPU first, then an integrated one. The log lists the devices with their numbers:\r\n"
@@ -55,9 +71,9 @@ static const char *const k_default_ini =
 ";   Internal resolution scale, 0.25 to 1.0 (Vulkan only; OpenGL ignores it). 1.0 = the game's 1920x1080. 0.75 = 1440x810,\r\n"
 ";   0.5 = 960x540: the main switch for a weak GPU. The whole picture is drawn smaller, the 2D interface too (it gets\r\n"
 ";   softer), and is scaled to the window size. Details and limits: plan\\phases\\O1_options.md.\r\n"
-"; Android port: auto (the default) draws as the console shows the game: docked 1920x1080 (1.2 x the game's 1600x900),\r\n"
+"; Android port: auto draws as the console shows the game: docked 1920x1080 (1.2 x the game's 1600x900),\r\n"
 ";   handheld 1280x720 (the game's own size). A number (0.25 .. 2.0) is a scale of the game's own sizes instead.\r\n"
-"resolution_scale = auto\r\n"
+"resolution_scale = " DEF_SCALE "\r\n"
 "\r\n"
 "; frame_rate = 60 | 30\r\n"
 ";   60: the console's frame rate. 30: 30 frames a second are drawn and the game's logic runs twice for each of them,\r\n"
@@ -71,13 +87,13 @@ static const char *const k_default_ini =
 "; boost = auto | on | off      (Android) auto: while frames come later than the frame rate asks, the threads that set it\r\n"
 ";   keep their CPUs busy instead of sleeping, so the phone raises the clocks (more fps in heavy scenes, more heat\r\n"
 ";   while it is on); it stops by itself when the frames are on time again. on: always, also where it gains nothing.\r\n"
-"boost = auto\r\n"
+"boost = " DEF_BOOST "\r\n"
 "\r\n"
 "; anti_aliasing = off | fxaa      (Vulkan) fxaa: edges smoothed on the final picture; a little softer, cheap\r\n"
-"anti_aliasing = off\r\n"
+"anti_aliasing = " DEF_AA "\r\n"
 "\r\n"
 "; sharpening = 0 .. 100      (Vulkan) contrast-adaptive: detail sharper, hard edges left alone (0 = off)\r\n"
-"sharpening = 0\r\n"
+"sharpening = " DEF_SHARPEN "\r\n"
 
 "\r\n"
 "; fps_counter = on | off      (Android: the frame rate in the corner)\r\n"
@@ -151,6 +167,9 @@ static void opt_load(void) {
     int written = 0, unknown = 0;
     memset(o, 0, sizeof *o);
     o->width = 1280; o->height = 720; o->scale = 0.0f; o->window_mode = 3; o->fps_counter = 1; o->dynres = 1; o->boost = 1; o->diag_off = 1;
+#ifdef __ANDROID__
+    o->present = 3; o->scale = 1.0f; o->boost = 2; o->fxaa = 1; o->sharpen = 0.75f;      /* as DEF_* above: a file without these keys */
+#endif
     opt_path(o->path);
     FILE *f = fopen(o->path, "rb");
     if (!f) {

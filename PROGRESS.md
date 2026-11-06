@@ -816,6 +816,15 @@ run, last windows of 150-170 s runs.
   caps the CPU. `SMO_SPINHOT_US=0` is not an answer (30 fps).
 - **Wrong turns:** free pacing alone, polling GPU stats as the cause, "45 is refresh rounding". Compare clocks first when two runs disagree.
 
+- **Defaults are slower than the numbers above (0.2, one run each, same view):** the user's settings (mailbox, boost on, scale 1.00, FXAA, sharpening
+  75, system driver): 58.1 fps, 1% low 44.9, 310 MHz, 77% busy. Fresh defaults with the system driver (clock pacing, boost auto, scale auto, no
+  FXAA or sharpening): 44.6 fps, 1% low 33.6, **231 MHz**, 82% busy, wait-other 8.4 ms. Defaults on Turnip: 57.2 fps. Chunking alone does not hold 310, then.
+  Which setting makes the difference is not tested. Lead: FXAA and sharpening add GPU work and may carry the governor over its 84% line. A fresh
+  `graphics.ini` says `driver = custom`, which picks Turnip whenever a package is installed: set `driver = system` for native tests.
+
+- **0.2 fresh installs on Android start on those settings** (mailbox, boost on, scale 1.00, FXAA, sharpening 75): 57.9 fps, 1% low 40.8, 310 MHz in a 200 s run on
+  the file the game writes (driver set to system, this phone has Turnip installed). Which of the five makes the difference is still not tested. Not run on Mali.
+
 ## Mali tester's result on 0.1.6 (2026-11-06)
 
 Xiaomi 2406APNFAG, Mali-G615 MC6, r44p1. Tester: format option ON = visual errors stay, fps a little better; OFF = errors gone, fps a little

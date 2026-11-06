@@ -142,7 +142,7 @@ public class LauncherActivity extends Activity {
         card.addView(statusLine("Graphics driver", driverStatus(), DIM));
         Ini g = new Ini(new File(config, "graphics.ini"));
         card.addView(statusLine("Frame rate", "30".equals(g.get("frame_rate", "60")) ? "30 fps (full game speed)" : "60 fps", DIM));
-        String rsv = g.get("resolution_scale", "auto");
+        String rsv = g.get("resolution_scale", "1.00");
         card.addView(statusLine("Resolution", "auto".equalsIgnoreCase(rsv) ? ("handheld".equalsIgnoreCase(g.get("console_mode", "docked")) ? "1280x720 (console)" : "1920x1080 (console)") : Math.round(parse(rsv, 1f) * 100) + "% of the game's size", DIM));
         card.addView(space(16));
         Button play = button(have ? "▶  Play" : "Import game files first", have ? ACCENT : CARD2);
@@ -236,7 +236,7 @@ public class LauncherActivity extends Activity {
                 "60 = no limit. WARNING: the game advances one step per frame, so any limit below 60 makes it run in slow "
                 + "motion (at 40, two thirds of its speed). Only \"30 fps, full speed\" above keeps normal speed; when it is "
                 + "chosen, this limit is not used."));
-        c.addView(choice(g, "boost", "CPU boost", new String[]{"auto", "on", "off"}, new String[]{"Auto", "Always", "Off"}, "auto",
+        c.addView(choice(g, "boost", "CPU boost", new String[]{"auto", "on", "off"}, new String[]{"Auto", "Always", "Off"}, "on",
                 "Keeps the phone's CPU clocks up so heavy scenes hold the frame rate. Auto: only while frames are late. Always: everywhere, warmer."));
         c.addView(choice(g, "shader_wait", "New shaders", new String[]{"hold", "skip"}, new String[]{"Wait", "Skip until ready"}, "hold",
                 "Skip avoids a stutter the first time an effect appears; the effect is missing for a moment instead."));
@@ -252,11 +252,11 @@ public class LauncherActivity extends Activity {
         r.addView(choice(g, "console_mode", "Console mode", new String[]{"docked", "handheld"}, new String[]{"Docked", "Handheld"}, "docked",
                 "What the game is told it runs as; it picks its own picture size for each: docked " + "1600x900, handheld 1280x720."));
         r.addView(choice(g, "resolution_scale", "Resolution", new String[]{"auto", "1.50", "2.00"},
-                new String[]{"Native\n" + (hh ? "1280x720" : "1920x1080"), "1.5x\n" + size(bw, bh, 1.5f), "2x\n" + size(bw, bh, 2f)}, "auto",
+                new String[]{"Native\n" + (hh ? "1280x720" : "1920x1080"), "1.5x\n" + size(bw, bh, 1.5f), "2x\n" + size(bw, bh, 2f)}, "1.00",
                 "Native: as the console shows the game (docked 1080p, handheld 720p). 1.5x and 2x multiply the game's own size, "
                 + "as an emulator's resolution multiplier, and shrink the picture to your screen: much smoother edges, more "
                 + "GPU work (2x held 30 fps in the 30 fps mode on a Galaxy S24 Ultra)."));
-        String rv = g.get("resolution_scale", "auto");
+        String rv = g.get("resolution_scale", "1.00");
         float cur = "auto".equalsIgnoreCase(rv) ? (hh ? 1f : 1.2f) : parse(rv, 1f);
         r.addView(slider(g, "resolution_scale", "Custom scale", 25, 200, 5, Math.round(cur * 100), "%", 0.01f,
                 "Now " + size(bw, bh, cur) + ". Your own scale of the game's " + bw + "x" + bh + "; moving it replaces the choice above."));
@@ -264,9 +264,9 @@ public class LauncherActivity extends Activity {
 
         LinearLayout q = card();
         q.addView(header("Quality"));
-        q.addView(choice(g, "anti_aliasing", "Anti-aliasing", new String[]{"off", "fxaa"}, new String[]{"Off", "FXAA"}, "off",
+        q.addView(choice(g, "anti_aliasing", "Anti-aliasing", new String[]{"off", "fxaa"}, new String[]{"Off", "FXAA"}, "fxaa",
                 "FXAA smooths jagged edges on the final picture. Cheap; the picture gets a little softer."));
-        q.addView(slider(g, "sharpening", "Sharpening", 0, 100, 5, 0, "%", 1f,
+        q.addView(slider(g, "sharpening", "Sharpening", 0, 100, 5, 75, "%", 1f,
                 "Contrast-adaptive: brings back fine detail (useful with FXAA or a high resolution scale) without hardening edges. 0 = off."));
         q.addView(choice(g, "anisotropic_filtering", "Anisotropic filtering", new String[]{"game", "2", "4", "8", "16"},
                 new String[]{"Game", "2x", "4x", "8x", "16x"}, "game", "Sharper textures at an angle; costs a little GPU time."));
@@ -275,7 +275,7 @@ public class LauncherActivity extends Activity {
         LinearLayout d = card();
         d.addView(header("Display"));
         d.addView(choice(g, "vsync", "Presentation", new String[]{"clock", "on", "mailbox", "off"},
-                new String[]{"Clock", "VSync", "Mailbox", "Off"}, "clock", "Clock: lowest latency, paced at 60 Hz by the game itself."));
+                new String[]{"Clock", "VSync", "Mailbox", "Off"}, "mailbox", "Clock: lowest latency, paced at 60 Hz by the game itself."));
         d.addView(toggle(g, "fps_counter", "FPS counter", "on", "off", "on", "The number in the top left corner."));
         content.addView(d);
         content.addView(note("Changes apply the next time the game starts."));
@@ -728,7 +728,7 @@ public class LauncherActivity extends Activity {
         String cur = ini.get(key, def);
         boolean known = false;
         for (String v : vals) known |= v.equalsIgnoreCase(cur);
-        if (!known) cur = def;      /* a value from an older version (diagnostics = auto) */
+        if (!known && key.equals("diagnostics")) cur = def;      /* a value from an older version (diagnostics = auto) */
         for (int i = 0; i < vals.length; i++) {
             final String v = vals[i];
             TextView b = text(names[i], 13, v.equalsIgnoreCase(cur) ? Color.WHITE : DIM, true);

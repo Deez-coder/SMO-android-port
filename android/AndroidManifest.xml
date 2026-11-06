@@ -4,7 +4,7 @@
      app's external files folder (tools/android/push_data.py). A private build for the owner of the game. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.mobileodyssey.game"
-    android:versionCode="10"
+    android:versionCode="11"
     android:versionName="0.2">
 
     <uses-sdk android:minSdkVersion="30" android:targetSdkVersion="35" />

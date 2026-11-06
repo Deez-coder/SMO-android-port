@@ -15,6 +15,9 @@ to about 42, at a softer picture (800 wide there). It is not a locked 60. Under 
 issues and good performance. No other Mali phone has been reported on. Reports are welcome.
 
 **Changes from 0.1.8:**
+- **New defaults on a fresh install:** Presentation Mailbox, CPU boost Always, Custom scale 100%, FXAA, Sharpening 75%. In one test spot in Cascade on the S24 Ultra
+  these ran at 58 fps and the old defaults at 45. The phone runs warmer with CPU boost on Always. If you already have settings, they stay as they are. These defaults have not
+  run on a Mali phone.
 - **Mali diagnostics are off by default,** and an existing "Auto" setting counts as off. Before, every Mali player got a short hitch about once a minute
   and the odd slightly wrong test frame, only to collect logs. Testers can turn them on in Graphics > Diagnostics. Everything else is the same
   as the build the tester played. This change has not run on a Mali phone.
