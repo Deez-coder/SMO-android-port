@@ -25,7 +25,7 @@ typedef struct { uint16_t internal, format, type; uint8_t bpb, bw, bh, kind; } F
 enum { K_TEX = 0x5854564e, K_PROG = 0x5250564e, K_CMD = 0x4443564e, K_TPOOL = 0x5054564e, K_SPOOL = 0x5053564e, K_WIN = 0x4e57564e };
 enum { K_SYNC = 0x5953564e, K_QUEUE = 0x5551564e };
 
-typedef struct { uint8_t min, mag, ws, wt, wr, cmode, cfunc, reduction; float lodmin, lodmax, bias, aniso, border[4]; uint8_t border_kind, pad[3]; float lod_snap; } SamplerParams;   /* 48 bytes = NVNsampler (0x30); border_kind: 0 float, 1 unsigned, 2 signed integers in border[] */
+typedef struct { uint8_t min, mag, ws, wt, wr, cmode, cfunc, reduction; float lodmin, lodmax, bias, aniso, border[4]; uint8_t border_kind, pad[3]; float lod_snap; } SamplerParams;   /* 48 bytes of the game's NVNsampler (0x60: smp_initialize clears the rest, see there); border_kind: 0 float, 1 unsigned, 2 signed integers in border[] */
 typedef struct { uint8_t set, target, dsmode, pad; uint16_t format; int16_t lvl0, nlvl, lay0, nlay; uint8_t swz[4]; } View;               /* fits NVNtextureView (0x28) */
 typedef struct {                                                                                                                       /* fits NVNtextureBuilder (0x80) */
     int32_t flags, target, format, width, height, depth, levels, samples, dsmode, has_layout;

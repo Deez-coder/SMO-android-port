@@ -369,17 +369,22 @@ static void clock_stat(int64_t n, plat_li now) {
         (long long)(g_cs_hist[0] - h_last[0]), (long long)(g_cs_hist[1] - h_last[1]), (long long)(g_cs_hist[2] - h_last[2]), (long long)(g_cs_hist[3] - h_last[3]), (long long)(late - late_last), 10);
     t_last = now; sig_last = sig; late_last = late; steps_last = g_cs_steps; memcpy(h_last, g_cs_hist, sizeof h_last);
 }
-/* Android port, SMO_PACE=free (SMO_PACE=refresh or unset: as before). With refresh pacing a frame is let
+/* Android port: free pacing in the 60 fps mode, since 0.1.8 (SMO_PACE=refresh: as before; 30 fps mode: refreshes). With refresh pacing a frame is let
  * go at the refresh after its present, so a frame of 17-33 ms took two refreshes: 30 fps for any frame between, and the
  * game (one step a frame) at half speed. Free pacing lets the game go 1/60 s after it was let go the last time, or at
  * once when it is later than that: never faster than 60 frames a second, and a 25 ms frame is 40 fps, not 30. The
- * frames still reach the display at its refreshes (the swapchain shows the newest one). Off by default. */
+ * frames still reach the display at its refreshes (the swapchain shows the newest one). Measured on a Galaxy S24 Ultra: about the same fps,
+ * 1% low 33 -> 42. */
 static int g_pace_free = -1;
 static int64_t g_free_at;                          /* free pacing: when the last queued frame lets the game go (g_freq ticks) */
 static int pace_free(void) {
     if (g_pace_free < 0) {
         const char *e = getenv("SMO_PACE");
-        g_pace_free = (e && !strcmp(e, "free")) || (gfx_options()->fps_cap && !gfx_options()->fps30);      /* fps_cap: paced by time at 1 / fps_cap s */
+        g_pace_free = (e && !strcmp(e, "free")) || (gfx_options()->fps_cap && !gfx_options()->fps30);
+#ifdef __ANDROID__
+        if (!e && !gfx_options()->fps30) g_pace_free = 1;
+#endif
+        /* fps_cap: paced by time at 1 / fps_cap s */
         if (gfx_options()->fps_cap && !gfx_options()->fps30) printf("display: fps_cap = %d: at most %d frames a second (the game runs at %d%% of its speed when held there)%c", gfx_options()->fps_cap, gfx_options()->fps_cap, gfx_options()->fps_cap * 100 / 60, 10);      /* opt-in: measured on a Galaxy S24 Ultra in Cap Kingdom, no change (29.4-29.8 fps): the game's own frame loop waits for the vsync event as well */
         printf("display: pacing %s%c", g_pace_free ? "free (a frame lets the game go 1/60 s after the one before, or at once when late; SMO_PACE=refresh: at the refresh after its present)" : "by refreshes (SMO_PACE=free: by time, no waiting for a refresh when late)", 10);
     }

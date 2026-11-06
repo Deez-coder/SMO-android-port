@@ -28,10 +28,11 @@ typedef struct VStage {
     VSmp smp[64];
     VkShaderModule mod; struct VStage *next, *next_h;
     VkPipeline lib, lib2; volatile int32_t lib_state, lib2_state;      /* session 9 (SMO_VK_GPL=2): the stage's pipeline library; lib2: a vertex stage with the empty fragment shader state */
+    int warp;                                      /* SMO 0.1.2: MxOut.warp (1 lane number, 2 values exchanged between lanes) */
     uint64_t spv; int mod_users, mod_rel;          /* spv: name of the stage's SPIR-V file; the module is used by mod_users threads now and may be released (mod_rel) once its library or compute pipeline is made (stage_mod_get) */
 } VStage;
-#define MX_VK_VERSION 10u                        /* part of every hash: change it when mx_translate's Vulkan text or these records change */
-typedef struct { uint32_t magic; int32_t stage, code_len; uint32_t key[4], fo; uint64_t spv, hb; uint32_t cbufs, ssbos, ssbo_w, images, dep, tex_units, in_attr, out_attr; int32_t uses_alpha, nsmp; VSmp smp[64]; } StageRec;
+#define MX_VK_VERSION 15u                        /* part of every hash: change it when mx_translate's Vulkan text or these records change */
+typedef struct { uint32_t magic; int32_t stage, code_len; uint32_t key[4], fo; uint64_t spv, hb; uint32_t cbufs, ssbos, ssbo_w, images, dep, tex_units, in_attr, out_attr; int32_t uses_alpha, nsmp; VSmp smp[64]; int32_t warp; } StageRec;      /* warp: 0.1.2 (version 11) */
 typedef struct { uint32_t magic, key[4], fo, dep, tex; uint64_t vh; } VarRec;      /* ..\cache\vk\stage\<stage>_<hb>.var: the variants of one code */
 #define STAGEREC_MAGIC (0x52545356u + MX_VK_VERSION)
 typedef struct { int stage, code_len, serial; const uint8_t *code, *cdata; uint32_t cdata_size, local[3], smem, lmem; int gprim; /* SMO: geometry stage, as VStage; a vertex stage: 1 when a geometry stage follows it (module_from_glsl_ex) */ } SSrc;
@@ -122,7 +123,11 @@ static int ssrc_of(SSrc *o, const Prog *p, int s) {
 static uint64_t ssrc_hb(const SSrc *o) {
     uint32_t ver = MX_VK_VERSION;
     uint64_t h = fnv(0xcbf29ce484222325ULL ^ (uint64_t)o->stage, o->code, (size_t)o->code_len);
-    if (o->stage == 5) { h = fnv(h, o->local, sizeof o->local); h = fnv(h, &o->smem, 4); h = fnv(h, &o->lmem, 4); }
+    if (mx_subgroup_wide) h = fnv(h, &mx_subgroup_wide, sizeof mx_subgroup_wide);
+    if (mx_guard) h = fnv(h, "guard1", 6);      /* 0.1.6: another translation; without these two the hash is the one it always was */
+    if (mx_precise && (o->stage == 0 || o->stage == 2)) h = fnv(h, "strict2", 7);
+    if (mx_opt_fs && (o->stage == 1 || o->stage == 5)) h = fnv(h, "optfs1", 6);
+    if (o->stage == 5) { h = fnv(h, o->local, sizeof o->local); h = fnv(h, &o->smem, 4); h = fnv(h, &o->lmem, 4); if (mx_max_invocations != 1024) h = fnv(h, &mx_max_invocations, 4); }      /* 0.1.2: a GPU with smaller compute groups splits them otherwise */
     if (o->cdata) h = fnv(h ^ o->cdata_size, o->cdata, o->cdata_size);
     if (o->stage == 2) h = fnv(h, &o->gprim, sizeof o->gprim);      /* SMO: a geometry stage is translated for the draw's primitive class */
     if (!D.has_dcc && (o->stage == 2 || (o->stage == 0 && o->gprim))) h = fnv(h, "dz-last", 7);      /* Android port: where the depth remap goes (module_from_glsl_ex); records made before it are not used */
@@ -262,7 +267,7 @@ static void stage_mod_releasable(VStage *v) {      /* its library or compute pip
 static void vstage_from_rec(VStage *v, const StageRec *r, uint64_t vh, VkShaderModule mod) {
     v->h = vh; v->hb = r->hb; v->code_len = r->code_len; memcpy(v->key, r->key, 16); v->fo = r->fo; v->spv = r->spv;
     v->cbufs = r->cbufs; v->ssbos = r->ssbos; v->ssbo_w = r->ssbo_w; v->images = r->images; v->dep = r->dep; v->tex_units = r->tex_units; v->in_attr = r->in_attr; v->out_attr = r->out_attr;
-    v->uses_alpha = r->uses_alpha; v->nsmp = r->nsmp; memcpy(v->smp, r->smp, sizeof v->smp);
+    v->uses_alpha = r->uses_alpha; v->nsmp = r->nsmp; memcpy(v->smp, r->smp, sizeof v->smp); v->warp = r->warp;
     v->mod = mod; v->ok = 1;
 }
 static int key_fits(int s, const uint32_t *want, const uint32_t *have, uint32_t dep, uint32_t tex) {
@@ -338,7 +343,7 @@ static void vstage_build(VStage *v, const SSrc *src) {
             v->spv = on_disk ? spv_hash : 0;       /* no SPIR-V file: the module is kept (stage_mod_releasable) */
             v->cbufs = out.cbufs; v->ssbos = out.ssbos; v->ssbo_w = out.ssbo_written; v->images = out.images; v->in_attr = out.in_attr; v->out_attr = out.out_attr;
             v->images_w = out.images_written; memcpy(v->img_fmt, out.image_gl_format, sizeof v->img_fmt); memcpy(v->img_type, out.image_type, sizeof v->img_type);
-            v->dep = s == 0 ? out.int_dep : 0; v->tex_units = out.tex_units; v->uses_alpha = out.uses_alpha; v->nsmp = out.nsmp;
+            v->dep = s == 0 ? out.int_dep : 0; v->tex_units = out.tex_units; v->uses_alpha = out.uses_alpha; v->nsmp = out.nsmp; v->warp = out.warp;
             for (int i = 0; i < out.nsmp && i < 64; i++) {
                 const char *ty = out.smp[i].type;
                 int arr = strstr(ty, "Array") != NULL, dim = strstr(ty, "Cube") ? (arr ? DIM_CUBEA : DIM_CUBE) : strstr(ty, "3D") ? DIM_3D : strstr(ty, "1D") ? (arr ? DIM_1DA : DIM_1D) : (arr ? DIM_2DA : DIM_2D);
@@ -355,7 +360,7 @@ static void vstage_build(VStage *v, const SSrc *src) {
                 memset(&r, 0, sizeof r);
                 r.magic = STAGEREC_MAGIC; r.stage = s; r.code_len = v->code_len; memcpy(r.key, v->key, 16); r.fo = v->fo; r.spv = spv_hash; r.hb = v->hb;
                 r.cbufs = v->cbufs; r.ssbos = v->ssbos; r.ssbo_w = v->ssbo_w; r.images = v->images; r.dep = v->dep; r.tex_units = v->tex_units; r.in_attr = v->in_attr; r.out_attr = v->out_attr;
-                r.uses_alpha = v->uses_alpha; r.nsmp = v->nsmp; memcpy(r.smp, v->smp, sizeof r.smp);
+                r.uses_alpha = v->uses_alpha; r.nsmp = v->nsmp; memcpy(r.smp, v->smp, sizeof r.smp); r.warp = v->warp;
                 snprintf(path, sizeof path, "%s/stage/%d_%016llx.st", vkc_dir(), s, (unsigned long long)v->h);
                 if ((fp = fopen(path, "wb")) != NULL) { fwrite(&r, 1, sizeof r, fp); fclose(fp); }
                 memset(&e, 0, sizeof e);
@@ -919,6 +924,12 @@ static double pipe_build(Pipe *p) {
         ba[i].blendEnable = k->blend_on >> i & 1; ba[i].colorWriteMask = D.has_eds3 ? 15 : (k->chanmask >> (i * 4)) & 15;
         ba[i].srcColorBlendFactor = blend_factor(b[0]); ba[i].dstColorBlendFactor = blend_factor(b[1]); ba[i].srcAlphaBlendFactor = blend_factor(b[2]); ba[i].dstAlphaBlendFactor = blend_factor(b[3]);
         ba[i].colorBlendOp = blend_op(b[4]); ba[i].alphaBlendOp = blend_op(b[5]);
+        if (ba[i].blendEnable && k->cfmt[i] && !fmt_supported((VkFormat)k->cfmt[i], VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT)) {      /* Mali: undefined (the driver takes it anyway, then draws garbage?): drawn without blending, unless SMO_VK_UNSUP_BLEND=1 */
+            static int nl;
+            if (nl++ < 40) printf("nvn_vk_fmt: pipeline of vertex stage %u, fragment stage %u blends into colour %d of Vulkan format %d, which this GPU cannot blend (factors %u %u %u %u, equations %u %u): drawn without blending\n",
+                                  k->vs, k->fs, i, k->cfmt[i], b[0], b[1], b[2], b[3], b[4], b[5]);
+            if (!(getenv("SMO_VK_UNSUP_BLEND") && atoi(getenv("SMO_VK_UNSUP_BLEND")))) ba[i].blendEnable = VK_FALSE;
+        }
     }
     VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     cb.attachmentCount = k->ncolor; cb.pAttachments = ba;

@@ -76,7 +76,7 @@ public class LauncherActivity extends Activity {
         head.setOrientation(LinearLayout.VERTICAL);
         head.setPadding(dp(20), dp(18), dp(20), dp(6));
         head.addView(text("Odyssey", 26, TEXT, true));
-        head.addView(text("Native Android port · your own game files", 13, DIM, false));
+        head.addView(text("Native Android port · beta " + appVersion() + " · your own game files", 13, DIM, false));
         page.addView(head);
 
         HorizontalScrollView tabScroll = new HorizontalScrollView(this);
@@ -240,6 +240,8 @@ public class LauncherActivity extends Activity {
                 "Keeps the phone's CPU clocks up so heavy scenes hold the frame rate. Auto: only while frames are late. Always: everywhere, warmer."));
         c.addView(choice(g, "shader_wait", "New shaders", new String[]{"hold", "skip"}, new String[]{"Wait", "Skip until ready"}, "hold",
                 "Skip avoids a stutter the first time an effect appears; the effect is missing for a moment instead."));
+        c.addView(choice(g, "diagnostics", "Diagnostics", new String[]{"off", "on"}, new String[]{"Off", "On"}, "off",
+                "On: on Mali GPUs, about once a minute one frame is measured and small pictures of it go into the exported logs (a short hitch). Other GPUs: nothing."));
         content.addView(c);
 
         /* everything that decides the picture's size, together: the mode the game is told, then the scale of what it draws */
@@ -552,9 +554,7 @@ public class LauncherActivity extends Activity {
     void exportLogs(Uri out) throws Exception {
         try (java.util.zip.ZipOutputStream z = new java.util.zip.ZipOutputStream(getContentResolver().openOutputStream(out))) {
             StringBuilder info = new StringBuilder();
-            String ver = "?";
-            try { ver = getPackageManager().getPackageInfo(getPackageName(), 0).versionName; } catch (Exception ignored) {}
-            info.append("app ").append(ver).append('\n')
+            info.append("app ").append(appVersion()).append('\n')
                 .append("android ").append(android.os.Build.VERSION.RELEASE).append(" (api ").append(android.os.Build.VERSION.SDK_INT).append(")\n")
                 .append("phone ").append(android.os.Build.MANUFACTURER).append(' ').append(android.os.Build.MODEL).append('\n')
                 .append("chip ").append(android.os.Build.SOC_MANUFACTURER).append(' ').append(android.os.Build.SOC_MODEL).append('\n')
@@ -571,6 +571,13 @@ public class LauncherActivity extends Activity {
                 if (!src.isFile()) continue;
                 z.putNextEntry(new ZipEntry(f[1]));
                 try (InputStream in = new FileInputStream(src)) { pipe(in, z); }
+                z.closeEntry();
+            }
+            File[] diag = new File(root, "diag").listFiles();  /* 0.1.3: the frames measured on this GPU (nvn_vk_draw.c, diag_present) */
+            if (diag != null) for (File f : diag) {
+                if (!f.isFile()) continue;
+                z.putNextEntry(new ZipEntry("diag/" + f.getName()));
+                try (InputStream in = new FileInputStream(f)) { pipe(in, z); }
                 z.closeEntry();
             }
             Process p = new ProcessBuilder("logcat", "-d", "-v", "threadtime", "-b", "main,system,crash").redirectErrorStream(true).start();
@@ -719,6 +726,9 @@ public class LauncherActivity extends Activity {
         LinearLayout seg = new LinearLayout(this);
         seg.setPadding(0, dp(6), 0, 0);
         String cur = ini.get(key, def);
+        boolean known = false;
+        for (String v : vals) known |= v.equalsIgnoreCase(cur);
+        if (!known) cur = def;      /* a value from an older version (diagnostics = auto) */
         for (int i = 0; i < vals.length; i++) {
             final String v = vals[i];
             TextView b = text(names[i], 13, v.equalsIgnoreCase(cur) ? Color.WHITE : DIM, true);
@@ -798,6 +808,10 @@ public class LauncherActivity extends Activity {
         r.addView(text(k, 14, DIM, false), new LinearLayout.LayoutParams(0, -2, 1));
         r.addView(text(v, 14, col, true));
         return r;
+    }
+    /* The manifest's versionName (bumped for every build handed out; CHANGELOG.md): on the launcher and in exported logs. */
+    String appVersion() {
+        try { return getPackageManager().getPackageInfo(getPackageName(), 0).versionName; } catch (Exception e) { return "?"; }
     }
     TextView text(String s, int sp, int col, boolean bold) {
         TextView t = new TextView(this);

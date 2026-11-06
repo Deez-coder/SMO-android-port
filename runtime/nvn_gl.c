@@ -4339,7 +4339,22 @@ static void smpb_compare(Ctx *c) { SMP->cmode = (uint8_t)A1; SMP->cfunc = (uint8
 static void smpb_border(Ctx *c) { if (A1) memcpy(SMP->border, P(A1), 16); }
 static void smpb_aniso(Ctx *c) { SMP->aniso = F0; }
 static void smpb_reduction(Ctx *c) { SMP->reduction = (uint8_t)A1; }
-static void smp_initialize(Ctx *c) { memcpy(P(A0), P(A1), sizeof(SamplerParams)); RET(1); }
+/* SMO 0.1.3: agl::driver::NVNMgr::registerSampler [main 0x77623c] keeps one pool slot per distinct sampler: it finds an
+ * existing one by a 16-bit key, a hash of bytes 8..0x60 of the NVNsampler (0x60 bytes on the Switch, all of them
+ * determined by the builder). This record is smaller (SamplerParams), so the rest of the game's object held whatever
+ * was in that memory, and its first 8 bytes (filters, wrap modes) are not hashed: nearly every registration took a new
+ * slot, the manager's cursor walked through its 3839 slots and, once it wrapped, bindings came back with sampler ID 0
+ * (never registered; the default sampler, so a bloom pass read the mip level it was drawing to: the white-out). So the
+ * tail is cleared and holds a copy of those 8 bytes, which makes the key depend on exactly the sampler's contents.
+ * SMO_SAMPLER_KEY=0 (test switch) brings back the old behaviour. */
+static void smp_initialize(Ctx *c) {
+    static int on = -1;
+    if (on < 0) on = !getenv("SMO_SAMPLER_KEY") || atoi(getenv("SMO_SAMPLER_KEY"));
+    uint8_t *d = (uint8_t *)P(A0);
+    memcpy(d, P(A1), sizeof(SamplerParams));
+    if (on) { memset(d + sizeof(SamplerParams), 0, 0x60 - sizeof(SamplerParams)); memcpy(d + sizeof(SamplerParams), d, 8); }
+    RET(1);
+}
 static void spool_initialize(Ctx *c) {                 /* (pool, memoryPool, offset, numDescriptors) */
     SamplerPool *sp = hnew(A0, K_SPOOL, sizeof *sp);
     sp->count = (int)A3 > 0 ? (int)A3 : 0; sp->mempool = A1; sp->offset = A2;
@@ -4983,7 +4998,11 @@ static void dev_finalize(Ctx *c) { if (g_nvn_device == A0) g_nvn_device = 0; }
 static void dev_get_origin_mode(Ctx *c) { RET(g_origin_mode); }
 static void dev_get_depth_mode(Ctx *c) { RET(g_depth_mode); }
 static void dev_timestamp_now(Ctx *c) { RET(now_ns()); }
-static void dev_timestamp_of(Ctx *c) { RET(A1 ? rd64(A1 + 8) : 0); }      /* (device, const NVNcounterData *): counter timestamps are written in nanoseconds */
+int nvn_counter_ticks;                     /* 0.1.7: the Vulkan path writes counter timestamps in the Switch GPU's ticks (614.4 MHz) */
+static void dev_timestamp_of(Ctx *c) {     /* (device, const NVNcounterData *) */
+    uint64_t v = A1 ? rd64(A1 + 8) : 0;
+    RET(nvn_counter_ticks ? (uint64_t)((unsigned __int128)v * 625 / 384) : v);
+}
 static void dev_debug_domain(Ctx *c) { static volatile int32_t next; RET(plat_atomic_inc(&next)); }
 static void dev_separate_handle(Ctx *c) { RET((uint64_t)(int64_t)(int32_t)(uint32_t)A1 | 0x100000000ull); }   /* nvnDeviceGetSeparateTextureHandle [sdk 0x41bc60] */
 static void dev_separate_sampler_handle(Ctx *c) { RET((uint64_t)((int64_t)(int32_t)(uint32_t)A1 << 20)); }                 /* nvnDeviceGetSeparateSamplerHandle [sdk 0x41bc50]: sbfiz x0, x1, #20, #32 */

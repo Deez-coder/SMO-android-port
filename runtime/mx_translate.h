@@ -86,6 +86,7 @@ typedef struct {
     uint8_t image_type[8];           /* SMO: the type each used image is declared with: 0 1D, 1 buffer, 2 1D array, 3 2D, 4 2D array, 5 3D */
     uint32_t int_dep;                /* which bits of int_attrs / int_tex influenced the code (vertex: attrs, fragment: textures) */
     int insns, blocks, uses_alpha;
+    int warp;                        /* SMO 0.1.2 (target 1): 1 the code reads its lane number (MX_LANE), 2 it exchanges values between lanes (SHFL, VOTE) */
     /* target 1: the samplers the text declares in set 1 (the back end binds a view of that type, or a dummy of that type) */
     struct { uint8_t unit, shadow; uint16_t binding; char type[24]; } smp[64];
     int nsmp;
@@ -93,15 +94,21 @@ typedef struct {
 
 /* Returns 1 on success. out->glsl must be freed by the caller. */
 int mx_translate(const MxIn *in, MxOut *out);
+/* SMO 0.1.2: the largest compute group the GPU takes (min of maxComputeWorkGroupInvocations and maxComputeWorkGroupSize[0]),
+ * set by the Vulkan back end before any translation; 1024 until then (offline tools). */
+extern unsigned mx_max_invocations;
+extern int mx_opt_fs;                    /* SMO 0.1.7, part of the stage hash: fragment and compute stages go through spirv-opt (vk_shaderc_android.c) */
+extern int mx_guard, mx_precise;         /* SMO 0.1.6, both part of the stage hash: guard: defined results for the math Vulkan leaves undefined, and no NaN or infinity into a target; precise: vertex and geometry float results may not be contracted */
+extern int mx_subgroup_wide;             /* SMO 0.1.3: the GPU's subgroups have 32 lanes or more (the back end sets it; part of the stage hash) */
 /* SMO: a compute work group larger than Vulkan's 1024 invocations (SMO has 1536 x 1 x 1 groups; NVN on the console takes
  * them) runs as k groups along x: the translator gives each invocation the local and group ids it would have had, the
  * back end dispatches k times as many groups in x. Only without shared memory (the translator has no barrier, so no
  * translated stage has one). 1 = no split; 0 = cannot be split. */
 static inline unsigned mx_split_x(const uint32_t local[3], uint32_t smem_bytes) {
     uint64_t lx = local[0] ? local[0] : 1, ly = local[1] ? local[1] : 1, lz = local[2] ? local[2] : 1;
-    if (lx * ly * lz <= 1024) return 1;
+    if (lx * ly * lz <= mx_max_invocations) return 1;
     if (smem_bytes) return 0;
-    for (unsigned k = 2; k <= lx; k++) if (lx % k == 0 && (lx / k) * ly * lz <= 1024) return k;
+    for (unsigned k = 2; k <= lx; k++) if (lx % k == 0 && (lx / k) * ly * lz <= mx_max_invocations) return k;
     return 0;
 }
 /* Name of the Maxwell opcode of an instruction word (suyu's opcode table). */

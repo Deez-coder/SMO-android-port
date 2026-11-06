@@ -22,6 +22,7 @@ typedef struct {
     float sharpen;           /* sharpening = 0..100 (%): contrast-adaptive sharpening in the present pass (0 = off) */
     int fps_cap;             /* fps_cap = 20..59: at most that many frames a second (0 or 60 = none; frame_rate = 30 wins); the game runs slower below 60 */
     int fps30;               /* frame_rate = 30: 30 frames a second are drawn and the game's logic runs twice a frame (full speed, smo_framerate.c) */
+    int diag_off;            /* diagnostics = off (default, 1; an old "auto" line counts as off) | on (ARM GPUs: nvn_vk_draw.c diag_present, eq_begin) */
     int boost;               /* boost = auto (default, 1) | on (2, always) | off (0): the frame's threads keep their CPUs' clocks up while frames are late (Android, android_perf.c) */
 } GfxOptions;
 const GfxOptions *gfx_options(void);      /* any thread; read once (the file is written with defaults when it does not exist) */

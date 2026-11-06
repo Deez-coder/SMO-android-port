@@ -144,9 +144,14 @@ static void perf_line(int64_t dt) {
     else snprintf(mode, sizeof mode, "60 fps mode");
     char scale[16];                                    /* resolution_scale = auto reads as 0 */
     if (o->scale > 0) snprintf(scale, sizeof scale, "%.2f", o->scale); else snprintf(scale, sizeof scale, "auto");
-    printf("perf: %.1f fps, 1%% low %.1f, worst frame %.1f ms over %d frames (%s, scale %s); CPU MHz %s; thermal %s%c",
+    int gpu_mhz = 0;                                   /* Adreno: readable by an app. On a Galaxy S24 Ultra the clock decides the frame rate (nvn_vk_draw.c, submit_chunk) */
+    {   FILE *f = fopen("/sys/class/kgsl/kgsl-3d0/clock_mhz", "r");
+        if (f) { if (fscanf(f, "%d", &gpu_mhz) != 1) gpu_mhz = 0; fclose(f); } }
+    char gpu[32] = "";
+    if (gpu_mhz > 0) snprintf(gpu, sizeof gpu, "; GPU %d MHz", gpu_mhz);
+    printf("perf: %.1f fps, 1%% low %.1f, worst frame %.1f ms over %d frames (%s, scale %s); CPU MHz %s; thermal %s%s%c",
            nf * 1000.0 / sum, 1000.0 * slow / slow_sum, worst, nf, mode, scale, at ? cpu : "unknown",
-           ts >= 0 && ts <= 6 ? k_thermal[ts] : "unknown", 10);
+           ts >= 0 && ts <= 6 ? k_thermal[ts] : "unknown", gpu, 10);
     nf = 0;
     total = 0;
 }

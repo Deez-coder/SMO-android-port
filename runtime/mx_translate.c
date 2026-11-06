@@ -20,6 +20,10 @@
 #include "mx_translate.h"
 #include "mx_ops.h"
 
+unsigned mx_max_invocations = 1024;      /* mx_translate.h */
+int mx_subgroup_wide;                    /* mx_translate.h */
+int mx_guard, mx_precise, mx_opt_fs;     /* mx_translate.h */
+
 #define MXB(x, lo, n) ((unsigned)(((x) >> (lo)) & ((1ull << (n)) - 1)))
 #define MAXSTK 16
 
@@ -40,7 +44,7 @@ typedef struct {
     uint32_t gubos;                           /* compute: uniform buffers reached through global memory */
     unsigned smem_words;
     int uses_smem;
-    int uses_fcs, uses_tf, uses_shfl;                    /* MxIn.screen_scale: gl_FragCoord.xy was scaled / a texelFetch was mapped */
+    int uses_fcs, uses_tf, uses_shfl, uses_lane, uses_xchg;      /* uses_lane / uses_xchg (SMO 0.1.2): MX_LANE / mx_shfl and mx_ballot (Vulkan text) */                    /* MxIn.screen_scale: gl_FragCoord.xy was scaled / a texelFetch was mapped */
     uint32_t images, images_read, images_written;
     uint16_t image_fmt[8]; uint8_t image_type[8];
     uint32_t *jt;                             /* static jump target of SYNC / BRK / CONT */
@@ -188,7 +192,7 @@ static void setcc_int(Mx *e, const char *res) { e->uses_cc = 1; emit(e, " cz = %
 /* ---------------------------------------------------------------- results */
 /* float result with optional saturation and condition code; saturation as Maxwell does it, a NaN to 0 (clamp leaves it undefined) */
 static void fres(Mx *e, uint64_t i, const char *expr, int sat, int cc) {
-    emit(e, "float f = %s;", expr);
+    emit(e, "%sfloat f = %s;", mx_precise && e->in->target == 1 && (e->in->stage == MX_VERTEX || e->in->stage == MX_GEOMETRY) ? "precise " : "", expr);
     if (sat) emit(e, " f = f > 0.0 ? min(f, 1.0) : 0.0;");
     emit(e, " %s = U(f);", DST);
     if (cc) { e->uses_cc = 1; emit(e, " cz = f == 0.0 || isnan(f); cs = f < 0.0 || isnan(f); ccf = false; cov = false;"); }
@@ -784,7 +788,7 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
         unsigned sr = MXB(i, 20, 8);
         const char *v;
         switch (sr) {
-        case 0x00: v = "gl_SubGroupInvocationARB"; break;
+        case 0x00: if (e->in->target == 1) { v = "MX_LANE"; e->uses_lane = 1; } else v = "gl_SubGroupInvocationARB"; break;      /* SMO 0.1.2: the lane of a 32-thread warp on any GPU (header) */
         case 0x11: v = e->in->stage == MX_GEOMETRY || e->in->stage == MX_TESS_CONTROL ? "uint(gl_InvocationID)" : "0u"; break;
         case 0x12: v = "0x3f800000u"; break;                     /* y direction: +1 (the window origin is applied by glClipControl) */
         case 0x13: v = e->in->stage == MX_FRAGMENT ? "(gl_HelperInvocation ? 0xffffffffu : 0u)" : "0u"; break;
@@ -801,11 +805,11 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
         case 0x25: v = "MX_GID_X"; break;
         case 0x26: v = "gl_WorkGroupID.y"; break;
         case 0x27: v = "gl_WorkGroupID.z"; break;
-        case 0x38: v = "uint(gl_SubGroupEqMaskARB)"; break;
-        case 0x39: v = "uint(gl_SubGroupLtMaskARB)"; break;
-        case 0x3a: v = "uint(gl_SubGroupLeMaskARB)"; break;
-        case 0x3b: v = "uint(gl_SubGroupGtMaskARB)"; break;
-        case 0x3c: v = "uint(gl_SubGroupGeMaskARB)"; break;
+        case 0x38: if (e->in->target == 1) { v = "(1u << MX_LANE)"; e->uses_lane = 1; } else v = "uint(gl_SubGroupEqMaskARB)"; break;
+        case 0x39: if (e->in->target == 1) { v = "((1u << MX_LANE) - 1u)"; e->uses_lane = 1; } else v = "uint(gl_SubGroupLtMaskARB)"; break;
+        case 0x3a: if (e->in->target == 1) { v = "(0xffffffffu >> (31u - MX_LANE))"; e->uses_lane = 1; } else v = "uint(gl_SubGroupLeMaskARB)"; break;
+        case 0x3b: if (e->in->target == 1) { v = "(~(0xffffffffu >> (31u - MX_LANE)))"; e->uses_lane = 1; } else v = "uint(gl_SubGroupGtMaskARB)"; break;
+        case 0x3c: if (e->in->target == 1) { v = "(~((1u << MX_LANE) - 1u))"; e->uses_lane = 1; } else v = "uint(gl_SubGroupGeMaskARB)"; break;
         case 0x50: case 0x52: v = "0u"; break;                   /* clocks */
         default: v = NULL; break;
         }
@@ -816,6 +820,14 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
     }
     case MXOP_VOTE: {
         const char *p = PR(e, MXB(i, 39, 3), (int)MXB(i, 42, 1)), *f = MXB(i, 48, 2) == 0 ? "allInvocationsARB" : MXB(i, 48, 2) == 1 ? "anyInvocationARB" : "allInvocationsEqualARB";
+        if (e->in->target == 1) {                                  /* SMO 0.1.2: over the 32 lanes of the warp, not the GPU's subgroup (mx_ballot) */
+            const unsigned m = MXB(i, 48, 2);
+            e->uses_lane = e->uses_xchg = 1;
+            emit(e, "bool vp = %s; uint vb = mx_ballot(vp);", p);
+            if (PD(e, MXB(i, 45, 3))) emit(e, " %s = %s;", PD(e, MXB(i, 45, 3)), m == 0 ? "vb == mx_ballot(true)" : m == 1 ? "vb != 0u" : "(vb == 0u || vb == mx_ballot(true))");
+            if (MXB(i, 0, 8) != 255) emit(e, " %s = vb;", DST);
+            break;
+        }
         emit(e, "bool vp = %s;", p);
         if (PD(e, MXB(i, 45, 3))) emit(e, " %s = %s(vp);", PD(e, MXB(i, 45, 3)), f);
         if (MXB(i, 0, 8) != 255) emit(e, " %s = uint(ballotARB(vp));", DST);
@@ -901,9 +913,10 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
     }
     case MXOP_MUFU: {
         static const char *const fn[9] = {"cos(%s)", "sin(%s)", "exp2(%s)", "log2(%s)", "(1.0 / %s)", "inversesqrt(%s)", NULL, NULL, "sqrt(%s)"};
+        static const char *const fng[9] = {"cos(%s)", "sin(%s)", "exp2(%s)", "mx_lg2(%s)", "mx_rcp(%s)", "mx_rsq(%s)", NULL, NULL, "mx_sqrt(%s)"};      /* mx_guard */
         unsigned o = MXB(i, 20, 4);
         if (o > 8 || !fn[o]) { fail(e, "MUFU", "MUFU operation %u", o); break; }
-        fres(e, i, S(e, fn[o], FN(e, A8, MXB(i, 46, 1), MXB(i, 48, 1))), MXB(i, 50, 1), 0);
+        fres(e, i, S(e, mx_guard && e->in->target == 1 ? fng[o] : fn[o], FN(e, A8, MXB(i, 46, 1), MXB(i, 48, 1))), MXB(i, 50, 1), 0);
         break;
     }
     case MXOP_RRO_reg: case MXOP_RRO_cbuf: case MXOP_RRO_imm:           /* range reduction before MUFU.SIN/COS/EX2: passed through (as suyu) */
@@ -916,7 +929,7 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
         if (dsz == 3 || ssz == 3 || !dsz || !ssz) { fail(e, "F2F.F64", "F2F with sizes %u -> %u", ssz, dsz); break; }
         if (op == MXOP_F2F_imm && ssz == 1) { fail(e, "F2F (imm)", "F2F immediate half"); break; }
         b = op == MXOP_F2F_reg ? R20 : op == MXOP_F2F_cbuf ? CB(e, i) : F20(e, i);
-        const char *src = ssz == 1 ? S(e, "unpackHalf2x16(%s)[%u]", b, sel) : S(e, "F(%s)", b);
+        const char *src = ssz == 1 ? S(e, "MX_UH(%s)[%u]", b, sel) : S(e, "F(%s)", b);
         if (MXB(i, 49, 1)) src = S(e, "abs(%s)", src);
         if (MXB(i, 45, 1)) src = S(e, "(-%s)", src);
         emit(e, "float f = %s;", src);
@@ -931,7 +944,7 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
         unsigned dsz = MXB(i, 8, 2), ssz = MXB(i, 10, 2), sgn = MXB(i, 12, 1);
         if (dsz == 3 || ssz == 3 || !dsz || !ssz) { fail(e, "F2I.64", "F2I with sizes %u -> %u", ssz, dsz); break; }
         b = op == MXOP_F2I_reg ? R20 : CB(e, i);
-        const char *src = ssz == 1 ? S(e, "unpackHalf2x16(%s)[%u]", b, MXB(i, 41, 1)) : S(e, "F(%s)", b);
+        const char *src = ssz == 1 ? S(e, "MX_UH(%s)[%u]", b, MXB(i, 41, 1)) : S(e, "F(%s)", b);
         if (MXB(i, 45, 1)) src = S(e, "abs(%s)", src);                 /* F2I: abs at 45, neg at 49 */
         if (MXB(i, 49, 1)) src = S(e, "(-%s)", src);
         emit(e, "%s = mx_f2i(%s(%s), %uu);", DST, rnd[MXB(i, 39, 2)], src, (dsz == 1 ? 2u : 0u) + sgn);
@@ -1236,13 +1249,13 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
         if (e->in->target != 1) { fail(e, "SHFL", "warp shuffle in the OpenGL text"); break; }
         unsigned mode = MXB(i, 30, 2), pd = MXB(i, 48, 3);
         const char *b = MXB(i, 28, 1) ? S(e, "%uu", MXB(i, 20, 5)) : R20, *cc = MXB(i, 29, 1) ? S(e, "%uu", MXB(i, 34, 13)) : X(e, MXB(i, 39, 8));
-        e->uses_shfl = 1;
-        emit(e, "uint ln = gl_SubgroupInvocationID, bv = (%s) & 31u, cv = (%s) & 31u, sg = ((%s) >> 8) & 31u, mx = (ln & sg) | (cv & ~sg), j; bool pv;", b, cc, cc);
+        e->uses_shfl = e->uses_lane = e->uses_xchg = 1;
+        emit(e, "uint ln = MX_LANE, bv = (%s) & 31u, cv = (%s) & 31u, sg = ((%s) >> 8) & 31u, mx = (ln & sg) | (cv & ~sg), j; bool pv;", b, cc, cc);
         if (mode == 0) emit(e, " j = (ln & sg) | (bv & ~sg); pv = j <= mx;");
         else if (mode == 1) emit(e, " j = ln - bv; pv = int(j) >= int(mx);");
         else if (mode == 2) emit(e, " j = ln + bv; pv = j <= mx;");
         else emit(e, " j = ln ^ bv; pv = j <= mx;");
-        emit(e, " if (!pv) j = ln; uint sv = subgroupShuffle(%s, j);", A8);
+        emit(e, " if (!pv) j = ln; uint sv = mx_shfl(%s, ln, j);", A8);      /* SMO 0.1.2: lane j of the warp (mx_shfl) */
         if (MXB(i, 0, 8) != 255) emit(e, " %s = sv;", DST);
         if (pd != 7) emit(e, " %s = pv;", PD(e, pd));
         break;
@@ -1476,7 +1489,7 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
             ha = HX(e, A8, MXB(i, 47, 2), (int)MXB(i, 44, 1), (int)MXB(i, 43, 1));
             if (op == MXOP_HADD2_reg) { hb = HX(e, R20, MXB(i, 28, 2), (int)MXB(i, 30, 1), (int)MXB(i, 31, 1)); sat = (int)MXB(i, 32, 1); }
             else if (op == MXOP_HADD2_cbuf) { hb = HX(e, CB(e, i), 1, (int)MXB(i, 54, 1), (int)MXB(i, 56, 1)); sat = (int)MXB(i, 52, 1); }
-            else { hb = S(e, "unpackHalf2x16(0x%08xu)", (MXB(i, 20, 9) << 6) | (MXB(i, 29, 1) << 15) | (MXB(i, 30, 9) << 22) | (MXB(i, 56, 1) << 31)); sat = (int)MXB(i, 52, 1); }
+            else { hb = S(e, "MX_UH(0x%08xu)", (MXB(i, 20, 9) << 6) | (MXB(i, 29, 1) << 15) | (MXB(i, 30, 9) << 22) | (MXB(i, 56, 1) << 31)); sat = (int)MXB(i, 52, 1); }
         }
         hres(e, i, S(e, "%s + %s", ha, hb), sat, merge, 0, NULL, NULL, NULL);
         break;
@@ -1488,7 +1501,7 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
         if (op == MXOP_HMUL2_32I) { ha = HX(e, A8, MXB(i, 53, 2), 0, 0); hb = HX(e, I32(e, i), 0, 0, 0); merge = 0; sat = (int)MXB(i, 52, 1); prec = MXB(i, 55, 2); }
         else if (op == MXOP_HMUL2_reg) { ha = HX(e, A8, MXB(i, 47, 2), (int)MXB(i, 44, 1), 0); hb = HX(e, R20, MXB(i, 28, 2), (int)MXB(i, 30, 1), (int)MXB(i, 31, 1)); sat = (int)MXB(i, 32, 1); }
         else if (op == MXOP_HMUL2_cbuf) { ha = HX(e, A8, MXB(i, 47, 2), (int)MXB(i, 44, 1), (int)MXB(i, 43, 1)); hb = HX(e, CB(e, i), 1, (int)MXB(i, 54, 1), 0); sat = (int)MXB(i, 52, 1); }
-        else { ha = HX(e, A8, MXB(i, 47, 2), (int)MXB(i, 44, 1), (int)MXB(i, 43, 1)); hb = S(e, "unpackHalf2x16(0x%08xu)", (MXB(i, 20, 9) << 6) | (MXB(i, 29, 1) << 15) | (MXB(i, 30, 9) << 22) | (MXB(i, 56, 1) << 31)); sat = (int)MXB(i, 52, 1); }
+        else { ha = HX(e, A8, MXB(i, 47, 2), (int)MXB(i, 44, 1), (int)MXB(i, 43, 1)); hb = S(e, "MX_UH(0x%08xu)", (MXB(i, 20, 9) << 6) | (MXB(i, 29, 1) << 15) | (MXB(i, 30, 9) << 22) | (MXB(i, 56, 1) << 31)); sat = (int)MXB(i, 52, 1); }
         emit(e, "vec2 ma = %s, mb = %s; ", ha, hb);
         hres(e, i, "ma * mb", sat, merge, prec == 2, "ma", "mb", "vec2(0.0)");
         break;
@@ -1503,7 +1516,7 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
         case MXOP_HFMA2_rc: hb = HX(e, R39, MXB(i, 53, 2), 0, (int)MXB(i, 56, 1)); hc = HX(e, CB(e, i), 1, 0, (int)MXB(i, 51, 1)); sat = (int)MXB(i, 52, 1); prec = MXB(i, 57, 2); break;
         case MXOP_HFMA2_cr: hb = HX(e, CB(e, i), 1, 0, (int)MXB(i, 56, 1)); hc = HX(e, R39, MXB(i, 53, 2), 0, (int)MXB(i, 51, 1)); sat = (int)MXB(i, 52, 1); prec = MXB(i, 57, 2); break;
         case MXOP_HFMA2_imm:
-            hb = S(e, "unpackHalf2x16(0x%08xu)", (MXB(i, 20, 9) << 6) | (MXB(i, 29, 1) << 15) | (MXB(i, 30, 9) << 22) | (MXB(i, 56, 1) << 31));
+            hb = S(e, "MX_UH(0x%08xu)", (MXB(i, 20, 9) << 6) | (MXB(i, 29, 1) << 15) | (MXB(i, 30, 9) << 22) | (MXB(i, 56, 1) << 31));
             hc = HX(e, R39, MXB(i, 53, 2), 0, (int)MXB(i, 51, 1)); sat = (int)MXB(i, 52, 1); prec = MXB(i, 57, 2); break;
         default: hb = HX(e, I32(e, i), 0, 0, 0); hc = HX(e, X(e, MXB(i, 0, 8)), 0, 0, (int)MXB(i, 52, 1)); sat = 0; prec = MXB(i, 55, 2); merge = 0; break;
         }
@@ -1516,7 +1529,7 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
         unsigned cmp, bf;
         if (op == MXOP_HSET2_reg) { hb = HX(e, R20, MXB(i, 28, 2), (int)MXB(i, 30, 1), (int)MXB(i, 31, 1)); cmp = MXB(i, 35, 4); bf = MXB(i, 49, 1); }
         else if (op == MXOP_HSET2_cbuf) { hb = HX(e, CB(e, i), 1, 0, (int)MXB(i, 56, 1)); cmp = MXB(i, 49, 4); bf = MXB(i, 53, 1); }
-        else { hb = S(e, "unpackHalf2x16(0x%08xu)", (MXB(i, 20, 9) << 6) | (MXB(i, 29, 1) << 15) | (MXB(i, 30, 9) << 22) | (MXB(i, 56, 1) << 31)); cmp = MXB(i, 49, 4); bf = MXB(i, 53, 1); }
+        else { hb = S(e, "MX_UH(0x%08xu)", (MXB(i, 20, 9) << 6) | (MXB(i, 29, 1) << 15) | (MXB(i, 30, 9) << 22) | (MXB(i, 56, 1) << 31)); cmp = MXB(i, 49, 4); bf = MXB(i, 53, 1); }
         const char *bp = PR(e, MXB(i, 39, 3), (int)MXB(i, 42, 1));
         emit(e, "vec2 ha = %s, hb = %s; %s = (%s ? %s : 0u) | (%s ? %s : 0u);", ha, hb, DST, BOP(e, FCMP(e, cmp, "ha.x", "hb.x"), bp, MXB(i, 45, 2)), bf ? "0x3c00u" : "0xffffu",
              BOP(e, FCMP(e, cmp, "ha.y", "hb.y"), bp, MXB(i, 45, 2)), bf ? "0x3c000000u" : "0xffff0000u");
@@ -1527,7 +1540,7 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
         unsigned cmp, hand;
         if (op == MXOP_HSETP2_reg) { hb = HX(e, R20, MXB(i, 28, 2), (int)MXB(i, 30, 1), (int)MXB(i, 31, 1)); cmp = MXB(i, 35, 4); hand = MXB(i, 49, 1); }
         else if (op == MXOP_HSETP2_cbuf) { hb = HX(e, CB(e, i), 1, (int)MXB(i, 54, 1), (int)MXB(i, 56, 1)); cmp = MXB(i, 49, 4); hand = MXB(i, 53, 1); }
-        else { hb = S(e, "unpackHalf2x16(0x%08xu)", (MXB(i, 20, 9) << 6) | (MXB(i, 29, 1) << 15) | (MXB(i, 30, 9) << 22) | (MXB(i, 56, 1) << 31)); cmp = MXB(i, 49, 4); hand = MXB(i, 53, 1); }
+        else { hb = S(e, "MX_UH(0x%08xu)", (MXB(i, 20, 9) << 6) | (MXB(i, 29, 1) << 15) | (MXB(i, 30, 9) << 22) | (MXB(i, 56, 1) << 31)); cmp = MXB(i, 49, 4); hand = MXB(i, 53, 1); }
         const char *bp = PR(e, MXB(i, 39, 3), (int)MXB(i, 42, 1));
         emit(e, "vec2 ha = %s, hb = %s; bool bl = %s, bh = %s;", ha, hb, BOP(e, FCMP(e, cmp, "ha.x", "hb.x"), bp, MXB(i, 45, 2)), BOP(e, FCMP(e, cmp, "ha.y", "hb.y"), bp, MXB(i, 45, 2)));
         if (hand) emit(e, " bool ba = bl && bh; bl = ba; bh = !ba;");
@@ -1727,7 +1740,7 @@ static int plan_structured(Mx *e) {
 static const char *const k_prelude =
     "#define F(x) uintBitsToFloat(x)\n#define U(x) floatBitsToUint(x)\n"
     "bool cz = false, cs = false, ccf = false, cov = false;\n"
-    "vec2 H(uint r, uint s) { vec2 v = unpackHalf2x16(r); return s == 0u ? v : s == 1u ? vec2(F(r)) : s == 2u ? v.xx : v.yy; }\n"
+    "vec2 H(uint r, uint s) { vec2 v = MX_UH(r); return s == 0u ? v : s == 1u ? vec2(F(r)) : s == 2u ? v.xx : v.yy; }\n"
     "uint HM(uint d, vec2 v, uint m) { uint p = packHalf2x16(v); return m == 0u ? p : m == 1u ? U(v.x) : m == 2u ? ((d & 0xffff0000u) | (p & 0xffffu)) : ((d & 0xffffu) | (p & 0xffff0000u)); }\n"
     "uint mx_addc(uint a, uint b, uint ci) { uint c1, c2; uint r = uaddCarry(a, b, c1); r = uaddCarry(r, ci, c2); cz = r == 0u; cs = int(r) < 0; ccf = (c1 | c2) != 0u; cov = (((a ^ r) & (b ^ r)) >> 31) != 0u; return r; }\n"
     "uint mx_bfe(uint base, uint ctl, bool sgn) { uint off = ctl & 255u, cnt = (ctl >> 8) & 255u;\n"
@@ -1743,6 +1756,26 @@ static const char *const k_prelude =
     "  if (kind == 0u) return f >= 4294967296.0 ? 0xffffffffu : f <= 0.0 ? 0u : uint(f);\n"
     "  if (kind == 3u) return uint(int(clamp(f, -32768.0, 32767.0)));\n"
     "  return uint(clamp(f, 0.0, 65535.0)); }\n";
+
+/* SMO 0.1.6 (mx_guard, on by default on Arm GPUs). GLSL leaves log2 of 0 or less, inversesqrt of 0 or less, sqrt of a negative and
+ * a division by 0 undefined, and the game's shaders were compiled for a GPU that answers them: pow(x, y) is 2^(y * log2(x)), and
+ * x = 0 is common in a specular highlight. Same reasoning as the FMNMX fix (a Mali driver keeps a NaN there). mx_ok: no NaN or
+ * infinity into a render target, where the bloom chain would spread it; healthy frames on the S24 and the emulator hold neither. */
+/* SMO 0.1.7 (mx_precise): half to float by bits in vertex and geometry stages. A driver may run the math after unpackHalf2x16 in native
+ * 16 bits, differently per shader, so a depth pass and its colour pass place a model apart (LAS Recomp saw this on NVIDIA, with holes
+ * in foliage; the conversion below follows its translator, MIT, docs/licenses/). Not known of Mali. */
+static const char *const k_h2f_exact =
+    "float mx_h2f(uint h) { uint s = (h & 0x8000u) << 16, e = (h >> 10) & 0x1Fu, m = h & 0x3FFu;"
+    " if (e == 0u) { float d = float(m) * 5.9604644775390625e-8; return s != 0u ? -d : d; }"
+    " if (e == 31u) return uintBitsToFloat(s | 0x7F800000u | (m << 13));"
+    " return uintBitsToFloat(s | ((e + 112u) << 23) | (m << 13)); }\n"
+    "vec2 mx_uh(uint v) { return vec2(mx_h2f(v & 0xFFFFu), mx_h2f(v >> 16)); }\n#define MX_UH mx_uh\n";
+static const char *const k_guard =
+    "float mx_lg2(float x) { return x > 0.0 ? log2(x) : x == 0.0 ? F(0xff800000u) : F(0x7fc00000u); }\n"
+    "float mx_rcp(float x) { return x != 0.0 ? 1.0 / x : (U(x) >> 31) != 0u ? F(0xff800000u) : F(0x7f800000u); }\n"
+    "float mx_rsq(float x) { return x > 0.0 ? inversesqrt(x) : x == 0.0 ? F(0x7f800000u) : F(0x7fc00000u); }\n"
+    "float mx_sqrt(float x) { return x > 0.0 ? sqrt(x) : x == 0.0 ? x : F(0x7fc00000u); }\n"
+    "vec4 mx_ok(vec4 v) { return mix(v, vec4(0.0), equal(U(v) & uvec4(0x7f800000u), uvec4(0x7f800000u))); }\n";
 
 int mx_translate(const MxIn *in, MxOut *out) {
     Mx *e = calloc(1, sizeof *e);
@@ -1785,6 +1818,7 @@ int mx_translate(const MxIn *in, MxOut *out) {
                 else n += (size_t)snprintf(e->exitcode + n, sizeof e->exitcode - n, "0.0%s", k < 3 ? ", " : "");
             }
             n += (size_t)snprintf(e->exitcode + n, sizeof e->exitcode - n, "); ");
+            if (mx_guard && in->target == 1) n += (size_t)snprintf(e->exitcode + n, sizeof e->exitcode - n, "frag%u = mx_ok(frag%u); ", rt, rt);
             if (rt == 0) { e->uses_alpha = 1; n += (size_t)snprintf(e->exitcode + n, sizeof e->exitcode - n, "if (!mx_alpha_ok(frag0.a)) discard; "); }
         }
         if (flags & 1) { e->regs[reg] = 1; n += (size_t)snprintf(e->exitcode + n, sizeof e->exitcode - n, "gl_SampleMask[0] = int(r%u); ", reg); }
@@ -1840,8 +1874,11 @@ int mx_translate(const MxIn *in, MxOut *out) {
         emit(&h, "#version 460 compatibility\n#extension GL_ARB_bindless_texture : require\n#extension GL_NV_gpu_shader5 : enable\n#extension GL_ARB_gpu_shader_int64 : enable\n"
                  "#extension GL_ARB_shader_ballot : enable\n#extension GL_ARB_shader_group_vote : enable\n#extension GL_EXT_texture_shadow_lod : enable\n");
         if (e->uses_layer_out || e->uses_vp_out) emit(&h, "#extension GL_ARB_shader_viewport_layer_array : require\n");
-        if (e->uses_shfl) emit(&h, "#extension GL_KHR_shader_subgroup_basic : require\n#extension GL_KHR_shader_subgroup_shuffle : require\n");      /* SMO: SHFL */
+        if (e->uses_shfl || (vk && e->uses_lane)) emit(&h, "#extension GL_KHR_shader_subgroup_basic : require\n#extension GL_KHR_shader_subgroup_shuffle : require\n");      /* SMO: SHFL */
+        if (vk && e->uses_xchg) emit(&h, "#extension GL_KHR_shader_subgroup_ballot : require\n");      /* SMO 0.1.2: mx_ballot */
+        emit(&h, "%s", mx_precise && in->target == 1 && (in->stage == MX_VERTEX || in->stage == MX_GEOMETRY) ? k_h2f_exact : "#define MX_UH unpackHalf2x16\n");
         emit(&h, "%s", k_prelude);
+        if (mx_guard && in->target == 1) emit(&h, "%s", k_guard);
         if (vk && in->stage == MX_FRAGMENT && in->screen_scale && e->uses_fcs) emit(&h, "layout(push_constant) uniform MXPC { uvec2 mx_alpha; float mx_point_size; float mx_fcs; };\n");      /* track O */
         else
         if (vk && (in->stage == MX_VERTEX || (in->stage == MX_FRAGMENT && e->uses_alpha))) emit(&h, "layout(push_constant) uniform MXPC { uvec2 mx_alpha; float mx_point_size; };\n");
@@ -1856,7 +1893,7 @@ int mx_translate(const MxIn *in, MxOut *out) {
              * with the same position code; Maxwell executes it identically, a GLSL compiler may not (contraction, order)
              * unless the output is invariant. Without it SMO's title-screen Mario passed the EQUAL test only at random
              * pixels: black speckles everywhere and no Mario (boot93, pass 11). */
-            emit(&h, "out gl_PerVertex { %svec4 gl_Position; float gl_PointSize;", in->target == 1 ? "invariant " : "");
+            emit(&h, "out gl_PerVertex { %svec4 gl_Position; float gl_PointSize;", in->target == 1 && !getenv("SMO_VK_NO_INVARIANT") ? "invariant " : "");      /* SMO_VK_NO_INVARIANT: tests, with a SMO_VK_CACHE of its own */
             if (nclip) emit(&h, " float gl_ClipDistance[%d];", nclip);
             emit(&h, " };\n");
             for (unsigned n = 0; n < 32; n++)
@@ -1913,6 +1950,34 @@ int mx_translate(const MxIn *in, MxOut *out) {
             }
             if (e->uses_smem) emit(&h, "shared uint smem[%u];\n", e->smem_words);
         }
+        /* SMO 0.1.2: warps of 32 threads on any GPU. Maxwell runs a compute group as warps of 32 consecutive threads (the
+         * linear thread index); a Vulkan subgroup has the GPU's own size: 32 on NVIDIA, 64 or 128 on Adreno and AMD, 16 on
+         * Mali (Valhall), 8 to 32 on Intel. The lane number (S2R SR_LANEID and the lane masks) is the Maxwell one, whatever
+         * the subgroup. Values exchanged between lanes (SHFL, VOTE's ballot) go through the subgroup: on a subgroup of 32
+         * lanes or more, inside the 32-lane window of the warp (exact as long as the GPU makes its subgroups of consecutive
+         * invocations, as all of these do); on a smaller subgroup only inside that subgroup (a lane of the other part of the
+         * warp gives the lane's own value to a shuffle and no bit to a ballot: NOT exact; the back end says so in the log).
+         * A graphics stage's lane is the subgroup's own (fragment quads stay inside any subgroup of 4 or more). */
+        if (vk && (e->uses_lane || e->uses_xchg)) {
+            if (in->stage == MX_COMPUTE && !(e->uses_xchg && mx_subgroup_wide)) {
+                unsigned lx = in->local_size[0] ? in->local_size[0] : 1, ly = in->local_size[1] ? in->local_size[1] : 1;
+                emit(&h, "#define MX_LANE ((MX_LID_X + gl_LocalInvocationID.y * %uu + gl_LocalInvocationID.z * %uu) & 31u)\n", lx, lx * ly);
+            } else emit(&h, "#define MX_LANE (gl_SubgroupInvocationID & 31u)\n");
+        }
+        /* SMO 0.1.3: a GPU whose subgroups hold a whole warp gets the short form, with the shuffle written in place: the shader
+         * compiler of Adreno 750 (Galaxy S24 Ultra) crashes in vkCreateComputePipelines, a null pointer in
+         * libllvm-qgl.so, when subgroupShuffle sits in a function of its own (the function form of this line and the general
+         * helper below both crash it; the macro compiles). On such a GPU the lane of a shader that exchanges values is the
+         * subgroup's own, modulo 32 (header, MX_LANE), so that the window of 32 lanes is always inside the subgroup. */
+        if (vk && e->uses_xchg && mx_subgroup_wide) emit(&h,
+            "#define mx_shfl(v, ln, j) subgroupShuffle(v, (gl_SubgroupInvocationID & ~31u) + ((j) & 31u))\n"
+            "uint mx_ballot(bool p) { uvec4 b = subgroupBallot(p); uint q = gl_SubgroupInvocationID >> 5; return q == 0u ? b.x : q == 1u ? b.y : q == 2u ? b.z : b.w; }\n");
+        else if (vk && e->uses_xchg) emit(&h,
+            "uint mx_shfl(uint v, uint ln, uint j) { uint s = gl_SubgroupSize, m = s - 1u; bool w = s >= 32u, same = w || (j & ~m) == (ln & ~m);\n"
+            "  uint t = subgroupShuffle(v, w ? gl_SubgroupInvocationID - ln + j : same ? (j & m) : gl_SubgroupInvocationID); return same ? t : v; }\n"
+            "uint mx_ballot(bool p) { uvec4 b = subgroupBallot(p); uint s = gl_SubgroupSize, ln = MX_LANE;\n"
+            "  if (s >= 32u) { uint q = (gl_SubgroupInvocationID - ln) >> 5; return q == 0u ? b.x : q == 1u ? b.y : q == 2u ? b.z : b.w; }\n"
+            "  return (b.x & ((1u << s) - 1u)) << (ln & ~(s - 1u)); }\n");
         for (unsigned k = 0; k < 8; k++) {
             static const char *const ity[6] = {"1D", "Buffer", "1DArray", "2D", "2DArray", "3D"};
             int cls = 0;
@@ -1965,7 +2030,7 @@ int mx_translate(const MxIn *in, MxOut *out) {
     out->ssbos = e->ssbos; out->ssbo_written = e->uses_gstore ? e->ssbos : 0;
     out->images = e->images; out->images_read = e->images_read; out->images_written = e->images_written;
     memcpy(out->image_gl_format, e->image_fmt, sizeof out->image_gl_format); memcpy(out->image_type, e->image_type, sizeof out->image_type);
-    out->insns = e->insns; out->blocks = e->blocks; out->uses_alpha = e->uses_alpha;
+    out->insns = e->insns; out->blocks = e->blocks; out->uses_alpha = e->uses_alpha; out->warp = (e->uses_lane ? 1 : 0) | (e->uses_xchg ? 2 : 0);
     out->nsmp = e->nsmp; memcpy(out->smp, e->smp, sizeof out->smp);
 done:
     free(e->s); free(e->reach); free(e->leader); free(e->loop_end); free(e->jt); free(e->stk_of); free(e->stks);

@@ -88,6 +88,15 @@ static void sampler_sort(Ctx *c) {
     if (n < 2) return;
     uint64_t *p = (uint64_t *)(uintptr_t)rd64(c->x[0] + 8);      /* guest addresses are host addresses */
     g_sorts++; g_items += n;
+    {   /* the manager (the list is its member at +368): capacity +344, first ID +360, cursor +362, slots in use +408 */
+        static int said, last_cur; uint64_t m = c->x[0] - 368;
+        int cap = (int)rd32(m + 344), used = rd16(m + 408), cur = rd16(m + 362);
+        if (n >= said + 64 || cur < last_cur) {
+            printf("smo_fast: sampler pool: %d slots in the sorted list, %d in use of %d (first ID %d, cursor %d%s), %lld new slots so far\n", n, used, cap, rd16(m + 360), cur, cur < last_cur ? ": it wrapped" : "", (long long)g_sorts);
+            if (n >= said + 64) said = n;
+        }
+        last_cur = cur;
+    }
     if (!g_check) { g_swaps += insertion_sort_keys(p, n); return; }
     uint64_t *before = malloc((size_t)n * 8), *mine = malloc((size_t)n * 8);
     if (!before || !mine) guest_trap("smo_fast: out of host memory for SMO_FAST_CHECK", c->x[30]);

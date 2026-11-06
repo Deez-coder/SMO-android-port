@@ -97,6 +97,10 @@ static const char *const k_default_ini =
 ";   left out until it is ready (no late frame; the object or effect is missing for some frames). The log counts both.\r\n"
 "shader_wait = hold\r\n"
 "\r\n"
+"; diagnostics = off | on      (Vulkan, test option)\r\n"
+";   on: on Mali GPUs, about once a minute a frame is measured and small pictures of it are kept for the log export (a short hitch).\r\n"
+"diagnostics = off\r\n"
+"\r\n"
 "; profile = custom | low\r\n"
 ";   custom: every key of this file as written. low: the set measured for a weak or integrated GPU (2026-10-12, Intel\r\n"
 ";   integrated: 4.2 ms of GPU time per fight frame instead of 9.0): resolution_scale = 0.5, anisotropic_filtering = game,\r\n"
@@ -146,7 +150,7 @@ static void opt_load(void) {
     GfxOptions *o = &g_opt;
     int written = 0, unknown = 0;
     memset(o, 0, sizeof *o);
-    o->width = 1280; o->height = 720; o->scale = 0.0f; o->window_mode = 3; o->fps_counter = 1; o->dynres = 1; o->boost = 1;
+    o->width = 1280; o->height = 720; o->scale = 0.0f; o->window_mode = 3; o->fps_counter = 1; o->dynres = 1; o->boost = 1; o->diag_off = 1;
     opt_path(o->path);
     FILE *f = fopen(o->path, "rb");
     if (!f) {
@@ -183,6 +187,7 @@ static void opt_load(void) {
         else if (!plat_stricmp(key, "fps_counter")) o->fps_counter = plat_stricmp(val, "off") != 0;
         else if (!plat_stricmp(key, "driver")) o->driver_system = !plat_stricmp(val, "system");
         else if (!plat_stricmp(key, "shader_wait")) o->shader_skip = !plat_stricmp(val, "skip");
+        else if (!plat_stricmp(key, "diagnostics")) o->diag_off = plat_stricmp(val, "on") != 0;
         else unknown++;
     }
     if (f) fclose(f);

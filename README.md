@@ -15,22 +15,16 @@ translated to C ahead of time and compiled for Android with the NDK. The console
 > directed, reviewed and tested on a real phone by the project's creator. Expect rough edges, and please report
 > problems with logs (see below).
 
-## Status: beta
+## Status: beta 0.2
 
-The game boots, plays and saves. It has been played on one phone so far, a Galaxy S24
-Ultra (Snapdragon 8 Gen 3). Other phones, including Mali (Exynos, MediaTek, Tensor) and lower-end chips, are untested.
+The game boots, plays and saves. On the dev's Galaxy S24 Ultra (Snapdragon 8 Gen 3, the phone's own driver):
 
-**Performance is not where we want it yet, and we are working on it.** On the S24 Ultra:
+- **60 fps mode:** 60 fps in small and medium areas, about 40–45 fps in some heavy areas. The picture gets softer when
+  the game lowers its render size, and under 60 fps the game plays a little slower than normal.
+- **30 fps mode:** full game speed, holds 30 fps most of the time.
 
-- The **30 fps mode** (recommended) runs the game at full speed and holds 30 fps most of the time, with 1% lows of
-  about 22–27 fps, on both the phone's own driver and Turnip. (you can use a custom driver if you would like for a lil more frames but it is NOT required.
-- The **60 fps mode** runs at about 30–45 fps on my phone, so the game plays slower than normal there.
-- The limit is the CPU (the game's main thread and the threads it waits on) and how Android clocks the CPU for this
-  kind of workload, not the GPU. The work in progress is described in [PROGRESS.md](PROGRESS.md).
-- The first start builds the graphics for your phone (a loading screen shows the progress; about 2-3 minutes once).
-  After that the title screen comes in about 20 seconds. The first visit to each area can still hitch once.
-
-The goal is to run well on Snapdragon and Mali with the phone's own driver. Custom drivers are optional.
+u/CAPELINI_W, testing on a Mali-G615 phone, reports no graphical issues and good performance. Other phones are untested. Custom
+drivers are optional. The first start builds the graphics for your phone (about 2-3 minutes, once).
 
 ## Features
 
@@ -56,7 +50,7 @@ The goal is to run well on Snapdragon and Mali with the phone's own driver. Cust
 
 **Problem reports**
 - **Advanced → Export logs** makes a .zip with the game's logs, a crash log, your settings and your phone model. The
-  log has a speed line every 10 seconds (fps, 1% low, CPU clocks, thermal state), so it shows how the game runs on
+  log has a speed line every 10 seconds (fps, 1% low, CPU clocks, thermal state, and the GPU clock on Snapdragon), so it shows how the game runs on
   your phone. It contains no save, keys or game files.
 
 ## Requirements
@@ -100,6 +94,7 @@ assets, keys or firmware, and it does not help anyone obtain them. You must own 
 ## Credits
 
 - **holdup.lethimcook** (Discord),quandaile (reddit): creator of the Android port. Direction, design, testing and play-testing.
+- **u/CAPELINI_W** (reddit): extensive testing on Mali, and patience with me.
 - **Claude** (Anthropic's AI assistant, used through Claude Code): co-developer. Wrote much of the Android port's code
   (the Android host, the Vulkan renderer's work for phones, the launcher, the 30 fps mode, the graphics options) and
   the measurements in PROGRESS.md.
@@ -108,6 +103,11 @@ assets, keys or firmware, and it does not help anyone obtain them. You must own 
 - [ssbu-recomp](https://github.com/Denkishi/ssbu-recomp) by Denkishi: the design and runtime smo-recomp builds on.
 - [SuperMarioWonderRecomp](https://github.com/hesanaltdoesgithub/SuperMarioWonderRecomp): the reference for the
   Android host (NativeActivity, a fixed guest mapping, an APK built without Gradle).
+- [LAS Recomp](https://github.com/peiikai/LASRecomp) by peiikai (MIT): read for its phone GPU findings. Chunked
+  submissions and the split pass barriers come from there.
+- [Power Moon Recomp](https://gitlab.com/zzzarathustra-dev/power-moon-recomp) by u/zzzarathustra-dev (MIT): the
+  optimizations and findings borrowed for this port, including the strict vertex math and the game's GPU timers in Switch
+  ticks. Licence in `docs/licenses/`.
 - [OdysseyDecomp](https://github.com/MonsterDruide1/OdysseyDecomp) by MonsterDruide1 and contributors: the decompilation
   project, used as a reference only. None of its code is included.
 - [libadrenotools](https://github.com/bylaws/libadrenotools) by bylaws (BSD-2-Clause): loads custom Vulkan drivers.
