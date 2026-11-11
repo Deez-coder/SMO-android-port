@@ -5612,12 +5612,16 @@ int nvn_front_tex_read(Tex *t, int decode, nvn_front_put_fn *put) {
             /* decode: a TEX_DEC_* kind (1 = RGBA8), the texels are decoded on the CPU slice by slice (Android port: BCn
              * on a GPU without BC, as ASTC on one without ASTC) */
             size_t lin = L.lvl_linear_size[l], slice_in = lin / (size_t)(L.lvl_d[l] > 0 ? L.lvl_d[l] : 1);
-            size_t slice_out = decode ? (size_t)L.lvl_w[l] * L.lvl_h[l] * (size_t)tex_decode_bytes_per_texel(decode) : 0;
+            size_t slice_out = decode == TEX_DEC_ETC ? slice_in : decode ? (size_t)L.lvl_w[l] * L.lvl_h[l] * (size_t)tex_decode_bytes_per_texel(decode) : 0;
             size_t need = lin + slice_out * (size_t)(L.lvl_d[l] > 0 ? L.lvl_d[l] : 1);
             if (!b->packaged && t->limit && p + L.lvl_size[l] > t->limit) return 0;
             if (need > tmp_cap) { tmp_cap = need * 2; tmp = realloc(tmp, tmp_cap); }
             tex_deswizzle_level(&L, l, p, tmp);
-            if (decode) {
+            if (decode == TEX_DEC_ETC) {               /* Android port: BC re-encoded as ETC2 / EAC, block for block (tex_etc.c) */
+                int dd = L.lvl_d[l] > 0 ? L.lvl_d[l] : 1;
+                for (int z = 0; z < dd; z++) tex_transcode_etc(b->format, tmp + slice_in * (size_t)z, L.lvl_w[l], L.lvl_h[l], tmp + lin + slice_in * (size_t)z);
+                put(t, l, layer, L.lvl_w[l], L.lvl_h[l], dd, tmp + lin, lin, 0, 0);
+            } else if (decode) {
                 int dd = L.lvl_d[l] > 0 ? L.lvl_d[l] : 1;
                 for (int z = 0; z < dd; z++) tex_decode_to(b->format, decode, tmp + slice_in * (size_t)z, L.lvl_w[l], L.lvl_h[l], tmp + lin + slice_out * (size_t)z);
                 put(t, l, layer, L.lvl_w[l], L.lvl_h[l], dd, tmp + lin, slice_out * (size_t)dd, 1, 0);

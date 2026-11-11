@@ -373,6 +373,7 @@ void plat_event_reset(plat_event *e) {
     pthread_mutex_unlock(&e->m);
 }
 
+int plat_spin_yield_ = -1;                             /* plat.h: spinning gives way (0.2.15) */
 _Thread_local int plat_spin_hot_;                     /* plat.h: spinning before blocking */
 int64_t plat_spinhot_ns_ = -1;                        /* plat.h: the hot threads' spin; -1 until SMO_SPINHOT_US is read */
 

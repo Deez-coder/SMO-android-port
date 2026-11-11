@@ -65,6 +65,14 @@ public class LauncherActivity extends Activity {
         root = getExternalFilesDir(null);
         config = new File(root, "config");
         config.mkdirs();
+        {   /* 0.2.8: "30 fps, full speed" (frame_rate = 30) is gone; the same is the FPS limit at 30 with Steady game speed on */
+            Ini g0 = new Ini(new File(config, "graphics.ini"));
+            if ("30".equals(g0.get("frame_rate", "60").trim())) {
+                if (parse(g0.get("fps_cap", "60"), 60f) >= 60f) g0.set("fps_cap", "30");
+                g0.set("steady_speed", "on");
+                g0.remove("frame_rate");
+            }
+        }
         getWindow().setStatusBarColor(BG);
         getWindow().setNavigationBarColor(BG);
 
@@ -107,6 +115,32 @@ public class LauncherActivity extends Activity {
         });
         setContentView(page);
         show(b != null ? b.getInt("tab", 0) : 0);         /* back from the landscape layout editor: the page the player was on */
+        restartIfAsked();
+    }
+
+    /* 0.2.3, "Restart the game" in the in-game menu: GameActivity ends its process and sends EXTRA_RESTART here; the game is
+     * started again once that process is gone (a new GameActivity must not land in the process that is ending). */
+    static final String EXTRA_RESTART = "com.mobileodyssey.game.RESTART";
+    @Override protected void onNewIntent(Intent i) { super.onNewIntent(i); setIntent(i); restartIfAsked(); }
+    void restartIfAsked() {
+        Intent i = getIntent();
+        if (i == null || !i.getBooleanExtra(EXTRA_RESTART, false)) return;
+        i.removeExtra(EXTRA_RESTART);
+        long t0 = android.os.SystemClock.uptimeMillis();
+        android.os.Handler h = new android.os.Handler(android.os.Looper.getMainLooper());
+        h.post(new Runnable() {
+            @Override public void run() {
+                if (isFinishing()) return;
+                if (gameProcessAlive() && android.os.SystemClock.uptimeMillis() - t0 < 8000) { h.postDelayed(this, 100); return; }
+                startActivity(new Intent(LauncherActivity.this, GameActivity.class));
+            }
+        });
+    }
+    boolean gameProcessAlive() {
+        android.app.ActivityManager am = getSystemService(android.app.ActivityManager.class);
+        List<android.app.ActivityManager.RunningAppProcessInfo> ps = am != null ? am.getRunningAppProcesses() : null;
+        if (ps != null) for (android.app.ActivityManager.RunningAppProcessInfo p : ps) if (p.processName.endsWith(":game")) return true;
+        return false;
     }
 
     @Override protected void onSaveInstanceState(Bundle out) { super.onSaveInstanceState(out); out.putInt("tab", tab); }
@@ -141,14 +175,17 @@ public class LauncherActivity extends Activity {
         card.addView(statusLine("Game files", have ? "installed" : "missing", have ? OK : WARN));
         card.addView(statusLine("Graphics driver", driverStatus(), DIM));
         Ini g = new Ini(new File(config, "graphics.ini"));
-        card.addView(statusLine("Frame rate", "30".equals(g.get("frame_rate", "60")) ? "30 fps (full game speed)" : "60 fps", DIM));
+        {   int cap = Math.round(parse(g.get("fps_cap", "60"), 60f));
+            boolean st = "on".equalsIgnoreCase(g.get("steady_speed", "off"));
+            card.addView(statusLine("FPS limit", cap >= 60 || cap <= 0 ? "none (60)" : cap + (st ? " fps, normal speed" : " fps, slow motion: turn on Steady game speed"), cap > 0 && cap < 60 && !st ? WARN : DIM));
+        }
         String rsv = g.get("resolution_scale", "1.00");
         card.addView(statusLine("Resolution", "auto".equalsIgnoreCase(rsv) ? ("handheld".equalsIgnoreCase(g.get("console_mode", "docked")) ? "1280x720 (console)" : "1920x1080 (console)") : Math.round(parse(rsv, 1f) * 100) + "% of the game's size", DIM));
         card.addView(space(16));
         Button play = button(have ? "▶  Play" : "Import game files first", have ? ACCENT : CARD2);
         play.setTextSize(18);
         play.setEnabled(have);
-        play.setOnClickListener(v -> startActivity(new Intent(this, GameActivity.class)));
+        play.setOnClickListener(v -> { if (archOk()) startActivity(new Intent(this, GameActivity.class)); });
         card.addView(play, new LinearLayout.LayoutParams(-1, dp(56)));
         content.addView(card);
 
@@ -230,12 +267,15 @@ public class LauncherActivity extends Activity {
         Ini g = new Ini(new File(config, "graphics.ini"));
         LinearLayout c = card();
         c.addView(header("Performance"));
-        c.addView(choice(g, "frame_rate", "Frame rate", new String[]{"60", "30"}, new String[]{"60 fps", "30 fps, full speed"}, "60",
-                "30 draws half the frames and runs the game's logic twice per frame, so it never plays in slow motion."));
+        c.addView(toggle(g, "steady_speed", "Steady game speed", "on", "off", "off",
+                "Keeps the game at its normal speed when your fps is below 60. Turn it on if you set the FPS limit below 60, "
+                + "or the game plays in slow motion. Movement can look a little less smooth."));
         c.addView(slider(g, "fps_cap", "FPS limit", 20, 60, 5, 60, "", 1f,
-                "60 = no limit. WARNING: the game advances one step per frame, so any limit below 60 makes it run in slow "
-                + "motion (at 40, two thirds of its speed). Only \"30 fps, full speed\" above keeps normal speed; when it is "
-                + "chosen, this limit is not used."));
+                "60 = no limit. If you set it below 60, turn on Steady game speed, or the game plays in slow motion."));
+        fpsWarn = text("\u26A0 Turn on Steady game speed: with the FPS limit below 60 the game plays in slow motion without it.", 12, WARN, true);
+        fpsWarn.setPadding(0, dp(2), 0, dp(6));
+        c.addView(fpsWarn);
+        fpsWarnUpdate(g);
         c.addView(choice(g, "boost", "CPU boost", new String[]{"auto", "on", "off"}, new String[]{"Auto", "Always", "Off"}, "on",
                 "Keeps the phone's CPU clocks up so heavy scenes hold the frame rate. Auto: only while frames are late. Always: everywhere, warmer."));
         c.addView(choice(g, "shader_wait", "New shaders", new String[]{"hold", "skip"}, new String[]{"Wait", "Skip until ready"}, "hold",
@@ -266,8 +306,19 @@ public class LauncherActivity extends Activity {
         q.addView(header("Quality"));
         q.addView(choice(g, "anti_aliasing", "Anti-aliasing", new String[]{"off", "fxaa"}, new String[]{"Off", "FXAA"}, "fxaa",
                 "FXAA smooths jagged edges on the final picture. Cheap; the picture gets a little softer."));
-        q.addView(slider(g, "sharpening", "Sharpening", 0, 100, 5, 75, "%", 1f,
-                "Contrast-adaptive: brings back fine detail (useful with FXAA or a high resolution scale) without hardening edges. 0 = off."));
+        q.addView(choice(g, "upscaling", "Upscaler", new String[]{"bilinear", "bicubic", "fsr", "gsr"},
+                new String[]{"Bilinear", "Bicubic", "AMD FSR 1", "Snapdragon GSR"}, "bilinear",
+                "How the picture is enlarged to your screen when the resolution is lower than the screen's (a scale under 100%, "
+                + "and a little even at 100% on most phones). All four work on any GPU. Bilinear: soft. Bicubic: a little sharper. "
+                + "FSR 1 and GSR: sharp edges, so a lower scale looks closer to full; GSR is the cheaper of the two. "
+                + "Bicubic, FSR and GSR replace FXAA where they enlarge."));
+        q.addView(slider(g, "sharpening", "Sharpening (Bilinear, Bicubic)", 0, 100, 5, 75, "%", 1f,
+                "Contrast-adaptive: brings back fine detail (useful with FXAA or a high resolution scale) without hardening edges. 0 = off. "
+                + "FSR and GSR use their own sharpening below instead."));
+        q.addView(slider(g, "fsr_sharpness", "FSR sharpness", 0, 100, 5, 90, "%", 1f,
+                "FSR 1's own sharpening (RCAS). 90% is AMD's default."));
+        q.addView(slider(g, "gsr_sharpness", "GSR sharpness", 0, 100, 5, 50, "%", 1f,
+                "GSR's edge sharpness. 50% is Qualcomm's default."));
         q.addView(choice(g, "anisotropic_filtering", "Anisotropic filtering", new String[]{"game", "2", "4", "8", "16"},
                 new String[]{"Game", "2x", "4x", "8x", "16x"}, "game", "Sharper textures at an angle; costs a little GPU time."));
         content.addView(q);
@@ -276,7 +327,11 @@ public class LauncherActivity extends Activity {
         d.addView(header("Display"));
         d.addView(choice(g, "vsync", "Presentation", new String[]{"clock", "on", "mailbox", "off"},
                 new String[]{"Clock", "VSync", "Mailbox", "Off"}, "mailbox", "Clock: lowest latency, paced at 60 Hz by the game itself."));
-        d.addView(toggle(g, "fps_counter", "FPS counter", "on", "off", "on", "The number in the top left corner."));
+        d.addView(toggle(g, "fps_counter", "FPS counter", "on", "off", "on", "The frame rate in the top left corner."));
+        d.addView(toggle(g, "fps_average", "Average FPS", "on", "off", "off", null));
+        d.addView(toggle(g, "fps_low", "1% low", "on", "off", "off", "The frame rate of the slowest 1% of frames: how bad the stutters get."));
+        d.addView(toggle(g, "frame_time", "Frame time", "on", "off", "off", "Milliseconds between frames. Average, 1% low and frame time are of the last 10 seconds or so."));
+        d.addView(slider(g, "fps_size", "Overlay size", 50, 200, 10, 100, "%", 1f, null));
         content.addView(d);
         content.addView(note("Changes apply the next time the game starts."));
     }
@@ -781,12 +836,40 @@ public class LauncherActivity extends Activity {
         s.setTextColor(TEXT);
         s.setTextSize(15);
         s.setChecked(on.equalsIgnoreCase(ini.get(key, def)));
-        s.setThumbTintList(ColorStateList.valueOf(Color.WHITE));
-        s.setTrackTintList(ColorStateList.valueOf(ACCENT2));
-        s.setOnCheckedChangeListener((x, c) -> ini.set(key, c ? on : off));
+        styleSwitch(s, getResources().getDisplayMetrics().density);
+        s.setOnCheckedChangeListener((x, c) -> { ini.set(key, c ? on : off); fpsWarnUpdate(ini); });
         row.addView(s);
         if (help != null) row.addView(text(help, 12, DIM, false));
         return row;
+    }
+
+    /* 0.2.8: a switch shows its state by its track: the accent colour when on, dark grey when off (one colour for both looked
+     * the same either way); the thumb is white when on, light grey when off. Used by the in-game menu too. */
+    static ColorStateList switchTrack() {
+        return new ColorStateList(new int[][]{{android.R.attr.state_checked}, {}}, new int[]{ACCENT2, 0xFF3A404C});
+    }
+    static ColorStateList switchThumb() {
+        return new ColorStateList(new int[][]{{android.R.attr.state_checked}, {}}, new int[]{Color.WHITE, 0xFFB4BAC6});
+    }
+    /* The theme's track is drawn see-through, so the colour came out dull: a solid rounded bar of our own instead, tinted by state. */
+    static void styleSwitch(Switch s, float density) {
+        GradientDrawable t = new GradientDrawable();
+        t.setShape(GradientDrawable.RECTANGLE);
+        t.setColor(Color.WHITE);
+        t.setCornerRadius(12 * density);
+        t.setSize(Math.round(46 * density), Math.round(24 * density));
+        s.setTrackDrawable(t);
+        s.setTrackTintList(switchTrack());
+        s.setTrackTintMode(android.graphics.PorterDuff.Mode.SRC_IN);
+        s.setThumbTintList(switchThumb());
+    }
+    /* 0.2.8: the yellow note under the FPS limit while it is below 60 and Steady game speed is off */
+    TextView fpsWarn;
+    void fpsWarnUpdate(Ini g) {
+        if (fpsWarn == null || !g.file.getName().equals("graphics.ini")) return;
+        float cap = parse(g.get("fps_cap", "60"), 60f);
+        boolean st = "on".equalsIgnoreCase(g.get("steady_speed", "off"));
+        fpsWarn.setVisibility(cap > 0 && cap < 59.5f && !st ? View.VISIBLE : View.GONE);
     }
 
     /* ------------------------------------------------------------ small views */
@@ -835,6 +918,28 @@ public class LauncherActivity extends Activity {
     static String size(int w, int h, float k) { return Math.round(w * k) + "x" + Math.round(h * k); }
     int dp(int v) { return Math.round(v * getResources().getDisplayMetrics().density); }
     void toast(String s) { Toast.makeText(this, s, Toast.LENGTH_SHORT).show(); }
+    /* Issue 9: the main APK is built for ARMv8.2 (LSE atomics) and an ARMv8.0 phone (Cortex-A53 / A73 cores: Snapdragon 680 and older)
+     * crashed at start with SIGILL. The armv8.0 APK (SMO_ARCH=armv8.0, assets/arch.txt "armv8.0") runs there. */
+    static String buildArch(android.content.Context c) {
+        try (java.io.InputStream in = c.getAssets().open("arch.txt")) { byte[] b = new byte[32]; int n = in.read(b); return n > 0 ? new String(b, 0, n).trim() : "armv8.2"; }
+        catch (Exception e) { return "armv8.2"; }
+    }
+    static boolean cpuHasAtomics() {               /* every core's Features line names "atomics"; true when it cannot be read */
+        int lines = 0, with = 0;
+        try (BufferedReader r = new BufferedReader(new java.io.FileReader("/proc/cpuinfo"))) {
+            for (String l; (l = r.readLine()) != null; ) if (l.startsWith("Features")) { lines++; if ((" " + l + " ").contains(" atomics ")) with++; }
+        } catch (Exception e) { return true; }
+        return lines == 0 || with == lines;
+    }
+    boolean archOk() {
+        if (!"armv8.2".equals(buildArch(this)) || cpuHasAtomics()) return true;
+        new AlertDialog.Builder(this).setTitle("This phone needs the ARMv8.0 build")
+            .setMessage("This phone's processor is ARMv8.0 (for example a Snapdragon 680 or older), and this APK needs a newer one: the game would close at once.\n\n"
+                + "Download odyssey-" + versionName() + "-armv8.0.apk from the same release page and install it over this app. Your game files, settings and saves stay.")
+            .setPositiveButton("OK", null).show();
+        return false;
+    }
+    String versionName() { try { return getPackageManager().getPackageInfo(getPackageName(), 0).versionName; } catch (Exception e) { return ""; } }
     void confirm(String q, Runnable yes) { confirm(q, "Reset", yes); }
     void confirm(String q, String verb, Runnable yes) {
         new AlertDialog.Builder(this).setMessage(q).setPositiveButton(verb, (d, w) -> yes.run()).setNegativeButton("Cancel", null).show();

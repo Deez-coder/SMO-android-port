@@ -201,12 +201,26 @@ static inline int64_t plat_spin_ns(void) {
     }
     return plat_spin_is_hot() ? plat_spinhot_ns() : ns;
 }
+/* 0.2.15: a spinning thread gives way to any other thread ready on its processor (sched_yield every 256 rounds). Each game
+ * thread is held on one processor (os_threads.c, console core model), so the main thread spinning while it waited for its
+ * own helpers (the view update and clipping jobs it hands out in every logic step, al::waitUpdateCalcView and
+ * al::ClippingActorHolder::update) kept a helper on the same processor, at a lower priority, from running: on the S24 about
+ * a third of each logic step was that wait. The governor still sees the processor busy. OFF by default (SMO_SPIN_YIELD=1): in a
+ * same-session A/B (SMO_SPIN_AB, S24, 30 fps cap, steady speed) the clipping wait went but the steps were only ~5% shorter and the
+ * frames ~1 ms longer. */
+extern int plat_spin_yield_;                          /* plat_posix.c / plat_win32.c: -1 until read; smo_framerate.c switches it for SMO_SPIN_AB */
+static inline int plat_spin_yield_on(void) {
+    int on = __atomic_load_n(&plat_spin_yield_, __ATOMIC_RELAXED);
+    if (on < 0) { const char *e = getenv("SMO_SPIN_YIELD"); on = e && atoi(e) != 0; __atomic_store_n(&plat_spin_yield_, on, __ATOMIC_RELAXED); }
+    return on;
+}
 /* Spins while cond holds, at most plat_spin_ns(); cond reads shared state with atomic loads. */
 #define PLAT_SPIN_WHILE(cond) do { \
         int64_t ps_ns_ = plat_spin_ns(); \
         if (ps_ns_ > 0) { \
             int64_t ps_end_ = plat_qpc() + ps_ns_ * plat_qpf() / 1000000000; \
-            for (unsigned ps_i_ = 1; (cond); ps_i_++) { plat_cpu_relax(); if (!(ps_i_ & 63) && plat_qpc() >= ps_end_) break; } \
+            int ps_y_ = plat_spin_yield_on(); \
+            for (unsigned ps_i_ = 1; (cond); ps_i_++) { plat_cpu_relax(); if (!(ps_i_ & 63)) { if (plat_qpc() >= ps_end_) break; if (ps_y_ && !(ps_i_ & 255)) plat_yield(); } } \
         } \
     } while (0)
 

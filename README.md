@@ -15,49 +15,55 @@ system libraries, NVN graphics (on Vulkan), shaders, audio, input and the file s
 > project's creator directing it, reviewing it and testing it on a real phone. Expect some rough edges, and if something
 > breaks, please send logs (see below).
 
-## Status: beta 0.2
+## Status: beta 0.3
 
-The game boots, plays and saves! Here's how it runs on the dev's Galaxy S24 Ultra (Snapdragon 8 Gen 3, the phone's own driver):
+The game boots, plays and saves! Here's how it runs on the two phones we've measured, both on the phone's own driver:
 
-- **60 fps mode:** 60 fps in small and medium areas, about 40–45 fps in some heavy areas. The picture gets softer when
-  the game lowers its render size, and under 60 fps the game plays a little slower than normal.
-- **30 fps mode:** full game speed, holds 30 fps most of the time.
+- **Galaxy S24 Ultra** (the dev's phone, Snapdragon 8 Gen 3 / Adreno 750): about 58–60 fps in Cascade at 100% scale, up
+  from about 44 in beta 0.2.
+- **Xiaomi 2406APNFAG** (u/CAPELINI_W's phone, MediaTek Dimensity 8300 / Mali-G615 MC6): about 40 fps, fairly stable, at
+  handheld resolution, with no graphical issues. A 30 fps limit holds steady.
 
-u/CAPELINI_W tested it on a Mali-G615 phone and reports no graphical issues and good performance. Other phones are untested,
-so we'd love to hear how yours does. Custom drivers are optional. The first start builds the graphics for your phone, which
-takes about 2-3 minutes, but only once.
+**Your results will likely be different.** Speed depends a lot on the phone's chip, its GPU driver, how warm it gets and
+your settings. Other phones are untested, so we'd love to hear how yours does. Custom drivers are optional. The first
+start builds the graphics for your phone, which takes a few minutes, but only once (and again after an update that
+changes the shaders).
 
 ## What you get
 
 **Game**
 - Import your own game right in the app: your `prod.keys`, then your NSP or XCI of 1.0.0 (base game, no update). The keys
   stay in the app's private storage until you remove them.
-- 30 fps mode (full game speed) and 60 fps mode.
+- Steady game speed: the game keeps its normal speed even below 60 fps. FPS limit from 20 to 60.
 - Save export and import as a .zip (your current save is kept as a backup).
 - RomFS mods you can turn on and off in the app.
 
 **Graphics**
 - Vulkan 1.3 renderer.
 - Docked (1080p) or handheld (720p) resolution, scale presets, or your own resolution scale.
-- FXAA, sharpening, anisotropic filtering, FPS counter, FPS limit.
+- Upscalers (bilinear, bicubic and more) for any scale under 100%.
+- FXAA, sharpening, anisotropic filtering.
+- FPS counter and performance overlay (average fps, 1% low, frame time).
 - Uses your phone's own Vulkan driver by default. On Snapdragon you can also load custom AdrenoTools driver packages (like
   Mesa Turnip).
 
 **Controls**
 - On-screen touch controls with Switch-style button icons, plus a layout editor to move and resize every button and stick.
 - Any controller Android sees as a gamepad, with button rebinding in the app.
-- To leave the game, use the house button on the touch controls or the controller's Home button (rebindable). It asks
-  first, waits for any save in progress, then takes you back to the app's menu.
+- The house button on the touch controls (or the controller's Home button, rebindable) opens the in-game menu: change
+  settings while the game is paused, restart, or exit. Exit waits for any save in progress, then takes you back to the
+  app's menu.
 - Motion controls through your phone's sensors.
 
 **When something goes wrong**
-- **Advanced → Export logs** makes a .zip with the game's logs, a crash log, your settings and your phone model. There's a
-  speed line every 10 seconds (fps, 1% low, CPU clocks, thermal state, and the GPU clock on Snapdragon), so it shows how the
-  game runs on your phone. No saves, keys or game files in there.
+- **Advanced → Export logs** makes a .zip with the game's logs, a crash log, your settings and your phone model. Every
+  10 seconds the log notes the fps, 1% low, CPU clocks, heat, and where each frame's time went (GPU, game logic,
+  shader building), so a slowdown or a stutter on your phone can be tracked down. No saves, keys or game files in there.
 
 ## What you need
 
-- Android 11 or newer, 64-bit ARM
+- Android 11 or newer, 64-bit ARM (older ARMv8.0 phones, like Snapdragon 680 / 665 / 662, use the `-armv8.0` APK; the
+  app tells you if you need it)
 - Vulkan 1.3
 - About 8 GB of free space for the game files
 - Your own *Super Mario Odyssey* 1.0.0 dump and `prod.keys` from your own console
@@ -83,8 +89,9 @@ The lifted code is made from your own copy of the game, so an APK built this way
 
 ## Found a problem?
 
-Open an issue with your phone model, what happened, and the .zip from **Advanced → Export logs**. Reports from phones other
-than the S24 Ultra help the most, especially Mali ones.
+Please report it here on GitHub: open an [issue](https://github.com/Deez-coder/SMO-android-port/issues) with your phone
+model, what happened, and the .zip from **Advanced → Export logs**. Reports from phones other than the S24 Ultra help the
+most, especially Mali ones.
 
 ## Legal
 

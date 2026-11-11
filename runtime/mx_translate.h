@@ -98,6 +98,12 @@ int mx_translate(const MxIn *in, MxOut *out);
  * set by the Vulkan back end before any translation; 1024 until then (offline tools). */
 extern unsigned mx_max_invocations;
 extern int mx_opt_fs;                    /* SMO 0.1.7, part of the stage hash: fragment and compute stages go through spirv-opt (vk_shaderc_android.c) */
+/* SMO 0.2.5, part of the stage hash: graphics stages read their constant buffers as uniform buffers (std140 uvec4 arrays of
+ * mx_ubo_vec4 entries) instead of storage buffers, so the driver can keep reads at fixed offsets in constant registers. 0: storage. */
+extern int mx_ubo; extern unsigned mx_ubo_vec4;
+extern int mx_c1_inline;                /* SMO 0.2.7, part of the stage hash: a mask of stages (bit = MxIn.stage) whose static reads of c1, the constants the
+                                           game's compiler put after the code (MxIn.cdata), are written as literals: no buffer read, the driver folds them */
+extern int mx_fast_minmax;               /* SMO 0.2.5, part of the stage hash: FMNMX as min / max and saturation as clamp, for GPUs whose min / max skip a NaN and whose clamp to [0, 1] makes a NaN 0 (Adreno) */
 extern int mx_guard, mx_precise;         /* SMO 0.1.6, both part of the stage hash: guard: defined results for the math Vulkan leaves undefined, and no NaN or infinity into a target; precise: vertex and geometry float results may not be contracted */
 extern int mx_subgroup_wide;             /* SMO 0.1.3: the GPU's subgroups have 32 lanes or more (the back end sets it; part of the stage hash) */
 /* SMO: a compute work group larger than Vulkan's 1024 invocations (SMO has 1536 x 1 x 1 groups; NVN on the console takes

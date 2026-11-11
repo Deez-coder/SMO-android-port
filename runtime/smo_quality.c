@@ -14,6 +14,7 @@
 
 void __real_f_4000a58394(Ctx *c);
 static int g_full = -1;
+static volatile uint32_t g_rs_in_w, g_rs_w, g_rs_h;  /* 0.3: smo_render_size */
 
 /* 0.1.8: with real GPU timers (0.1.7) the game's controller moved its cap about 5 times a second on a phone (S24 Ultra, 60 fps
  * mode: 300 changes in a minute), between 800 and 1600 wide, and the game makes its render targets again at each new size:
@@ -75,4 +76,12 @@ void __wrap_f_4000a58394(Ctx *c) {
     }
     if (g_full && !rd32(view + 4)) { wr32(out, rd32(in)); wr32(out + 4, rd32(in + 4)); }
     else if (!rd32(view + 4)) res_hold(out, in);
+    if (!rd32(view + 4) && rd32(in) >= g_rs_in_w) { g_rs_in_w = rd32(in); g_rs_w = rd32(out); g_rs_h = rd32(out + 4); }
+}
+
+/* 0.3: the main view's render size (the largest asked for since the last call) for android_perf.c's perf line; 0 when the game
+ * asked for none. The next window starts afresh, so a change of mode (docked / handheld) shows within one line. */
+void smo_render_size(unsigned *w, unsigned *h, unsigned *asked_w) {
+    *w = g_rs_w; *h = g_rs_h; *asked_w = g_rs_in_w;
+    g_rs_in_w = 0;
 }

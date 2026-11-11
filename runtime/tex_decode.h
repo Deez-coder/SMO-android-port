@@ -196,6 +196,11 @@ extern int tex_bc7_p56_anchor;
 enum { TEX_DEC_NONE = 0, TEX_DEC_RGBA8 = 1, TEX_DEC_R8 = 2, TEX_DEC_R8_SNORM = 3, TEX_DEC_RG8 = 4, TEX_DEC_RG8_SNORM = 5, TEX_DEC_RGBA16F = 6 };
 int tex_decode_to(int nvn_format, int kind, const void *src, int w, int h, void *dst);
 int tex_decode_bytes_per_texel(int kind);
+/* TEX_DEC_ETC (tex_etc.c): BC blocks re-encoded as the ETC2 / EAC blocks of the same size (tex_etc_target names which). */
+enum { TEX_DEC_ETC = 7 };
+enum { TEX_ETC_RGB = 1, TEX_ETC_RGBA1 = 2, TEX_ETC_RGBA8 = 3, TEX_ETC_R11 = 4, TEX_ETC_R11S = 5, TEX_ETC_RG11 = 6, TEX_ETC_RG11S = 7 };
+int tex_etc_target(int nvn_format);
+int tex_transcode_etc(int nvn_format, const void *src, int w, int h, void *dst);
 
 /* Decode a single block (16 or 8 bytes) into an out[bh][bw] RGBA8 array with row pitch pitch bytes
  * (bw, bh from the format; 4x4 for BCn). Same output conventions as above. */

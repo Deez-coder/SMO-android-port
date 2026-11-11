@@ -840,6 +840,280 @@ Joy-Con screen (7,900 of 25,000 shaders in 5.5 min on the S24). **The tester pla
 swap only 0x0a and 0x2e and not 0x13 (SFLOAT does not clamp and can hold NaN), split barriers, optimiser for drawn shaders only. Chunking at
 15 is unmeasured on Mali.
 
+## After Beta 0.2: GitHub issues (2026-11-07, 0.2.1 test build)
+
+**The Joy-Con screen (#12, #13, #14, #15).** The screen before the game's menu waits on `nvn_vk_program_set`, which holds the game's loader while translation
+is behind; about 40,000 programs are handed over on a first start. 0.2.1 limits that hold to 90 s per start on Android (`SMO_VK_HOLD_BUDGET_S`, 0 = no limit). After that,
+programs go to the background scan or are made at their first draw. A notice is shown while the game is held. S24 Ultra, empty test cache:
+
+| Run | Held | Leaves the screen | Fps afterwards |
+|---|---|---|---|
+| 0.2, no limit | 119 s | 138 s | about 54 |
+| limit 30 s | 30.0 s | 59 s | about 50-53 |
+| limit 90 s | 90.0 s | 113 s | about 50 |
+| second start on the cache of the 90 s run | 52 s | 71 s | 52-54 at the end |
+
+Holds at draws 14.7 s and 12.6 s against 11.9 s. No errors; 1 watchdog report in each cold run, as in 0.2. The lower fps is probably the background scan (not confirmed). The second
+start is above the usual 35 s because the first run stopped before the scan finished. No log from a stuck run exists, so the hold is not confirmed as what stops the affected phones.
+The notice was seen on screen; its window has the not-touchable and not-focusable flags. Touch through it was not tried by hand.
+
+**Black, grainy ground on Mali-G615 (#11, Poco X6 Pro, Cap Kingdom, handheld, 30 fps, system driver, 0.2).** Not understood yet. From the reporter's log and video:
+the game's cap fell 1280 to 640 wide at about the time fps fell, the limiter followed (7 steps down, none up logged), and the bad frames in the video are at 26 and 24 fps. Log and video cannot be lined up exactly.
+S24, Cap's start area, same settings (runs `c0`-`c5`), static camera, not the reporter's hill:
+- At 640 wide alone, and at 640 with `SMO_VK_SIM_FMT=100:b,109:b,78:l`: no black. The share of dark pixels is the same as at full size. The tiny coloured specks show here too, so those may not be a bug.
+- This setup falls to 640 on the S24 as well and stays there. The game's GPU timers span the frame across chunked submits, a likely reason the cap sits at its floor (not measured). `SMO_DYNRES=0` gives 1280x720 at 27-29 fps there, a clearly sharper picture, so 640 is not free of cost but neither is full size.
+- 0.2.1 reads R16G16_SNORM (the G-buffer's second target, not filterable on that GPU) nearest. `SMO_VK_UNSUP_NEAREST=0` restores linear, `=1` applies it to every such format. The picture is fine on the S24 with limits imitated, which cannot imitate Mali's undefined result.
+- Evidence against this suspect: the tester's clean 0.1.6 runs had that format native with linear reads, and this texture is half the width of the view, so reads interpolate at full size as well. It is the cheapest thing to rule out, not a finding. Needs a Mali run at that spot.
+
+**First-start preparation (0.2.2).** Replaces the 0.2.1 limit and notice on a first start. `tools_vk`'s container store was never written (`nvn_vk_store.c` is a stub), so the preparation is the game's own hand-over on the Joy-Con screen. The program serial reaches about 26,185 by the end of that screen on the S24 and on the Poco alike (`FIRST_PREP_PROGRAMS`, game 1.0.0). `first_prep_done.txt` in the cache folder marks it done, so another cache folder (another driver) prepares again. S24: 151-154 s from nothing; closed at 60 s, the next start took 121 s; Skip at 35 s reached the menu within about 70 s, and the next start got to program 10,022 at 38 s against 5,075 at 35 s; later start: no bar, about 30 s on the Joy-Con screen. Touching the bar's window works (Skip was tapped by coordinates and by hand). Not run on a slow phone.
+
+**Test input and baselines (found 2026-11-07).**
+- `SMO_SEQ=@until-nerve:StageSceneNrvPlay:Z/45` never ends on the phone: `../functions/main_functions.tsv` is not there, so nerve tracking is off and Z is pressed every 45 polls for the whole run. Mario keeps jumping, the camera looks down, and the flag view in Cascade draws about 846 per frame. Standing still it draws 1205. All earlier Cascade numbers are of the jumping view. `@until:800-1400/20:Z/45` stops the presses once the stage is drawn.
+- The S24's graphics.ini was on `resolution_scale = auto` for all of today's runs before `q3` (`jb`, `j1`-`j3`, `q1`), against 1.00 for the 57-58 fps runs of 2026-11-06, so those are not comparable. It was 1.00 at 22:56 on 11-06. Probably left by the "old defaults" test.
+- Fps, 0.2.2, jumping, 100%, starting at 34°C (runs `a1`, `b1`, `a2`, `b2`, all 0.2.2): from 90 s 57.5, 56.7, 47.9, 52.2. Settled at 310 MHz all four run 56-58. The spread is how long the GPU stays at 231 MHz (45-48 fps): 90, 100, 175 and 135 s. Yesterday's 0.2 runs at 310 MHz: 57-59. `b1` and `b2` were meant to be 0.2, but `adb install -r` refuses the lower version code, so there is no same-day 0.2 run. Standing still, 100% (`q3`): about 34 fps, the clock stays at 231 MHz. A hotter run (`q4`, thermal moderate) falls to 47-51 after about 200 s as the clock drops to 231.
+
+**#9 (Moto G52, Snapdragon 680).** SIGILL in `display_init`: the build uses ARMv8.2 (`-march=armv8.2-a`, `tools/android/android_env.py`) and that phone has ARMv8.0 cores. 0.2 does not change that. The flag is deliberate: LSE atomics, since outline helpers took 3-10% of the game threads on the S24.
+
+## Render passes and upscalers (2026-11-09, 0.2.3 test build)
+
+**Why passes split (SMO_VK_PASSTIME now prints the address of the code that ended each pass, and a line for each layout change that ends one).** Forward view of Cascade, S24 Ultra:
+- The 4-target G-buffer pass was cut 3 times by `resolve_sampler`, which switched textures from COLOR_ATTACHMENT (2) to SHADER_READ_ONLY (5) at their first read: 128x128 (format 38), 2x1 (122), 256x256 (76), all drawn earlier in the frame, and later 400x225 (100, 37) and 200x113 (76). Each cut stored and reloaded 4 colour targets plus depth.
+- The empty clear passes (0, 6, 10, 24, 33) came from `pass_begin` -> `vt_layout` -> `pass_end`, which performed the pending load-clears in an empty pass before the real one loaded the result.
+- Fixes in `pass_begin` (`nvn_vk_draw.c`, "EARLY READ LAYOUT" and "KEEP THE LOAD-CLEARS"): the last pass's attachments that the new pass does not use go to SHADER_READ_ONLY between the passes, and pending clears are kept while the pass changes its own attachments' layouts. `SMO_VK_EARLYREAD=0` / `SMO_VK_LCKEEP=0` undo them.
+- Runs `e1` (on) and `e0` (off), back to back, both at 310 MHz at the measured frame: 50 passes against 62; GPU first to last 23.55 ms against 28.10 (in passes 14.66 against 17.43); 49.8 fps against 44.3. The G-buffer is one pass of 7.2 ms. Same picture (screenshots side by side; only Mario's animation timing differs).
+- Jumping view, 100%, started at 32.8°C (run `j4`): 56-59 fps at 310 MHz, GPU 12.6 ms per frame. Same range as 0.2.2.
+- Not yet: the clear pass before the G-buffer (pass 11 now: depth cleared with 1 colour target, then the 4-target pass loads it). The pending clear does not carry over to a new target set.
+
+**Upscalers (`upscaling` in graphics.ini, the launcher's "Upscaler"; `SMO_UPSCALE` for tests).** All in the present pass, so they enlarge the final picture (the HUD too), not the game's 3D on its own.
+- bilinear (default), bicubic (Catmull-Rom, 9 bilinear reads), gsr (Snapdragon GSR 1 ported into the present shader, edge sharpness from `gsr_sharpness`), fsr (AMD FSR 1: `up_easu` draws EASU into an RGBA8 image at the picture's place on screen, then the present shader runs RCAS on it texel for texel; sharpness `fsr_sharpness`, 90% = 0.2 stops). The shaders come from Power Moon Recomp's adaptation (MIT); here EASU's taps stay inside the crop.
+- Cost at 50% scale (800x450 to 1920x1080), forward view (runs `pb`, `pc`, `pf`, `pg`): present pass 2.49 ms bilinear + FXAA + sharpening, 2.49 bicubic, 2.19 GSR, all at 231 MHz. FSR's run was at 422 MHz: RCAS present 1.15 ms, EASU about 2.5 ms in the gap before it. The fps of these runs are not comparable (different GPU clocks).
+- Look (screenshots at 50%): bilinear with FXAA and sharpening shows dark specks; bicubic is a little sharper; FSR is the smoothest and sharp; GSR is sharp with some stair-stepping. Not seen on a Mali phone.
+- The present pass itself costs 2.2-2.5 ms at 231 MHz for 2340x1080. Worth a look later.
+
+**Test runs.** `TaskStop` on the runner left its child processes going: they kept starting and stopping the game for about 20 minutes, broke a batch and changed the save. The save was put back from the backups (all identical). Stop the runner with `taskkill /T` on its root process.
+
+## In-game menu and performance overlay (2026-11-09, 0.2.4 test build)
+
+- InGameMenu.java replaces the exit question: a right-side panel, the game held behind it. Picture options are re-read by
+  `gfx_options_reload_live()` (nativeReloadOptions), then the game runs for PREVIEW_MS (150 ms) so the held frame shows the
+  change. `nativeMenuOpen` sets `g_menu_open`, so the dialog's focus does not count as "in the background" (otherwise
+  nnmisc.c suspended the game and the preview never drew).
+- The menu's views are made with a ContextThemeWrapper of Theme.DeviceDefault.NoActionBar (the launcher's theme). The game
+  activity has Theme.Black, where a SeekBar is the old grey bar and a Switch is a bare "ON" text.
+- The performance overlay (fps, AVG, 1% LOW, MS) is drawn in the present shader with a 5x7 font kept in the OV uniform
+  block (a constant array indexed by a variable is slow on Adreno). Frame times: a 600-entry ring, 1% low = 1000 / p99.
+- Tested on the S24 Ultra: upscaler changes show while the menu is open (log "upscaling = X" right after the tap, FSR's
+  EASU pass starting), the overlay lines and size change live, the restart note shows for Console mode and hides when
+  it is set back, Restart (two taps) ends the game process within 1 s and starts a new one 1 s later, Exit returns to the
+  launcher. Not tested on a Mali phone.
+- The overlay sits in the top left, under the default touch layout's ZL and L buttons.
+
+## Uniform buffers and the 0.2.5 changes (2026-11-09, 0.2.5 test build)
+
+- **Constant buffers were storage buffers** (`readonly buffer CBn { uint cn[]; }`); LAS and PM use `uniform CBn { uvec4 cbn[N]; }`.
+  Now `mx_ubo` (mx_translate.c): graphics stages declare `uniform CBn { uvec4 cn_v[mx_ubo_vec4]; }` plus `uint cn_r(uint i)`, and
+  `ubo_rewrite` turns every `cN[expr]` of the output into `cN_r(expr)` (brackets counted). Compute stages stay storage. Backend:
+  `CB_DT` for the layouts (layout_bindings, gpl_universal), uniform descriptor writes with the range clamped to
+  maxUniformBufferRange, `D.dyn0u` (dynamic uniform budget, dyn0_pick counts the two kinds apart, 64 in all), pools with uniform
+  sizes, UNIFORM usage on the ring, the zero buffer and the guest-memory buffers, and the uniform offset alignment for buffers
+  bound in place. Stage hash: "ubo1" + mx_ubo_vec4. On when maxPerStageDescriptorUniformBuffers >= 17, set >= 51, range >= 16 KB.
+  S24 limits: 16777216 a stage and a set, 32 dynamic, 65536 bytes, offsets of 256.
+- Runs `s6` (storage) and `u7` (uniform), Cascade forward view, 1205 draws, both at 231 MHz and about 78% busy: 41 against 49 fps;
+  in passes 18.62 against 15.45 ms; G-buffer pass 9.45 against 7.52; first to last 27.26 against 23.68. Picture checked by
+  screenshot. (`u6` landed in the down view, 846 draws, 59.5 fps: not comparable.)
+- **c0 bug:** layouts and writes began at constant buffer 1, so a graphics stage reading c0 outside the storage descriptors was
+  refused (VkResult -13, Qualcomm's driver; the same 6 pipelines in every run, draws left out). Now bound to R.zero.
+- **Still there:** a gap of about 7 ms before pass 9 (after the 256x256 shadow passes, before the G-buffer's 843 draws) in both
+  runs: the GPU waits for the render thread. The forward view is now partly CPU-bound (batch replay ~12 ms, draw preparation ~7 ms).
+  The present pass is 2.5 ms at 231 MHz (bicubic, FXAA, sharpening, 2340x1080).
+- Clear carry (OP_TARGETS, `clearcarry_on`): 3 clears a frame go to the next pass, 50 to 48 passes. Present pass per upscaler
+  (specialisation constant UMODE): 2.56 to 2.48 ms. Fast min / max (Adreno only) and the Arm command buffer release: no
+  measurable change on the S24 (the latter does not apply there).
+- Test-method note: fps alone misleads on the S24 (the clock governor jumps after loading screens and decays); compare
+  SMO_VK_PASSTIME at a frame both runs reach in the level (7000), the same draw count, and the clock in busy.txt.
+
+## Steady game speed (2026-11-10, 0.2.6 test build)
+
+- `smo_framerate.c` (the wrap of procCalc_, main 0x731fdc): with `steady_speed = on` each procCalc_ call runs the calc n times,
+  n = floor(acc + 0.15) clamped to 1..3, acc += frame time x 60 (in steps), acc -= n, acc kept in [-0.5, 1]; a frame over 0.25 s
+  resets acc to 1. The 0.15 keeps a frame rate wobbling around 60 at one step. Read every frame (gfx_options()->steady, live
+  through gfx_options_reload_live and the in-game menu). The log prints steps per frame, how many frames had 1/2/3, and the time
+  of a step every 1800 frames.
+- Runs: `st1` (fps_cap 40, steady on): 1.505 steps a frame at 39.9 fps = 60.2 steps a second. `st2` / `st3` (uncapped, forward view,
+  1205 draws, 231 MHz): off 48 fps / 1.000; on 48.6 fps / 1.23 = 59.8 steps a second. A step measures 11-13 ms on the main thread,
+  but most of it is waiting (no fps lost with 23% more steps).
+- In-game menu toggle tested: "changed in the game: ... steady_speed=on" right after the tap.
+- Not done: above 60 fps (120 Hz screens) needs in-between frames (Power Moon Recomp's frame interpolation, MIT, LAS Recomp's core).
+  Not tested: cutscene and audio sync with steps doubled (frame_rate = 30 has run two steps a frame since 2026-11-02 without reports).
+
+## CPU per draw, shader constants, split passes (2026-11-10, 0.2.7 test build)
+
+- **Profile (simpleperf, render thread, forward view, 0.2.6):** about 10-11 ms busy a frame: libsmo ~4.4 ms, Qualcomm's driver ~3.5,
+  libc ~2.7 (memcpy 0.8: the ring copies 9.3 MB a frame because the copy cache is dropped at every batch; scudo malloc/free ~0.5;
+  atomics 0.4). The boost spin (vdso clock_gettime) is on top. Fixed costs per chunk: vkResetCommandPool ~0.5 ms and
+  vkCmdBeginRendering ~0.35 ms a frame even at the title (122 draws).
+- **mx_c1_inline** (mx_translate.c CB(), stage mask, default 0x22 = fragment + compute): static c1 reads become literals from
+  MxIn.cdata; dynamic reads (LDC, 6 sites in the whole game) keep the buffer. Stage hash "c1i1" (ssrc_hb, only with cdata).
+  Main pass 7.34 vs 7.51 ms at 231 MHz (runs n1 / o2, separate sessions, same view). Vertex stages left out on purpose.
+- **draw_prepare state cache (g_dc):** valid only within a command buffer and after a pipeline of the game (pipe_bound NULL resets it);
+  push descriptors compared by their buffer infos, set 0 / set 1 by set and layout. **Descriptor update templates** per Pipe
+  (dt[0], dt[1], made from the first draw's write list; push form with vkCmdPushDescriptorSetWithTemplateKHR). **Pipeline memo**
+  and **hfast** for g_pipes and the set tables (never for disk names: fnv stays). In-session A/B (`SMO_VK_AB=600`, run `ab1`):
+  draw preparation 6.01 vs 6.16 ms, replay 10.00 vs 10.26.
+- **inpass_split** (after each draw, Adreno default 200, `SMO_VK_SPLIT_PASS`): cmd_submit inside a pass; pass_begin loads the
+  targets in the next command buffer. Runs `sp1` (200) / `sp2` (100), A/B in one session, forward view 1203 draws: 58.10 vs 55.81 fps
+  (the off windows fell to 50-53 when the clock dropped to 231) and 58.16 vs 57.85 (clock at 310 all along). Replay +0.7-1.1 ms
+  (more submits). 100 gives no more than 200.
+- **Test method:** separate-session pairs were spoiled twice: once by heat (thermal moderate, CPU at 1.8-2.3 GHz against 2.8-2.9)
+  and once by the camera (526 vs 843 draws in the main pass). `SMO_VK_AB` (+ `SMO_VK_AB_WHAT` mask: 1 cache and templates, 2 split)
+  switches by turns every N frames, so both states share view, heat and clocks. Getting the forward view: wait for the title (122
+  draws), press Z until the loading screen (8 draws), then press nothing: `SMO_SEQ=@draws:110-130/20 @until:0-100/30:Z/45
+  @draws:1000-1400/20`. A press after spawning makes Mario jump and the camera look down (the 777-draw view).
+- **Runner mistake:** editing the running p30.sh (bash reads a script as it goes) made it run its final cleanup early and start
+  another run; the save was put back by hand from the backup. Never edit a runner that is running: copy it first.
+- **Next ideas:** the ring copies (zero-copy needs host-memory import, which Qualcomm's driver lacks: an AHardwareBuffer / dmabuf
+  remap of the memory pools would be the way, risky); the per-chunk pool resets (one pool per frame, many command buffers);
+  LAS's hot constant buffer words as push constants; the present pass (2.6 ms at 231 MHz with bicubic and sharpening).
+
+## Frame rate options and switches (2026-11-10, 0.2.8 test build)
+
+- frame_rate (60 / 30) removed from LauncherActivity and InGameMenu (and from RESTART_KEYS). The launcher migrates `frame_rate = 30` at
+  start to `fps_cap = 30` + `steady_speed = on` and removes the line; gfx_options.c reads an old `frame_rate = 30` as fps_cap 30
+  (fps30 is always 0 now; `SMO_CALC_TWICE` still forces two steps for tests). fps_cap is copied by gfx_options_reload_live, so the
+  in-game slider applies at once (display.c frame_queued reads it every frame). Steady speed is NOT switched on by itself: the user
+  asked for an explicit note and a yellow warning (fpsWarn in both activities: visible while fps_cap < 60 and steady_speed off).
+- Switches: LauncherActivity.styleSwitch: a solid rounded GradientDrawable track tinted by state (ACCENT2 checked, 0xFF3A404C
+  unchecked, SRC_IN), thumb white / light grey. The theme's own track is drawn see-through, so a tint alone looked dull.
+- Tested on the S24: launcher Graphics page (no Frame rate choice, warning appears at limit 40 with steady off and goes when it is
+  turned on, switch blue / grey), in-game menu (same; log "changed in the game: ... steady_speed=on fps_cap=40"). The user's
+  graphics.ini and save were put back afterwards (md5 checked).
+
+## Mali's CPU path on the S24, and submissions when the GPU runs dry (2026-11-11, 0.2.15)
+
+- **Why:** the user asked for optimizations that help every phone, especially Mali, not just the S24. The S24 pass timing (SMO_VK_PASSTIME,
+  frame 4000, 1600x900) showed 14.9 ms in passes and 12.0 ms of gaps where the GPU waits for the render thread. The passes split into 4 there
+  (#11-#14) are the Adreno-only in-pass splits.
+- **Mali logs:** the tester's 0.2.14 log and the issue logs (#11 G615 MC6, #14 / #16 G615 MC2, #17 Pixel 7 Pro G710, #19 G615 MC6, all 0.2)
+  show 4-5 submissions a frame and 4-10 ms of draw preparation. The present pass is small there (0.7 ms of render-thread time). #14's first
+  log ended at vkCreateSwapchainKHR failing with -1000072003 on the moto g86 (mailbox); its later log ran.
+- **Mali's CPU path run on the S24** (`SMO_VK_PUSH=0 SMO_VK_VIDS=0`, test cache `SMO_VK_CACHE=../cache/vk_mtest` seeded with the spv / stage
+  folders, removed afterwards; Cascade forward view, graphics_pt.ini at scale 1.00; draw preparation and fps from the last perf lines):
+
+  | run | submits between passes / in-pass split | fps | GPU clock | draw preparation |
+  |---|---|---|---|---|
+  | Adreno path (baseline) | 15 / 200 | 59.7 | 310 MHz | 5.3 ms |
+  | Mali path, Mali's old counts | 150 / off | 45.0 | 231 MHz | 5.75 ms |
+  | Mali path | 15 / off | 47.8 | 231 MHz | 5.9 ms |
+  | Mali path | 15 / 200 | 59.8 | 310 MHz | 4.8 ms |
+  | Mali path, 0.2.15 rule | when the GPU has run dry | 58.4-58.9 | 310 MHz | 5.8 ms |
+  | Adreno path, 0.2.15 rule | when the GPU has run dry | 59.0 | 310 MHz | 6.05 ms |
+
+  Descriptor sets instead of push descriptors and the vertex layout in the pipeline key cost nothing that showed. The GPU waiting inside the
+  big pass (and the governor's lower clock that follows) was the whole difference.
+- **0.2.15 rule** (nvn_vk_draw.c gpu_starved / submit_chunk / inpass_split): the last command buffer given to the queue is checked through its
+  end event. Between passes: submit after 15 draws if it has finished, at 150 anyway. Inside a pass: split after 100 draws if it has finished
+  (checked every 10 draws). About 2 splits a frame in Cascade on both paths. Not run on a Mali phone: there each split stores and reloads the
+  pass's images, which is why it waits for an idle GPU instead of a fixed count.
+- **Test-runner note:** p46.sh RUNS lines need `SMO_GRAPHICS_CONFIG=../config/graphics_test.ini SMO_SEQ=@until:800-1400/20:Z/45` as separate
+  words, or the game stays on the title menu; several env values in one quoted string become one env.txt line.
+
+## Mali tester on 0.2.14 (2026-11-10, Xiaomi 2406APNFAG, Dimensity 8300 / Mali-G615 MC6, driver r44p1)
+
+- **Tester's words:** no graphical bugs; "native resolution" 35-45 fps (before the update 35-42); with steady speed the counter is lower but the
+  game "feels like 50-55"; the picture is blurry. Log: odyssey-logs-20261110-1105.zip (one session, handheld, scale 1.00 = 1280x720 on a
+  2712x1220 screen, bilinear, AA off, diagnostics on).
+- **ETC on a real Mali:** "BC textures: re-encoded on the CPU as ETC2 / EAC"; Vulkan memory 992 MB in Cascade (the Mali logs of #16 / #19 had
+  about 2 GB); no visual problems reported. First real confirmation of 0.2.9's texture change.
+- **Steady speed (cause of the low counter):** off: ~1 logic step a frame, 37-41 fps in Cascade (median frame 22-24 ms; the game thread waits
+  ~10 ms a frame for the present, so the render / GPU side limits it). On: 1.4-2.0 steps a frame at ~11.6-13.6 ms each, 26-30 fps, full game
+  speed. On the S24 steady speed costs nothing (GPU-bound with CPU to spare); here the extra calc steps take the frame. The S24's calc step is
+  10-14 ms too, so the step's cost is the game's own logic, not this phone's CPU.
+- **Hitches:** diagnostics = on made 14 capture rounds (every 1800 frames), worst frames 0.6-1.0 s. First start: preparation ended after 235 s
+  at program 9643 ("nothing new for 15 s"; the game held 151 s, watchdog reports of 5-21 s without a frame), then 1,483 holds (58 s) and 1,384
+  pipelines made during play.
+- **Blurry:** handheld renders 1280x720, enlarged 2.1x to the screen with bilinear. Docked (1920x1080) or GSR would be sharper; neither measured
+  on this phone.
+
+## Mali tester on 0.2.15 (2026-11-11, same phone)
+
+- **Tester's words (no log):** "around 40 fps fairly stable" at native handheld resolution, the same with steady speed on or off; the 30 fps
+  limit holds; loading "much faster", "quite noticeable". Diagnostics were to be off.
+- **Against 0.2.14:** steady speed on went from 26-30 fps to ~40 (full game speed at 40 fps means ~1.5 logic steps a frame, so the render side
+  now overlaps them); off went from 37-41 to ~40 and steadier. Fits the submit-when-the-GPU-runs-dry rule (the S24's Mali-path test gave +30%),
+  but one phone, by message. Why loading is faster is not measured: candidates are the earlier submissions while loading, the spin yield off,
+  and diagnostics off. A log of this build would settle it.
+
+## Beta 0.3: release prep, update check, more informative logs (2026-11-11)
+
+- **Update check (emulator odyssey_test, Android 15, started -read-only):** GitHub B0.1.0 -> GitHub B0.2 -> 0.2.1 -> 0.2.9 -> 0.2.14 each
+  installed over the one before (`adb install -r`, Success, version codes 1 -> 11 -> 12 -> 23 -> 28); 0.2.14 -> 0.2.15 through a
+  package-installer session (`pm install-create/-write/-commit`, the API installer apps use): Success, data kept. The Files-app tap path
+  was not run (it needs "install unknown apps" granted). The tester's Xiaomi "conflict" is not reproduced and not explained by the APKs.
+- **The tester's 0.2.15 log (odyssey-logs-20261111-0820.zip):** log.prev = handheld, 60 fps mode, auto scale: 59.6-59.9 fps early,
+  41-46 in heavier play (draw preparation 5-7 ms, GPU waits 1.3-3 ms a frame). log.txt = docked (internal scale 1.20), cap 30, steady
+  speed on: 17-25 fps with 300-900 ms hitches (pipelines being made, 2.25 logic steps a frame) and the render size dropping to 800 wide.
+  That log could not say where a 38 ms median frame went: the render thread was busy ~4 ms and the logic ~10 ms, the GPU unmeasured.
+- **Logs (0.3):** GPU timestamps on by default on Android (`SMO_VK_GPUTIME=0` off). A second perf line every 10 s: GPU ms per frame,
+  render thread ms (and pipelines / stages made, holds), logic ms and steps, a "likely limit" guess, handheld / docked, the 3D size
+  (smo_quality.c smo_render_size), steady speed, frames over 50 ms. `hitch:` lines for frames of 100 ms or more (at most one a second).
+  Perf line: thermal headroom (AThermal_getThermalHeadroom, dlsym), battery temperature, GPU clock / load from kgsl, MediaTek GED or a
+  devfreq node (the first perf line names which, or "not readable"). Totals: nvn_vk_draw.c nvn_vk_totals, smo_framerate.c
+  smo_framerate_totals. **Checked on the S24 (runs log03, 100 s, and log03b, 45 s, Cascade, docked 100%, 60 fps mode):** GPU 3.2-3.8
+  ms a frame in the menus, 4.4-16.8 in Cascade; the GPU clock and load read from kgsl, headroom 0.69-0.72; battery temperature not
+  readable on Samsung (left out of the line). Hitch lines named their cause: 413 ms = render thread 370 ms with 53 holds (shaders
+  being prepared), 116-121 ms = game logic (loading steps). Before the first 3D view the line says "no 3D view yet" (was 0x0).
+  Not run on a Mali phone, so whether MediaTek's GED clock is readable there is unknown.
+- **Version:** Beta 0.3 = versionCode 30. README: status 0.3 with both phones' results, results vary, GitHub issues only. Release notes
+  draft (no Discord): ../release/RELEASE_NOTES_0.3.md.
+
+## Vanishing map parts and first-start stutter (2026-11-10, 0.2.10-0.2.14 test builds)
+
+- **Symptom (S24, 0.2.9, the user's play):** in Cascade at some camera angles ground and props vanished (sky visible inside their outline, like a
+  mirror) and a yellow-white glow with black / blue speckles grew near them. Not reproduced by a scripted camera sweep at the start of Cascade.
+- **Bisect in the user's play (env.txt pushed over adb, same spots each time):** fast min / max off (0.2.10): no change. Fresh shader cache
+  (SMO_VK_CACHE=../cache/fresh): no change. SPLIT_PASS + STATECACHE + DTEMPLATE + EARLYREAD + LCKEEP + CLEARCARRY off: fixed. SPLIT_PASS off
+  alone: not fixed. STATECACHE + DTEMPLATE off: fixed. STATECACHE off alone: fixed. 0.2.12 (disturbed descriptor sets): not fixed. Mask 14
+  (descriptor and push-constant parts off): not fixed. Mask 114 (vertex input and vertex buffer parts off): fixed. 0.2.14 (pchg rule): fixed.
+- **Cause and fix:** draw_prepare kept vkCmdSetVertexInputEXT / vkCmdBindVertexBuffers across a vkCmdBindPipeline when they matched the draw
+  before. Spec-legal, but Qualcomm's driver (Adreno 750, driver 0x802fa029) loses them at the bind. `pchg` sets both again after every pipeline
+  change. Which of the two the driver drops was not narrowed further. Not checked on Mali (the rule applies everywhere).
+- **First-start preparation never ran again after 0.2.5 / 0.2.7:** cache/vk/first_prep_done.txt (2026-11-07) counted for good, so later
+  translation changes were translated during play: 0.2.9 session 441 game holds (12.6 s), 0.2.10 1,453 (43 s), plus 700-900 pipelines made
+  during play. The marker is now first_prep_done_<hash of the translation settings>.txt (first_prep_marker); checked: the bar shows on a fresh
+  cache and finished in 215 s on the S24. The pipelines made during play remain (next stutter work).
+- The user's cache/vk had grown to 11 GB (every test build's translations).
+
+## Issues: BC as ETC2 on Mali, an ARMv8.0 build (2026-11-10, 0.2.9 test build)
+
+- **BC -> ETC2 / EAC (tex_etc.c, TEX_DEC_ETC).** Every Mali log in the issues (#11, #16, #17, #19) says "BC textures: decoded on the CPU": RGBA8 for
+  BC1-3/7, R8 / RG8 for BC4/5. #16 (Moto G86, Mali-G615 MC2, 8 GB) reached 2,012 MB of Vulkan memory and 3.6 GB peak working set, then the
+  log ends (no crash line, logcat empty: most likely the low-memory killer). At the Joy-Con screen: 497 uploads, 566 MB on Mali against 129 MB
+  on the S24. tex_vkfmt maps BC to ETC2 RGB / RGB A1 / RGBA8 and EAC R11 / RG11 (unorm, snorm, sRGB kept) when textureCompressionETC2 and
+  linear filtering of those formats are there; nvn_front_tex_read re-encodes each slice into blocks of the same size (vt->bpb / bw / bh stay
+  the BC ones, so vt_put copies blocks). BC6H keeps RGBA16F. `SMO_VK_BC_ETC=0` = the RGBA8 path; `SMO_ETC_THREADS=1..4` (default 4 for 512x512+).
+- **Encoder.** ETC1 individual / differential in both flips (individual only when differential had to clamp the colour difference), table
+  chosen on the luminance form of the error (q - 2md + 3m^2), exact error for the chosen one, one refit of the base colours. EAC: per table
+  the multiplier spanning the block's range (and the next), base centred, nearest of 8 by a binary search on midpoints. No T, H or planar mode.
+  Test program (scratchpad etctest/etc_test.c, run on the phone): with a reference decoder written separately from the Khronos spec, no
+  invalid blocks, punch-through alpha exact; gradient 41.7 dB, EAC 52-60 dB; a harsh synthetic image with hard colour edges 25 dB (ETC1's
+  limit: one colour per half block). Speed on one S24 big core (clocks unsteady, phone locked): RGB about 30 Mpixel/s, R11 about 16.
+- **In the game (S24, SMO_VK_NO_BC=1 to imitate Mali, Cascade forward view, runs etcA / etcB / etcC):** Vulkan memory 1,376 MB (BC read by the
+  GPU) / 1,312 MB (ETC) / 2,374 MB (RGBA8); uploads 1,581 / 1,451 / 2,454 MB; fps 58-60 in all three (scale 0.90 from the phone's ini, GPU 310
+  MHz); worst frames while loading 0.2-0.4 s in all three. Crops of the cliff side by side: no visible difference.
+- **#9, ARMv8.0 (SIGILL).** `SMO_ARCH=armv8.0` (android_env.py): -march=armv8-a -moutline-atomics -mtune=cortex-a53, folders
+  build/android/arm64-v8a-v80, APK odyssey-<ver>-armv8.0.apk; build_apk writes assets/arch.txt; the launcher's Play checks /proc/cpuinfo
+  (every Features line has "atomics") and on an ARMv8.0 phone with the normal APK shows a dialog naming the armv8.0 APK. Game compile 257
+  objects (about 15 min), runtime 30 s. Disassembly scan (scratchpad scan_v81.sh: LSE, RDMA, LOR, dot product, fp16 arithmetic, RCpc,
+  complex, PAC loads): normal lib 2,997 such instructions, armv8.0 lib 0 outside the __aarch64_* helpers (which check the processor); the
+  adrenotools hooks 0. Not run on an ARMv8.0 phone.
+- **First start.** Cold profile (run cold1, S24, boost on): the render and main threads spin in clock_gettime (boost), the workers about half
+  the sampled time; thread states (cold2): 4.3 of 6 workers running on average. 15,546 programs and 6,090 stages in about 50 s. No lock to fix;
+  glslang (parse, symbol maps, scudo malloc) is most of a stage's cost.
+- **Against 0.2 (runs ab02w / ab02 / ab29, p43.sh):** odyssey-0.2.apk re-signed with version code 22 (reversion02.py: 0.2's manifest from git HEAD, its dex and libs
+  unchanged), cache ../cache/vk02 warmed for 420 s, then 120 s cooled runs, SMO_GRAPHICS_CONFIG = the phone's ini at scale 1.00, forward view:
+  0.2 43.8-44.9 fps at 310 MHz (35.4-36.4 at 231 MHz in the warm run), 0.2.9 58.1-59.5 at 310 MHz. 0.2.9 is code 23 so it installs over that.
+- **Test runs:** the phone stays awake on USB now (the user asked; `svc power stayon usb`), the runners no longer turn it off.
+
 ## Open problems, most important first
 
 0. **Post effects vanish after dying: fixed on Adreno in 0.1.4, Mali not tested.** On the user's S24 (Adreno): when Mario

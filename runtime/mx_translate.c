@@ -17,12 +17,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <ctype.h>
 #include "mx_translate.h"
 #include "mx_ops.h"
 
 unsigned mx_max_invocations = 1024;      /* mx_translate.h */
 int mx_subgroup_wide;                    /* mx_translate.h */
-int mx_guard, mx_precise, mx_opt_fs;     /* mx_translate.h */
+int mx_guard, mx_precise, mx_opt_fs, mx_fast_minmax, mx_c1_inline;     /* mx_translate.h */
+int mx_ubo; unsigned mx_ubo_vec4 = 4096;                  /* mx_translate.h */
+/* 0.2.5 (mx_fast_minmax): saturation as Maxwell does it (a NaN to 0) in the form the GPU does it for free where clamp to
+ * [0, 1] saturates a NaN to 0 (Adreno: a saturate modifier on the instruction that makes the value) */
+#define SAT_F (mx_fast_minmax ? " f = clamp(f, 0.0, 1.0);" : " f = f > 0.0 ? min(f, 1.0) : 0.0;")
 
 #define MXB(x, lo, n) ((unsigned)(((x) >> (lo)) & ((1ull << (n)) - 1)))
 #define MAXSTK 16
@@ -112,6 +117,10 @@ static const char *CB(Mx *e, uint64_t i) {                /* c[bits 34..38][bits
         if (f == 0) { e->gubos |= 1u << n; e->cbufs |= 1u << (3 + n); return S(e, "0x%08xu", (17 + n) << 27); }
         return f == 2 ? "0x07fffffcu" : "0u";
     }
+    if (b == 1 && (mx_c1_inline >> e->in->stage & 1) && e->in->cdata && (w + 1u) * 4u <= e->in->cdata_size) {      /* 0.2.7: the word itself (LAS Recomp inlines c1 too) */
+        uint32_t v; memcpy(&v, e->in->cdata + 4u * w, 4);
+        return S(e, "0x%08xu", v);
+    }
     e->cbufs |= 1u << b;
     return S(e, "c%u[%uu]", b, w);
 }
@@ -193,7 +202,7 @@ static void setcc_int(Mx *e, const char *res) { e->uses_cc = 1; emit(e, " cz = %
 /* float result with optional saturation and condition code; saturation as Maxwell does it, a NaN to 0 (clamp leaves it undefined) */
 static void fres(Mx *e, uint64_t i, const char *expr, int sat, int cc) {
     emit(e, "%sfloat f = %s;", mx_precise && e->in->target == 1 && (e->in->stage == MX_VERTEX || e->in->stage == MX_GEOMETRY) ? "precise " : "", expr);
-    if (sat) emit(e, " f = f > 0.0 ? min(f, 1.0) : 0.0;");
+    if (sat) emit(e, "%s", SAT_F);
     emit(e, " %s = U(f);", DST);
     if (cc) { e->uses_cc = 1; emit(e, " cz = f == 0.0 || isnan(f); cs = f < 0.0 || isnan(f); ccf = false; cov = false;"); }
 }
@@ -880,8 +889,11 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
         b = op == MXOP_FMNMX_reg ? R20 : op == MXOP_FMNMX_cbuf ? CB(e, i) : F20(e, i);
         const char *fa = FN(e, A8, MXB(i, 46, 1), MXB(i, 48, 1)), *fb = FN(e, b, MXB(i, 49, 1), MXB(i, 45, 1));
         /* Maxwell's FMNMX gives the other operand when one is NaN (GLSL leaves min / max of a NaN undefined: Mali keeps the
-         * NaN, and a NaN in the HDR picture spreads through the bloom into white or black blocks; Android port, 2026-11-04) */
-        fres(e, i, S(e, "(isnan(%s) ? %s : isnan(%s) ? %s : %s ? min(%s, %s) : max(%s, %s))", fa, fb, fb, fa, PR(e, MXB(i, 39, 3), (int)MXB(i, 42, 1)), fa, fb, fa, fb), 0, MXB(i, 47, 1));
+         * NaN, and a NaN in the HDR picture spreads through the bloom into white or black blocks; Android port, 2026-11-04).
+         * 0.2.5, mx_fast_minmax: the GPU's own min / max where they already give the operand that is not NaN (Adreno, as D3D
+         * requires; measured by LASRecompAndroid, MIT: two tests and two selects less each) */
+        if (mx_fast_minmax) fres(e, i, S(e, "(%s ? min(%s, %s) : max(%s, %s))", PR(e, MXB(i, 39, 3), (int)MXB(i, 42, 1)), fa, fb, fa, fb), 0, MXB(i, 47, 1));
+        else fres(e, i, S(e, "(isnan(%s) ? %s : isnan(%s) ? %s : %s ? min(%s, %s) : max(%s, %s))", fa, fb, fb, fa, PR(e, MXB(i, 39, 3), (int)MXB(i, 42, 1)), fa, fb, fa, fb), 0, MXB(i, 47, 1));
         break;
     }
     case MXOP_FSET_reg: case MXOP_FSET_cbuf: case MXOP_FSET_imm: {
@@ -934,7 +946,7 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
         if (MXB(i, 45, 1)) src = S(e, "(-%s)", src);
         emit(e, "float f = %s;", src);
         if (ssz == dsz && rop >= 8) emit(e, " f = %s(f);", rnd[rop & 3]);
-        if (MXB(i, 50, 1)) emit(e, " f = f > 0.0 ? min(f, 1.0) : 0.0;");
+        if (MXB(i, 50, 1)) emit(e, "%s", SAT_F);
         if (dsz == 1) emit(e, " %s = packHalf2x16(vec2(f, 0.0));", DST); else emit(e, " %s = U(f);", DST);
         if (MXB(i, 47, 1)) { e->uses_cc = 1; emit(e, " cz = f == 0.0 || isnan(f); cs = f < 0.0 || isnan(f); ccf = false; cov = false;"); }
         break;
@@ -1311,7 +1323,7 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
                 emit(e, " if ((ad >> 4) == %uu) f = in_attr%u[(ad >> 2) & 3u]%s;", (0x80 >> 4) + n, n, (eff == 2 || eff == 0) ? " * gl_FragCoord.w" : "");
             }
             if (mode == 1) emit(e, " f *= F(%s);", R20);
-            if (MXB(i, 51, 1)) emit(e, " f = f > 0.0 ? min(f, 1.0) : 0.0;");
+            if (MXB(i, 51, 1)) emit(e, "%s", SAT_F);
             emit(e, " %s = U(f);", DST);
             break;
         }
@@ -1323,7 +1335,7 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
             if (eff == 2 || eff == 0) emit(e, " f *= gl_FragCoord.w;");      /* hardware IPA returns attribute / w; the shader multiplies by w */
         }
         if (mode == 1) emit(e, " f *= F(%s);", R20);
-        if (MXB(i, 51, 1)) emit(e, " f = f > 0.0 ? min(f, 1.0) : 0.0;");
+        if (MXB(i, 51, 1)) emit(e, "%s", SAT_F);
         emit(e, " %s = U(f);", DST);
         break;
     }
@@ -1736,6 +1748,35 @@ static int plan_structured(Mx *e) {
     }
     return 1;
 }
+/* 0.2.5 (mx_ubo): every read cN[expr] of a constant buffer becomes cN_r(expr), the read of the uniform buffer's uvec4 array
+ * declared with it. The bracket that closes it is found by counting, so an index that itself reads a buffer works. An
+ * identifier that only ends in cN (mx_tc2[) is left alone, and so is the declaration (cN_v[). Returns a new string. */
+static char *ubo_rewrite(char *src) {
+    size_t len = strlen(src), cap = len + len / 4 + 64, o = 0;
+    char *out = malloc(cap), *stk = malloc(len + 1);
+    int depth = 0;                                 /* open [ of reads being rewritten, and of plain [ inside them */
+    for (size_t i = 0; i < len; i++) {
+        if (o + 16 > cap) { cap *= 2; out = realloc(out, cap); }
+        char c = src[i];
+        if (c == 'c' && (i == 0 || !(isalnum((unsigned char)src[i - 1]) || src[i - 1] == '_')) && isdigit((unsigned char)src[i + 1])) {
+            size_t j = i + 1;
+            while (isdigit((unsigned char)src[j])) j++;
+            if (src[j] == '[') {
+                memcpy(out + o, src + i, j - i); o += j - i;
+                memcpy(out + o, "_r(", 3); o += 3;
+                stk[depth++] = 1;
+                i = j;
+                continue;
+            }
+        }
+        if (c == '[') { stk[depth++] = 0; out[o++] = c; continue; }
+        if (c == ']' && depth > 0) { out[o++] = stk[--depth] ? ')' : ']'; continue; }
+        out[o++] = c;
+    }
+    out[o] = 0;
+    free(stk); free(src);
+    return out;
+}
 /* ---------------------------------------------------------------- whole shader */
 static const char *const k_prelude =
     "#define F(x) uintBitsToFloat(x)\n#define U(x) floatBitsToUint(x)\n"
@@ -1885,7 +1926,11 @@ int mx_translate(const MxIn *in, MxOut *out) {
         if (vk && e->uses_tf) emit(&h, "ivec2 mx_tf(ivec2 p, ivec2 real, uint gw, uint gh) { ivec2 g = ivec2(int(gw), int(gh)); return (g.x <= 0 || g.y <= 0 || g == real) ? p : ivec2(floor((vec2(p) + 0.5) * vec2(real) / vec2(g))); }\n");
         if (vk && in->stage == MX_VERTEX) emit(&h, "float mx_psize;\n");
         for (int k = 0; vk && k < e->nsmp; k++) emit(&h, "layout(set = 1, binding = %u) uniform %s mx_t%u_%s;\n", (unsigned)e->smp[k].binding, e->smp[k].type, (unsigned)e->smp[k].unit, e->smp[k].type);
-        for (unsigned n = 0; n < 18; n++) if (e->cbufs >> n & 1) emit(&h, "layout(std430, %sbinding = %u) readonly buffer CB%u { uint c%u[]; };\n", set0, in->binding_base + n, n, n);
+        int ubo = vk && mx_ubo && in->stage != MX_COMPUTE;      /* 0.2.5: cN[i] becomes cN_r(i) below (ubo_rewrite) */
+        for (unsigned n = 0; n < 18; n++) if (e->cbufs >> n & 1) {
+            if (ubo) emit(&h, "layout(std140, %sbinding = %u) uniform CB%u { uvec4 c%u_v[%u]; };\nuint c%u_r(uint i) { return c%u_v[i >> 2u][i & 3u]; }\n", set0, in->binding_base + n, n, n, mx_ubo_vec4, n, n);
+            else emit(&h, "layout(std430, %sbinding = %u) readonly buffer CB%u { uint c%u[]; };\n", set0, in->binding_base + n, n, n);
+        }
         if (in->stage == MX_VERTEX) {
             int nclip = 0;
             for (int k = 0; k < 8; k++) if (e->clip_out >> k & 1) nclip = k + 1;
@@ -2023,6 +2068,7 @@ int mx_translate(const MxIn *in, MxOut *out) {
         else n += (size_t)sprintf(res + n, " %s\n}\n", e->exitcode);
         res[n] = 0;
         free(h.s);
+        if (ubo) res = ubo_rewrite(res);
     }
     out->glsl = res;
     out->cbufs = e->cbufs; out->in_attr = e->in_attr; out->out_attr = e->out_attr; out->tex_units = e->tex_units;

@@ -385,7 +385,7 @@ static int pace_free(void) {
         if (!e && !gfx_options()->fps30) g_pace_free = 1;
 #endif
         /* fps_cap: paced by time at 1 / fps_cap s */
-        if (gfx_options()->fps_cap && !gfx_options()->fps30) printf("display: fps_cap = %d: at most %d frames a second (the game runs at %d%% of its speed when held there)%c", gfx_options()->fps_cap, gfx_options()->fps_cap, gfx_options()->fps_cap * 100 / 60, 10);      /* opt-in: measured on a Galaxy S24 Ultra in Cap Kingdom, no change (29.4-29.8 fps): the game's own frame loop waits for the vsync event as well */
+        if (gfx_options()->fps_cap && !gfx_options()->fps30) printf("display: fps_cap = %d: at most %d frames a second (%s)%c", gfx_options()->fps_cap, gfx_options()->fps_cap, gfx_options()->steady ? "steady_speed on: the game keeps its speed" : "steady_speed off: the game runs slower when held there", 10);      /* opt-in: measured on a Galaxy S24 Ultra in Cap Kingdom, no change (29.4-29.8 fps): the game's own frame loop waits for the vsync event as well */
         printf("display: pacing %s%c", g_pace_free ? "free (a frame lets the game go 1/60 s after the one before, or at once when late; SMO_PACE=refresh: at the refresh after its present)" : "by refreshes (SMO_PACE=free: by time, no waiting for a refresh when late)", 10);
     }
     return g_pace_free;

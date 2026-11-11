@@ -50,7 +50,12 @@ def target_flags(abi):
     # arm64: ARMv8.2-A (every arm64 phone core since about 2018: Cortex-A55/A75 on) - atomics as LSE instructions instead
     # of calls to the outline helpers (__aarch64_cas4_acq ..., 3-10% of the game's threads on a Galaxy S24 Ultra), tuned
     # for the Cortex-A720 cores the game's threads run on
-    extra = ['-march=armv8.2-a', '-mtune=cortex-a720'] if abi == 'arm64-v8a' else []
+    # SMO_ARCH=armv8.0: the build for phones whose cores are ARMv8.0 (Cortex-A53 / A73: Snapdragon 680 and older, issue 9), whose
+    # atomics are the outline helpers (LSE instructions where the processor has them); its folders and APK have their own names
+    if abi == 'arm64-v8a' and arch_v80():
+        extra = ['-march=armv8-a', '-moutline-atomics', '-mtune=cortex-a53']
+    else:
+        extra = ['-march=armv8.2-a', '-mtune=cortex-a720'] if abi == 'arm64-v8a' else []
     return ['--target=%s%d' % (ABIS[abi], API)] + extra + prefix_maps()
 
 
@@ -63,5 +68,9 @@ def prefix_maps():
     return ['-ffile-prefix-map=%s=~' % f for f in sorted(forms)]
 
 
+def arch_v80():
+    return os.environ.get('SMO_ARCH', '').lower() in ('armv8.0', 'armv8-a', 'v80')
+
+
 def build_dir(abi, *parts):
-    return T.build('android', abi, *parts)
+    return T.build('android', abi + ('-v80' if abi == 'arm64-v8a' and arch_v80() else ''), *parts)

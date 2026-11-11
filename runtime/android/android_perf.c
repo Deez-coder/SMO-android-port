@@ -19,6 +19,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <dirent.h>
 #include <sys/types.h>
 #include <android/thermal.h>
 #include "gfx_options.h"
@@ -102,8 +103,74 @@ static void spin_start(void) {
     }
 }
 
+/* 0.3: what a frame's time went to, from the running totals of the renderer (nvn_vk_draw.c nvn_vk_totals) and of the game's
+ * logic (smo_framerate.c); the perf and hitch lines take differences of two snapshots. */
+void nvn_vk_totals(double t[9]);
+void smo_framerate_totals(double *logic_ms, int64_t *steps);
+void smo_render_size(unsigned *w, unsigned *h, unsigned *asked_w);
+typedef struct { double t[9], logic; int64_t steps; } Totals;
+static void totals_now(Totals *x) { nvn_vk_totals(x->t); smo_framerate_totals(&x->logic, &x->steps); }
+
+/* The GPU's clock, where the system lets an app read it: Adreno (kgsl), MediaTek's GED (Mali on Dimensity), a devfreq node
+ * of the GPU (Exynos, Tensor, others). Many phones refuse all of them (SELinux); the first perf line says which one works,
+ * or that none does. Values over 10^7 are Hz, over 10^4 kHz, else MHz. */
+static const char *k_gpu_clock[] = {"/sys/class/kgsl/kgsl-3d0/clock_mhz", "/sys/kernel/ged/hal/current_freqency", "/sys/kernel/gpu/gpu_clock",
+                                    "/sys/class/misc/mali0/device/cur_freq", NULL};
+static const char *k_gpu_busy[] = {"/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage", "/sys/kernel/ged/hal/gpu_utilization", "/sys/kernel/gpu/gpu_busy", NULL};
+static long read_last_number(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    char buf[256];
+    size_t n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    long v = -1;                                       /* GED's file is "<index> <kHz>": the last number on the first line */
+    for (char *p = buf; *p && *p != '\n'; ) {
+        if (*p >= '0' && *p <= '9') { v = strtol(p, &p, 10); continue; }
+        p++;
+    }
+    return v;
+}
+static int gpu_clock_mhz(int *busy) {
+    static int clk = -2, bz = -2;                      /* -2 not looked for yet, -1 none readable, 99 devfreq, else the index */
+    static char devfreq[192];
+    if (clk == -2) {
+        clk = -1;
+        for (int i = 0; k_gpu_clock[i]; i++) if (read_last_number(k_gpu_clock[i]) > 0) { clk = i; break; }
+        if (clk < 0) {                                 /* a devfreq device with "gpu", "mali" or "kgsl" in its name */
+            DIR *d = opendir("/sys/class/devfreq");
+            struct dirent *e;
+            while (d && (e = readdir(d))) {
+                if (!strstr(e->d_name, "gpu") && !strstr(e->d_name, "mali") && !strstr(e->d_name, "kgsl")) continue;
+                snprintf(devfreq, sizeof devfreq, "/sys/class/devfreq/%s/cur_freq", e->d_name);
+                if (read_last_number(devfreq) > 0) { clk = 99; break; }
+                devfreq[0] = 0;
+            }
+            if (d) closedir(d);
+        }
+        bz = -1;
+        for (int i = 0; k_gpu_busy[i]; i++) if (read_last_number(k_gpu_busy[i]) >= 0) { bz = i; break; }
+        printf("perf: GPU clock %s%s, GPU load %s%c", clk < 0 ? "not readable on this phone" : "from ", clk < 0 ? "" : clk == 99 ? devfreq : k_gpu_clock[clk],
+               bz < 0 ? "not readable" : k_gpu_busy[bz], 10);
+    }
+    *busy = -1;
+    if (bz >= 0) {                                     /* GED: "<loading> <idle> <block>", the first number */
+        FILE *f = fopen(k_gpu_busy[bz], "r");
+        if (f) { if (fscanf(f, "%d", busy) != 1) *busy = -1; fclose(f); }
+    }
+    if (clk < 0) return 0;
+    long v = read_last_number(clk == 99 ? devfreq : k_gpu_clock[clk]);
+    if (v <= 0) return 0;
+    return (int)(v > 10000000 ? v / 1000000 : v > 10000 ? v / 1000 : v);
+}
+static int battery_tenths(void) {                      /* tenths of a degree C; -1000: not readable */
+    long v = read_last_number("/sys/class/power_supply/battery/temp");
+    return v < 0 ? -1000 : (int)v;
+}
+
 /* Every 10 s of play a "perf:" line in log.txt, for reports from other phones (Export logs in the launcher): the frame
  * rate, the 1% low, the worst frame, the frame mode and scale, each CPU cluster's clock and Android's thermal state. */
+static int g_slow_frames;                          /* frames over 50 ms since the last perf line (hitch_check) */
 static int cmp_float(const void *a, const void *b) { float x = *(const float *)a, y = *(const float *)b; return (x > y) - (x < y); }
 static void perf_line(int64_t dt) {
     enum { MAXF = 4096 };
@@ -144,16 +211,92 @@ static void perf_line(int64_t dt) {
     else snprintf(mode, sizeof mode, "60 fps mode");
     char scale[16];                                    /* resolution_scale = auto reads as 0 */
     if (o->scale > 0) snprintf(scale, sizeof scale, "%.2f", o->scale); else snprintf(scale, sizeof scale, "auto");
-    int gpu_mhz = 0;                                   /* Adreno: readable by an app. On a Galaxy S24 Ultra the clock decides the frame rate (nvn_vk_draw.c, submit_chunk) */
-    {   FILE *f = fopen("/sys/class/kgsl/kgsl-3d0/clock_mhz", "r");
-        if (f) { if (fscanf(f, "%d", &gpu_mhz) != 1) gpu_mhz = 0; fclose(f); } }
-    char gpu[32] = "";
-    if (gpu_mhz > 0) snprintf(gpu, sizeof gpu, "; GPU %d MHz", gpu_mhz);
-    printf("perf: %.1f fps, 1%% low %.1f, worst frame %.1f ms over %d frames (%s, scale %s); CPU MHz %s; thermal %s%s%c",
+    int busy, gpu_mhz = gpu_clock_mhz(&busy);         /* on a Galaxy S24 Ultra the clock decides the frame rate (nvn_vk_draw.c, submit_chunk) */
+    char gpu[64] = "";
+    if (gpu_mhz > 0 && busy >= 0) snprintf(gpu, sizeof gpu, "; GPU %d MHz, %d%% busy", gpu_mhz, busy);
+    else if (gpu_mhz > 0) snprintf(gpu, sizeof gpu, "; GPU %d MHz", gpu_mhz);
+    else if (busy >= 0) snprintf(gpu, sizeof gpu, "; GPU %d%% busy", busy);
+    char heat[64] = "";
+    {   static float (*p_headroom)(AThermalManager *, int);      /* Android 12+: 1.0 = the point where the system slows the phone */
+        static int looked;
+        if (!looked) { looked = 1; void *lib = dlopen("libandroid.so", RTLD_NOW); if (lib) p_headroom = (float (*)(AThermalManager *, int))dlsym(lib, "AThermal_getThermalHeadroom"); }
+        float hr = thermal && p_headroom ? p_headroom(thermal, 0) : -1.0f;
+        int bt = battery_tenths();
+        size_t h = 0;
+        if (hr >= 0.0f && hr == hr) h += (size_t)snprintf(heat + h, sizeof heat - h, ", headroom %.2f", hr);
+        if (bt > -1000) snprintf(heat + h, sizeof heat - h, ", battery %.1f C", bt / 10.0);
+    }
+    printf("perf: %.1f fps, 1%% low %.1f, worst frame %.1f ms over %d frames (%s, scale %s); CPU MHz %s; thermal %s%s%s%c",
            nf * 1000.0 / sum, 1000.0 * slow / slow_sum, worst, nf, mode, scale, at ? cpu : "unknown",
-           ts >= 0 && ts <= 6 ? k_thermal[ts] : "unknown", gpu, 10);
+           ts >= 0 && ts <= 6 ? k_thermal[ts] : "unknown", heat, gpu, 10);
+    /* 0.3: where the frames' time went in these 10 s, per frame. The game's logic and the render thread run side by side, and the
+     * GPU after them, so a frame takes about the longest of the three; the one close to the frame's time is the limit. */
+    {   static Totals prev;
+        static int have_prev;
+        Totals cur;
+        totals_now(&cur);
+        if (have_prev) {
+            double n = nf, frame = sum / n;
+            double logic = (cur.logic - prev.logic) / n, steps = (double)(cur.steps - prev.steps) / n;
+            double render = (cur.t[0] - prev.t[0] + cur.t[1] - prev.t[1]) / n, pipes = (cur.t[2] - prev.t[2] + cur.t[3] - prev.t[3]) / n;
+            double holds = (cur.t[7] - prev.t[7]) / n, gpu_n = cur.t[6] - prev.t[6], gpu_ms = gpu_n > 0 ? (cur.t[5] - prev.t[5]) / n : -1.0;
+            long long nholds = (long long)(cur.t[8] - prev.t[8]);
+            const char *limit = "mixed (no one part fills the frame)";
+            double cap_ms = o->fps30 ? 33.333 : o->fps_cap ? 1000.0 / o->fps_cap : 16.667;
+            if (frame <= cap_ms * 1.05) limit = o->fps30 || o->fps_cap ? "the fps cap (frames on time)" : "60 fps (frames on time)";
+            else if (gpu_ms >= 0 && gpu_ms >= frame * 0.8) limit = "the GPU";
+            else if (holds >= frame * 0.3) limit = "shaders being prepared (holds)";
+            else if (logic >= frame * 0.8) limit = "the game's logic (CPU)";
+            else if (render >= frame * 0.8) limit = "the render thread (CPU)";
+            unsigned rw, rh, aw;
+            smo_render_size(&rw, &rh, &aw);
+            char size[64];                             /* no 3D view yet: the menus before the game */
+            if (rw) snprintf(size, sizeof size, "3D %ux%u%s", rw, rh, aw && rw < aw ? " (the game lowered it)" : "");
+            else snprintf(size, sizeof size, "no 3D view yet");
+            char gpus[32];
+            if (gpu_ms >= 0) snprintf(gpus, sizeof gpus, "%.1f", gpu_ms); else snprintf(gpus, sizeof gpus, "unknown");
+            printf("perf: per frame %.1f ms: GPU %s, render thread %.1f (making pipelines and shader stages %.1f; %lld holds, %.0f ms in all), game logic %.1f (%.2f steps of %.1f) | likely limit: %s | %s, %s, steady speed %s, %d frames over 50 ms%c",
+                   frame, gpus, render, pipes, nholds, holds * n, logic, steps, steps > 0 ? logic / steps : 0.0, limit,
+                   o->handheld ? "handheld" : "docked", size, o->steady ? "on" : "off", g_slow_frames, 10);
+        }
+        prev = cur; have_prev = 1;
+        g_slow_frames = 0;
+    }
     nf = 0;
     total = 0;
+}
+
+/* 0.3: a frame of 100 ms or more (up to 10 s: longer is the app in the background) gets a "hitch:" line, at most one a second, with what
+ * its time went to; frames over 50 ms are counted for the perf line. The render thread's and the logic's figures are this frame's;
+ * the GPU's is the work that finished during it. */
+static void hitch_check(int64_t dt) {
+    static Totals prev;
+    static int have;
+    static long long frame_no, hidden;
+    static int64_t last_print;
+    Totals cur;
+    totals_now(&cur);
+    frame_no++;
+    double ms = dt / 1e6;
+    if (ms > 50.0 && ms < 1000.0) g_slow_frames++;
+    if (have && ms >= 100.0 && ms < 10000.0) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        int64_t now = (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+        if (now - last_print >= 1000000000) {
+            double render = cur.t[0] - prev.t[0] + cur.t[1] - prev.t[1], pipes = cur.t[2] - prev.t[2] + cur.t[3] - prev.t[3];
+            double holds = cur.t[7] - prev.t[7], wait = cur.t[4] - prev.t[4], logic = cur.logic - prev.logic, gpu = cur.t[5] - prev.t[5];
+            double most = render > logic ? render : logic;
+            if (gpu > most) most = gpu;
+            char more[48] = "";
+            if (hidden) snprintf(more, sizeof more, " (%lld more since the last line)", hidden);
+            printf("hitch: frame %lld took %.0f ms%s: render thread %.0f (making pipelines and shader stages %.0f; %lld holds, %.0f ms; waits for the GPU %.0f), game logic %.0f (%lld steps), GPU work finished %.0f; not in these %.0f (loading, the game's other threads, the system)%c",
+                   frame_no, ms, more, render, pipes, (long long)(cur.t[8] - prev.t[8]), holds, wait, logic, (long long)(cur.steps - prev.steps), gpu, ms > most ? ms - most : 0.0, 10);
+            last_print = now;
+            hidden = 0;
+        } else hidden++;
+    }
+    prev = cur; have = 1;
 }
 
 /* SMO_SPIN_TEST=1, a measuring aid: <files>/config/spinhot holds the hot threads' spin in microseconds (plat.h
@@ -242,6 +385,7 @@ void android_perf_frame(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     int64_t now = (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec, dt = last_ns ? now - last_ns : 0;
     last_ns = now;
+    hitch_check(dt);
     perf_line(dt);
     boost_frame(now, dt);
     if (!perf_on()) return;

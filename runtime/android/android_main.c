@@ -67,7 +67,8 @@ void plat_window_set_title(void *win, const char *title) {
     uint64_t now = plat_ms64();
     if (now - last >= 10000) { last = now; LOGI("%s", title); }     /* the frame counter line, every 10 s in the log */
 }
-int plat_window_focused(void) { return g_focused && g_visible; }
+static volatile int g_menu_open;                      /* 0.2.3: the in-game menu (GameActivity) is shown: it takes the focus, but the game is not in the background */
+int plat_window_focused(void) { return (g_focused || g_menu_open) && g_visible; }
 const char *android_internal_path(void) { return g_app && g_app->activity ? g_app->activity->internalDataPath : NULL; }      /* android_driver.c */
 int android_window_generation(void) { return g_window_gen; }
 void *android_window_current(void) { return g_window; }
@@ -103,6 +104,9 @@ void fs_quiesce(void);                                /* nnfs.c */
 void nvn_vk_pcache_save(const char *why);             /* nvn_vk_m4.c */
 int nvn_vk_load_progress(long long *done, long long *total);      /* nvn_vk_m4.c */
 long long nvn_vk_window_presents(void);               /* nvn_vk_draw.c */
+int nvn_vk_first_prep(long long *done, long long *total);      /* nvn_vk_m4.c */
+void nvn_vk_first_prep_skip(void);                    /* nvn_vk_m4.c */
+static void JNICALL native_skip_prep(JNIEnv *env, jobject self) { (void)env; (void)self; nvn_vk_first_prep_skip(); }
 static void JNICALL native_hold(JNIEnv *env, jobject self, jboolean on) { (void)env; (void)self; display_menu_hold(on ? 1 : 0); }
 static void JNICALL native_quiesce(JNIEnv *env, jobject self) {
     (void)env; (void)self;
@@ -116,20 +120,37 @@ static void JNICALL native_save_cache(JNIEnv *env, jobject self, jboolean leavin
     nvn_vk_pcache_save(leaving ? "the game is left" : "the game went to the background");
 }
 /* GameActivity's loading screen, polled from the UI thread: {frames that reached the window, pipelines made ahead,
- * of how many, 1 when they are all made} */
+ * of how many, 1 when they are all made, first-start preparation running, programs seen, of how many} */
 static void JNICALL native_load_state(JNIEnv *env, jobject self, jlongArray out) {
     (void)self;
-    long long done = 0, total = 0;
+    long long done = 0, total = 0, pdone = 0, ptotal = 0;
     int fin = nvn_vk_load_progress(&done, &total);
-    jlong v[4] = {nvn_vk_window_presents(), done, total, fin};
-    (*env)->SetLongArrayRegion(env, out, 0, 4, v);
+    int prep = nvn_vk_first_prep(&pdone, &ptotal);
+    jlong v[7] = {nvn_vk_window_presents(), done, total, fin, prep, pdone, ptotal};
+    (*env)->SetLongArrayRegion(env, out, 0, 7, v);
+}
+#include "../gfx_options.h"
+void nvn_vk_present_info(int out[5]);                 /* nvn_vk_draw.c */
+/* 0.2.3, the in-game menu (GameActivity): graphics.ini was written, the keys that take effect at once are read again */
+/* without it the game counted as obscured while the menu has the focus and suspended itself (nnmisc.c oe_watch), so a
+ * change of the upscaler could not be shown until the menu was closed */
+static void JNICALL native_menu_open(JNIEnv *env, jobject self, jboolean on) { (void)env; (void)self; g_menu_open = on ? 1 : 0; }
+static void JNICALL native_reload_options(JNIEnv *env, jobject self) { (void)env; (void)self; gfx_options_reload_live(); }
+/* and what it shows: {the game's picture width, height, its size on the screen width, height, fps} */
+static void JNICALL native_menu_info(JNIEnv *env, jobject self, jintArray out) {
+    (void)self;
+    int v[5];
+    nvn_vk_present_info(v);
+    (*env)->SetIntArrayRegion(env, out, 0, 5, v);
 }
 static void register_natives(void) {
     JNIEnv *env = jni_env();
     jclass c = (*env)->GetObjectClass(env, g_app->activity->clazz);
-    JNINativeMethod m[4] = {{"nativeHold", "(Z)V", (void *)native_hold}, {"nativeQuiesce", "()V", (void *)native_quiesce}, {"nativeSaveCache", "(Z)V", (void *)native_save_cache},
-                            {"nativeLoadState", "([J)V", (void *)native_load_state}};
-    if ((*env)->RegisterNatives(env, c, m, 4) != 0) { (*env)->ExceptionClear(env); printf("smo: no GameActivity: no Exit button%c", 10); }
+    JNINativeMethod m[8] = {{"nativeHold", "(Z)V", (void *)native_hold}, {"nativeQuiesce", "()V", (void *)native_quiesce}, {"nativeSaveCache", "(Z)V", (void *)native_save_cache},
+                            {"nativeLoadState", "([J)V", (void *)native_load_state}, {"nativeSkipPrep", "()V", (void *)native_skip_prep},
+                            {"nativeReloadOptions", "()V", (void *)native_reload_options}, {"nativeMenuInfo", "([I)V", (void *)native_menu_info},
+                            {"nativeMenuOpen", "(Z)V", (void *)native_menu_open}};
+    if ((*env)->RegisterNatives(env, c, m, 8) != 0) { (*env)->ExceptionClear(env); printf("smo: no GameActivity: no Exit button%c", 10); }
     (*env)->DeleteLocalRef(env, c);
 }
 static int display_rotation(void) {                  /* Surface.ROTATION_0 .. 270 as 0..3 */

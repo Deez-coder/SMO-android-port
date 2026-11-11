@@ -16,14 +16,20 @@ typedef struct {
     int shader_skip;         /* shader_wait: 0 hold (a draw waits for its shader or pipeline: the frame is late), 1 skip (near a fight the draw is left out until they are ready; nvn_vk_m4.c skip_on; env SMO_VK_NOHOLD wins) */
     int profile;            /* 0 custom (the keys as written), 1 low: scale, aniso and present are set by the profile (gfx_options.c) */
     int fps_counter;         /* fps_counter = on (default) | off: the frame rate in the corner (Android present pass; env SMO_FPS=0 wins) */
+    int fps_avg, fps_low, frame_time;   /* fps_average, fps_low, frame_time = on | off: more lines of the performance overlay (the present pass, nvn_vk_draw.c ov_text) */
+    float fps_size;          /* fps_size = 50..200 (%): its size */
     int driver_system;       /* driver = custom (default: a custom Vulkan driver when one is installed, Android) | system (env SMO_DRIVER=system wins) */
     int fxaa;                /* anti_aliasing = fxaa: edges smoothed in the present pass (nvn_vk_draw.c) */
     int dynres;              /* dynamic_resolution = on: the game caps its 3D size by its quality setting; off: full size (smo_quality.c) */
+    int upscaler;            /* upscaling = bilinear (0, default) | gsr (1) | fsr (2) | bicubic (3): how the present pass enlarges the picture (nvn_vk_draw.c up_mode; env SMO_UPSCALE wins) */
+    float fsr_sharp, gsr_sharp;  /* fsr_sharpness, gsr_sharpness = 0..100 (%): the sharpening of FSR 1 (RCAS) and of GSR; sharpening is for bilinear and bicubic */
     float sharpen;           /* sharpening = 0..100 (%): contrast-adaptive sharpening in the present pass (0 = off) */
     int fps_cap;             /* fps_cap = 20..59: at most that many frames a second (0 or 60 = none; frame_rate = 30 wins); the game runs slower below 60 */
+    int steady;              /* steady_speed = on: the game's logic runs as often as the time since the last frame asks (1..3 steps, smo_framerate.c), so the game keeps its speed below 60 fps; re-read in the game (gfx_options_reload_live) */
     int fps30;               /* frame_rate = 30: 30 frames a second are drawn and the game's logic runs twice a frame (full speed, smo_framerate.c) */
     int diag_off;            /* diagnostics = off (default, 1; an old "auto" line counts as off) | on (ARM GPUs: nvn_vk_draw.c diag_present, eq_begin) */
     int boost;               /* boost = auto (default, 1) | on (2, always) | off (0): the frame's threads keep their CPUs' clocks up while frames are late (Android, android_perf.c) */
 } GfxOptions;
 const GfxOptions *gfx_options(void);      /* any thread; read once (the file is written with defaults when it does not exist) */
+void gfx_options_reload_live(void);   /* the in-game menu: re-reads the keys that take effect at once (gfx_options.c) */
 #endif

@@ -138,6 +138,10 @@ static struct {
 } V;
 static volatile int64_t g_vk_frames, g_vk_recreated, g_vk_skipped, g_vk_errors, g_vk_messages, g_vk_missing_calls;
 static int g_vk_missing_warn = -1;
+/* 0.2.5: command buffers and pools reset with RELEASE_RESOURCES (nvn_vk_draw.c sets it: Arm's own driver). libmali keeps what
+ * vkCmdBeginRendering allocated across a reset that does not release it: a process grew by ~490 MB an hour until it ran out of
+ * memory (LAS Recomp #607, MIT: libmali g29p1, Mali-G610). Elsewhere keeping the memory is faster (~1.2 ms a frame on Qualcomm's driver). */
+static int g_cb_release;
 
 static const char *vk_result_name(VkResult r) {
     static char buf[32];
@@ -536,7 +540,7 @@ static void present_colour(const float rgba[4]) {
     VkCommandBufferBeginInfo bi;
     memset(&bi, 0, sizeof bi);
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO; bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vk_ok("vkResetCommandBuffer", vkResetCommandBuffer(V.cmd, 0));
+    vk_ok("vkResetCommandBuffer", vkResetCommandBuffer(V.cmd, g_cb_release ? VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT : 0));
     vk_ok("vkBeginCommandBuffer", vkBeginCommandBuffer(V.cmd, &bi));
     VkImageMemoryBarrier b;
     memset(&b, 0, sizeof b);

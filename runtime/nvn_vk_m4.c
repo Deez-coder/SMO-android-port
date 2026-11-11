@@ -91,6 +91,15 @@ static const char *ho_text(uint64_t hb) {
     return "code never handed over before this draw";
 }
 static uint64_t fnv(uint64_t h, const void *p, size_t n) { const uint8_t *b = p; for (size_t i = 0; i < n; i++) h = (h ^ b[i]) * 0x100000001B3ULL; return h; }
+/* 0.2.7: for tables that live in memory only (pipelines, the descriptor set lists of a command buffer): 8 bytes a step where fnv
+ * takes one (a pipeline key is about 200 bytes, hashed at every draw). Never for anything on disk: fnv names the cache files. */
+static inline uint64_t hfast(uint64_t h, const void *p, size_t n) {
+    const uint8_t *b = p;
+    for (; n >= 8; b += 8, n -= 8) { uint64_t w; memcpy(&w, b, 8); h = (h ^ w) * 0x9E3779B97F4A7C15ULL; h ^= h >> 29; }
+    if (n) { uint64_t w = 0; memcpy(&w, b, n); h = (h ^ w) * 0x9E3779B97F4A7C15ULL; h ^= h >> 29; }
+    return h ^ (h >> 32);
+}
+#define PK_HASH(kp) hfast(0xcbf29ce484222325ULL, (kp), sizeof *(kp))      /* the bucket of g_pipes */
 /* Session 7: the cache folder. SMO_VK_CACHE=<folder> (tests: a first run on a cache of one's own, without touching the
  * shared ..\cache\vk); first called on the starting thread, before the workers exist. */
 static const char *vkc_dir(void) {
@@ -127,8 +136,11 @@ static uint64_t ssrc_hb(const SSrc *o) {
     if (mx_guard) h = fnv(h, "guard1", 6);      /* 0.1.6: another translation; without these two the hash is the one it always was */
     if (mx_precise && (o->stage == 0 || o->stage == 2)) h = fnv(h, "strict2", 7);
     if (mx_opt_fs && (o->stage == 1 || o->stage == 5)) h = fnv(h, "optfs1", 6);
+    if (mx_fast_minmax) h = fnv(h, "fmm1", 4);      /* 0.2.5 */
+    if (mx_ubo && o->stage != 5) { h = fnv(h, "ubo1", 4); h = fnv(h, &mx_ubo_vec4, 4); }      /* 0.2.5: constant buffers as uniform buffers */
     if (o->stage == 5) { h = fnv(h, o->local, sizeof o->local); h = fnv(h, &o->smem, 4); h = fnv(h, &o->lmem, 4); if (mx_max_invocations != 1024) h = fnv(h, &mx_max_invocations, 4); }      /* 0.1.2: a GPU with smaller compute groups splits them otherwise */
     if (o->cdata) h = fnv(h ^ o->cdata_size, o->cdata, o->cdata_size);
+    if (o->cdata && (mx_c1_inline >> o->stage & 1)) h = fnv(h, "c1i1", 4);      /* 0.2.7: c1 read as literals */
     if (o->stage == 2) h = fnv(h, &o->gprim, sizeof o->gprim);      /* SMO: a geometry stage is translated for the draw's primitive class */
     if (!D.has_dcc && (o->stage == 2 || (o->stage == 0 && o->gprim))) h = fnv(h, "dz-last", 7);      /* Android port: where the depth remap goes (module_from_glsl_ex); records made before it are not used */
     if (o->stage == 1 && RS_ON) h = fnv(h, "rs1", 3);      /* track O: the fragment stages of a run with an internal resolution scale are another translation (MxIn.screen_scale); at 1.0 the hash is the one it always was */
@@ -454,7 +466,7 @@ static VStage *vstage_get(Prog *p, int s, const uint32_t *key, uint32_t fo, int 
  * VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE), so a mesh with another stride does not make another pipeline. */
 typedef struct { uint32_t vs, fs, chanmask, sample_mask; int32_t cfmt[8], dfmt; uint8_t topo_class, ncolor, samples, poly, a2c, dclamp, logic, sshade, blend_on, pad[3]; uint8_t blend[8][8];
                  uint8_t vnb, vna, vrate[17], vpad; uint8_t vbind[16], vfmt[16]; uint16_t voff[16]; } PKey;
-typedef struct Pipe { PKey k; VkPipeline p, p_fast; /* p_fast: the pipeline linked at once, after the optimised one took its place */ VkPipelineLayout layout; VkDescriptorSetLayout dl[2]; int nb[2], push0, dyn0 /* buffers of set 0 at dynamic offsets (dyn0_pick) */, dl0_shared /* 1: dl[0], 2: dl[1] from dl0_get */; uint64_t dynm[2] /* which of set 0's writes are dynamic */; VStage *vs, *fs, *gs /* SMO: see gs_pipe_get */; volatile int32_t state; uint8_t recorded, predicted, used, libbed, lib_how; struct Pipe *next; } Pipe;      /* libbed: linked from libraries (layout and set layouts belong to the pair library); lib_how: 0 the pair library was there, 1 compiled by this build, 2 waited for */      /* state: 0 queued for a worker, 1 being made, 2 made */
+typedef struct Pipe { PKey k; VkPipeline p, p_fast; /* p_fast: the pipeline linked at once, after the optimised one took its place */ VkPipelineLayout layout; VkDescriptorSetLayout dl[2]; int nb[2], push0, dyn0 /* buffers of set 0 at dynamic offsets (dyn0_pick) */, dl0_shared /* 1: dl[0], 2: dl[1] from dl0_get */; uint64_t dynm[2] /* which of set 0's writes are dynamic */; VStage *vs, *fs, *gs /* SMO: see gs_pipe_get */; volatile int32_t state; uint8_t recorded, predicted, used, libbed, lib_how, dt_tried[2]; VkDescriptorUpdateTemplate dt[2] /* 0.2.7: set 0 and set 1 written by template (draw_prepare) */; struct Pipe *next; } Pipe;      /* libbed: linked from libraries (layout and set layouts belong to the pair library); lib_how: 0 the pair library was there, 1 compiled by this build, 2 waited for */      /* state: 0 queued for a worker, 1 being made, 2 made */
 static Pipe *g_pipes[1024];
 static VkShaderModule g_gs_dbg_fs;                 /* SMO_VK_GS_DEBUG=3 (gs_pipe_get): the fragment stage of draws with a geometry stage */
 /* SMO debug aid SMO_VK_GS_DEBUG=<mode> for the draws with a geometry stage (the lightning): 1 measures them (nvn_vk_draw.c
@@ -475,7 +487,7 @@ static VkBlendFactor blend_factor(unsigned f) {
 static VkBlendOp blend_op(unsigned e) { static const uint8_t m[6] = {VK_BLEND_OP_ADD, VK_BLEND_OP_ADD, VK_BLEND_OP_SUBTRACT, VK_BLEND_OP_REVERSE_SUBTRACT, VK_BLEND_OP_MIN, VK_BLEND_OP_MAX}; return (VkBlendOp)m[e < 6 ? e : 1]; }
 static void layout_bindings(VStage *v, int s, VkDescriptorSetLayoutBinding *b0, int *n0, VkDescriptorSetLayoutBinding *b1, int *n1) {
     VkFlags sf = s == 2 ? VK_SHADER_STAGE_GEOMETRY_BIT : s ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT;
-    for (unsigned n = 1; n < 18; n++) if (v->cbufs >> n & 1) { VkDescriptorSetLayoutBinding b = {40u * (unsigned)s + n, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, sf, NULL}; b0[(*n0)++] = b; }
+    for (unsigned n = 0; n < 18; n++) if (v->cbufs >> n & 1) { VkDescriptorSetLayoutBinding b = {40u * (unsigned)s + n, CB_DT, 1, sf, NULL}; b0[(*n0)++] = b; }      /* 0.2.5: from 0 (c0: the zero buffer) */
     for (unsigned k = 0; k < 16; k++) if (v->ssbos >> k & 1) { VkDescriptorSetLayoutBinding b = {40u * (unsigned)s + 20 + k, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, sf, NULL}; b0[(*n0)++] = b; }
     for (int i = 0; i < v->nsmp; i++) { VkDescriptorSetLayoutBinding b = {v->smp[i].binding, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, sf, NULL}; b1[(*n1)++] = b; }
 }
@@ -485,11 +497,16 @@ static void layout_bindings(VStage *v, int s, VkDescriptorSetLayoutBinding *b0, 
  * ranges (draw_prepare). All of them when the device allows that many, else the uniform slots and storage buffers first
  * (binding % 40 >= 3), then c1 and c2. m: which of the n bindings (in order, = the draw's writes) are dynamic. */
 static int dyn0_pick(VkDescriptorSetLayoutBinding *b, int n, uint64_t *m) {
-    int nd = 0;
+    int nd = 0, ns = 0, nu = 0;                    /* 0.2.5: uniform (constant buffers, mx_ubo) and storage buffers each have their budget; 64 in all (the draw's offsets) */
     m[0] = m[1] = 0;
     for (int pass = 0; pass < 2; pass++)
-        for (int i = 0; i < n && i < 128; i++)
-            if (nd < D.dyn0 && !(m[i >> 6] >> (i & 63) & 1) && (pass || b[i].binding % 40 >= 3)) { b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC; m[i >> 6] |= 1ull << (i & 63); nd++; }
+        for (int i = 0; i < n && i < 128 && nd < 64; i++) {
+            if ((m[i >> 6] >> (i & 63) & 1) || !(pass || b[i].binding % 40 >= 3)) continue;
+            int u = b[i].descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            if (u ? nu >= D.dyn0u : ns >= D.dyn0) continue;
+            b[i].descriptorType = u ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+            m[i >> 6] |= 1ull << (i & 63); nd++; if (u) nu++; else ns++;
+        }
     return nd;
 }
 /* Pipelines with the same set 0 bindings (without push descriptors), or the same set 1 bindings (every device), share
@@ -698,11 +715,11 @@ static int gpl_sep(void) { static int m = -1; if (m < 0) m = D.has_gpl && vk_gpl
 static void gpl_universal(void) {
     plat_mutex_lock(&g_gpl_lock);
     if (!g_ulayout) {
-        static VkDescriptorSetLayoutBinding b0[66], b1[128];
+        static VkDescriptorSetLayoutBinding b0[68], b1[128];
         int n0 = 0, n1 = 0;
         for (unsigned s = 0; s < 2; s++) {
             VkFlags sf = s ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT;
-            for (unsigned n = 1; n < 18; n++) { VkDescriptorSetLayoutBinding b = {40u * s + n, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, sf, NULL}; b0[n0++] = b; }
+            for (unsigned n = 0; n < 18; n++) { VkDescriptorSetLayoutBinding b = {40u * s + n, CB_DT, 1, sf, NULL}; b0[n0++] = b; }
             for (unsigned k = 0; k < 16; k++) { VkDescriptorSetLayoutBinding b = {40u * s + 20 + k, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, sf, NULL}; b0[n0++] = b; }
             for (unsigned u = 0; u < 32; u++) { VkDescriptorSetLayoutBinding b = {40u * s + u, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, sf, NULL}; b1[n1++] = b; b.binding += 240; b1[n1++] = b; }
         }
@@ -844,7 +861,7 @@ static double pipe_build(Pipe *p) {
         VkResult r = vkCreateGraphicsPipelines(V.device, g_pcache, 1, &gi, NULL, &p->p);
         if (r != VK_SUCCESS) vkd_fail("vkCreateGraphicsPipelines, link of stage libraries (vertex stage %u, fragment stage %u, %d colour targets, depth format %d): %s", k->vs, k->fs, k->ncolor, k->dfmt, vk_result_name(r));
         int64_t dt = tk() - t1;
-        p->layout = g_ulayout; p->dl[0] = g_udl[0]; p->dl[1] = g_udl[1]; p->nb[0] = 66; p->nb[1] = 128; p->push0 = 0; p->libbed = 1; p->lib_how = (uint8_t)how;
+        p->layout = g_ulayout; p->dl[0] = g_udl[0]; p->dl[1] = g_udl[1]; p->nb[0] = 68; p->nb[1] = 128; p->push0 = 0; p->libbed = 1; p->lib_how = (uint8_t)how;
         plat_atomic_inc(&R.pipelines);
         if (plat_tid() == g_render_tid) { g_gpl_dlink++; g_gpl_dlink_tk += dt; if (dt > g_gpl_dlink_max) g_gpl_dlink_max = dt; if (g_in_fight) g_gpl_dlink_fight++; }
         else { plat_atomic_inc(&g_gpl_link); plat_atomic_add(&g_gpl_link_tk, dt); }
@@ -1142,7 +1159,7 @@ static void predict_pair(PairRec *pr, int i) {
     if (pr->drawn || pr->npred >= 3 || (pr->sigs >> i & 1)) return;
     PKey k = g_sig[i].k;
     k.vs = pr->vs->id; k.fs = pr->fs ? pr->fs->id : 0; k.sshade = pr->fs ? pr->sshade : 0;
-    uint64_t h = fnv(0xcbf29ce484222325ULL, &k, sizeof k);
+    uint64_t h = PK_HASH(&k);
     pr->sigs |= 1ull << i;
     if (pipe_find(&k, h)) return;
     pr->npred++;
@@ -1153,7 +1170,7 @@ static void predict_pair(PairRec *pr, int i) {
 }
 /* Render thread, at a draw: the pipeline of the key; made here, or waited for, when it is not ready (the frame is late). */
 static Pipe *pipe_get(const PKey *k, VStage *vs, VStage *fs) {
-    uint64_t h = fnv(0xcbf29ce484222325ULL, k, sizeof *k);
+    uint64_t h = PK_HASH(k);
     int mine = 0, waited = 0;
     int64_t t0 = 0;
     plat_mutex_lock(&g_sh_lock);
@@ -1483,7 +1500,7 @@ static void job_draw(Job *j) {                     /* a draw the look-ahead met 
     if (!D.has_eds3 || !D.has_vids) return;        /* the key holds blend state (or the vertex layout) the look-ahead does not follow */
     PKey k = j->k;
     k.vs = vs->id; k.fs = fs ? fs->id : 0;
-    uint64_t h = fnv(0xcbf29ce484222325ULL, &k, sizeof k);
+    uint64_t h = PK_HASH(&k);
     int mine = 0;
     plat_mutex_lock(&g_sh_lock);
     Pipe *p = pipe_find(&k, h);
@@ -1647,7 +1664,7 @@ static uint32_t  pw_main(void *arg) {
         Pipe *p = NULL;
         if (vs && !r->compute && (!r->fs_h || fs)) {
             r->k.vs = vs->id; r->k.fs = fs ? fs->id : 0;
-            uint64_t h = fnv(0xcbf29ce484222325ULL, &r->k, sizeof r->k);
+            uint64_t h = PK_HASH(&r->k);
             if (!pipe_find(&r->k, h)) { p = pipe_new(&r->k, vs, fs, h, 1); p->recorded = 1; }
             int idx;
             sig_note(&r->k, &idx);
@@ -1746,9 +1763,89 @@ static void stage_copy(Stage *st, int s) {
     st->code = blk + (st->code - lo);
     g_scopy_n++; g_scopy_bytes += (int64_t)n;
 }
+/* 0.2.1, a limit on the wait above (Android 90 s in all per start, SMO_VK_HOLD_BUDGET_S=<s>, 0 = no limit; other platforms none). On a first
+ * start the game hands over about 40,000 programs on the Joy-Con screen, and with the hold it stays there until the
+ * workers have translated them: 2.5 min on a Galaxy S24 Ultra, 3.5 on a Dimensity 8300 Ultra, reports of 17 min and more on slower
+ * phones. Past the limit the game is no longer held and a program over the backlog is not queued: most are never drawn in
+ * a session, the container scan goes on below the game and fills the cache, and a draw that needs a stage makes it. The price
+ * is holds at draws in the first session. g_sh_lock held. */
+static int64_t g_set_budget_tk = -1, g_set_dropped;
+/* 0.2.2, THE FIRST-START PREPARATION (Android). The game sets all its programs on the Joy-Con screen, so that hand-over is the
+ * preparation: until it has been seen through once on this cache (the file first_prep_done.txt) the game is held with no
+ * limit and GameActivity covers it with a progress bar, serial against FIRST_PREP_PROGRAMS, the count at which game 1.0.0 leaves
+ * that screen (S24 Ultra and Poco X6 Pro alike). A skip uses the 0.2.1 path (no hold, the rest later) and the next start goes on where this
+ * one stopped, because finished stages are on disk. A start that holds a limit of its own (SMO_VK_HOLD_BUDGET_S) has no preparation. */
+#define FIRST_PREP_PROGRAMS 26185
+static volatile int g_fp_state = -1;               /* 0 none, 1 running, 2 finished in this start, 3 skipped */
+static volatile int32_t g_fp_serial;
+static int64_t g_fp_t0;
+/* 0.2.11: the marker names the translation it was made for (the parts of ssrc_hb that do not depend on the stage). Until then one
+ * finished preparation counted for good: after 0.2.5 and 0.2.7 changed the translation every stage was made again during play, the
+ * game held at each new program (a S24 session of 0.2.9: 441 holds, 12.6 s; 0.2.10: 1,453, 43 s) and the bar never came back. */
+static const char *first_prep_marker(void) {
+    static char name[64];
+    uint32_t ver = MX_VK_VERSION; int rs = RS_ON, d = D.has_dcc;
+    uint64_t h = fnv(0xcbf29ce484222325ULL, &ver, 4);
+    h = fnv(h, &mx_subgroup_wide, sizeof mx_subgroup_wide); h = fnv(h, &mx_guard, sizeof mx_guard); h = fnv(h, &mx_precise, sizeof mx_precise);
+    h = fnv(h, &mx_opt_fs, sizeof mx_opt_fs); h = fnv(h, &mx_fast_minmax, sizeof mx_fast_minmax); h = fnv(h, &mx_ubo, sizeof mx_ubo);
+    h = fnv(h, &mx_ubo_vec4, sizeof mx_ubo_vec4); h = fnv(h, &mx_c1_inline, sizeof mx_c1_inline); h = fnv(h, &mx_max_invocations, sizeof mx_max_invocations);
+    h = fnv(h, &rs, sizeof rs); h = fnv(h, &d, sizeof d);
+    snprintf(name, sizeof name, "first_prep_done_%016llx.txt", (unsigned long long)h);
+    return name;
+}
+static void first_prep_init(void) {
+    g_fp_state = 0;
+#ifdef __ANDROID__
+    if (getenv("SMO_VK_HOLD_BUDGET_S") || plat_exists(vkc_file(first_prep_marker()))) return;
+    g_fp_state = 1; g_fp_t0 = tk();
+    printf("nvn_vk: first-start preparation: the game waits for its %d programs, with a progress bar (no %s yet)\n", FIRST_PREP_PROGRAMS, vkc_file(first_prep_marker()));
+#endif
+}
+/* GameActivity's progress bar: 1 while it runs, with the programs seen and their number. It also notices the end: all handed over and translated
+ * (the marker is written); or, for a game whose count differs, nothing new for 15 s with the workers idle (no marker: the next start shows the bar again). */
+int nvn_vk_first_prep(long long *done, long long *total) {
+    static int last; static int64_t last_t;
+    if (g_fp_state != 1) return 0;
+    int s = g_fp_serial;
+    int idle = g_jq_queued <= g_jq_done;
+    int64_t now = tk();
+    if (s != last || !last_t || !idle) { last = s; last_t = now; }
+    int whole = s >= FIRST_PREP_PROGRAMS && idle;
+    if (whole || (s > 1000 && now - last_t > 15 * plat_qpf())) {
+        g_fp_state = 2;
+        printf("nvn_vk: first-start preparation %s after %.0f s: program %d, the game held %.0f s\n", whole ? "finished" : "ended, nothing new for 15 s,", (double)(now - g_fp_t0) / (double)plat_qpf(), s, (double)g_set_held_tk / (double)plat_qpf());
+        fflush(stdout);
+        if (whole) { FILE *f = fopen(vkc_file(first_prep_marker()), "wb"); if (f) { fprintf(f, "%d programs\n", s); fclose(f); } }
+        return 0;
+    }
+    *done = s < FIRST_PREP_PROGRAMS ? s : FIRST_PREP_PROGRAMS; *total = FIRST_PREP_PROGRAMS;
+    return 1;
+}
+void nvn_vk_first_prep_skip(void) {
+    if (g_fp_state != 1) return;
+    g_fp_state = 3;
+    printf("nvn_vk: first-start preparation skipped by the player after %.0f s, at program %d; the next start goes on from there\n", (double)(tk() - g_fp_t0) / (double)plat_qpf(), (int)g_fp_serial);
+    fflush(stdout);
+}
+static int set_over_budget(void) {
+    if (g_fp_state == 1 || g_fp_state == 2) return 0;
+    if (g_fp_state == 3) return 1;
+    if (g_set_budget_tk < 0) {
+        const char *e = getenv("SMO_VK_HOLD_BUDGET_S");
+#ifdef __ANDROID__
+        int s = e ? atoi(e) : 90;
+#else
+        int s = e ? atoi(e) : 0;
+#endif
+        g_set_budget_tk = s > 0 ? (int64_t)s * plat_qpf() : 0;
+        printf("nvn_vk: the game waits for shaders at most %d s per start (0 = no limit; SMO_VK_HOLD_BUDGET_S)\n", s);
+    }
+    return g_set_budget_tk > 0 && g_set_held_tk >= g_set_budget_tk;
+}
 void nvn_vk_program_set(void *prog) {
     Prog *p = prog;
     SSrc s[3];
+    if (p->serial > g_fp_serial) g_fp_serial = p->serial;
     {   static volatile int32_t first;                /* the process before any stage, library or pipeline of the game exists (nvn_vk_mem lines follow every 300 frames) */
         if (!first && plat_atomic_xchg(&first, 1) == 0) {
             size_t ws = 0, priv = 0;
@@ -1793,6 +1890,14 @@ void nvn_vk_program_set(void *prog) {
     plat_mutex_lock(&g_sh_lock);
     nvn_setsh_part[6] += tk() - tb;
     if (holdlog_on()) for (int i = 0; i < 2; i++) if (has[i]) ho_note(hn[i], 0);
+    int over = set_over_budget();
+    if (over && g_jq_queued - g_jq_done > g_pw_nthread * 8) {      /* see set_over_budget: left to the container scan or its first draw; a queue without a limit would hold hundreds of MB of code */
+        g_set_dropped++;
+        if (g_set_dropped == 1 || !(g_set_dropped % 5000)) printf("nvn_vk: %lld programs left to the background scan or their first draw (the game waited %.0f s in all)\n", (long long)g_set_dropped, (double)g_set_held_tk / (double)plat_qpf());
+        plat_mutex_unlock(&g_sh_lock);
+        free(j);
+        return;
+    }
     job_push(j);
     /* session 6: outside a fight (no compute dispatch in the last frame) the caller is also held while the container scan
      * still has work: loading ends when everything the container holds is ready */
@@ -1800,10 +1905,10 @@ void nvn_vk_program_set(void *prog) {
     /* session 7: in a fight the caller (the game's main thread) is not held at all: a draw that needs the program waits for it
      * on the render thread, a program not drawn in this frame costs nothing */
     int hs = hold_scan();
-    if (!fr && (g_jq_queued - g_jq_done > g_pw_nthread || (hs && g_bq_queued > g_bq_done))) {
+    if (!fr && !over && (g_jq_queued - g_jq_done > g_pw_nthread || (hs && g_bq_queued > g_bq_done))) {
         int64_t t0 = tk();
         plat_li fq; ((fq).QuadPart = plat_qpf());
-        while ((g_jq_queued - g_jq_done > g_pw_nthread || (hs && g_bq_queued > g_bq_done)) && tk() - t0 < 30 * fq.QuadPart) WD_SLEEP(&g_sh_cv, &g_sh_lock, 100);
+        while ((g_jq_queued - g_jq_done > g_pw_nthread || (hs && g_bq_queued > g_bq_done)) && tk() - t0 < 30 * fq.QuadPart && !(g_set_budget_tk > 0 && g_set_held_tk + (tk() - t0) >= g_set_budget_tk)) WD_SLEEP(&g_sh_cv, &g_sh_lock, 100);
         g_set_held++; g_set_held_tk += tk() - t0;
         nvn_setsh_part[7] += tk() - t0;
     }
@@ -1833,6 +1938,7 @@ static void prewarm_start(void) {
     plat_cond_init(&g_sh_cv); plat_cond_init(&g_jq_cv);
     plat_mkdirs(vkc_dir()); plat_mkdirs(vkc_file("spv")); plat_mkdirs(vkc_file("stage"));
     if (getenv("SMO_VK_CACHE")) printf("nvn_vk: cache folder %s (SMO_VK_CACHE)\n", vkc_dir());
+    first_prep_init();
     {   smo_glsl_bind(&g_glsl_to_spirv, &g_spirv_free);
         if (!g_glsl_to_spirv || !g_spirv_free) vkd_fail("smo_glslang.dll cannot be loaded (build_glslang.bat makes it)");
     }
@@ -1943,7 +2049,7 @@ static void scan_draw(Scan *s, unsigned prim) {
     if (vs_made && fs_made) {
         if (!vs->ok || (fs && !fs->ok)) return;
         k.vs = vs->id; k.fs = fs ? fs->id : 0;
-        uint64_t h = fnv(0xcbf29ce484222325ULL, &k, sizeof k);
+        uint64_t h = PK_HASH(&k);
         plat_mutex_lock(&g_sh_lock);
         Pipe *pf = pipe_find(&k, h);
         if (!pf || pf->state == 0) {               /* not there, or waiting in the background queue: to the front */
@@ -2214,7 +2320,7 @@ static void cont_predict(PairRec *pr, int i) {     /* g_sh_lock held */
     pr->sigs |= 1ull << i;
     PKey k = g_sig[i].k;
     k.vs = pr->vs->id; k.fs = pr->fs ? pr->fs->id : 0; k.sshade = pr->fs ? pr->sshade : 0;
-    uint64_t h = fnv(0xcbf29ce484222325ULL, &k, sizeof k);
+    uint64_t h = PK_HASH(&k);
     if (pipe_find(&k, h)) return;
     Job *j = calloc(1, sizeof *j);
     j->kind = 1; j->pipe = pipe_new(&k, pr->vs, pr->fs, h, 0); j->pipe->predicted = 1;

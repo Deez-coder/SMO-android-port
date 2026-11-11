@@ -75,14 +75,16 @@ static const char *const k_default_ini =
 ";   handheld 1280x720 (the game's own size). A number (0.25 .. 2.0) is a scale of the game's own sizes instead.\r\n"
 "resolution_scale = " DEF_SCALE "\r\n"
 "\r\n"
-"; frame_rate = 60 | 30\r\n"
-";   60: the console's frame rate. 30: 30 frames a second are drawn and the game's logic runs twice for each of them,\r\n"
-";   so the game keeps its full speed (for a device that cannot draw 60). Animation is less smooth.\r\n"
-"frame_rate = 60\r\n"
-"\r\n"
-"; fps_cap = 60      at most this many frames a second (20 .. 60; 60 = no limit). The game advances one step per\r\n"
-";   frame, so below 60 it runs in slow motion; frame_rate = 30 keeps full speed and is used instead when set.\r\n"
+"; fps_cap = 60      at most this many frames a second (20 .. 60; 60 = no limit). Below 60, turn on steady_speed,\r\n"
+";   or the game runs in slow motion (it advances one step per frame). An old frame_rate = 30 line counts as fps_cap = 30.\r\n"
 "fps_cap = 60\r\n"
+"\r\n"
+"; steady_speed = off | on\r\n"
+";   on: the game keeps its full speed whatever the frame rate. Each frame its logic runs as many 1/60 s steps as the time\r\n"
+";   since the last frame holds (1 to 3; at 40 fps, 1 and 2 by turns), so below 60 fps the game no longer slows down\r\n"
+";   (down to 20 fps; long hitches and loading are not caught up). Movement is a little less even than at a steady 60.\r\n"
+";   Needed with an fps_cap below 60. off: one step a frame, as the console.\r\n"
+"steady_speed = off\r\n"
 "\r\n"
 "; boost = auto | on | off      (Android) auto: while frames come later than the frame rate asks, the threads that set it\r\n"
 ";   keep their CPUs busy instead of sleeping, so the phone raises the clocks (more fps in heavy scenes, more heat\r\n"
@@ -92,7 +94,21 @@ static const char *const k_default_ini =
 "; anti_aliasing = off | fxaa      (Vulkan) fxaa: edges smoothed on the final picture; a little softer, cheap\r\n"
 "anti_aliasing = " DEF_AA "\r\n"
 "\r\n"
-"; sharpening = 0 .. 100      (Vulkan) contrast-adaptive: detail sharper, hard edges left alone (0 = off)\r\n"
+"; upscaling = bilinear | bicubic | fsr | gsr      (Vulkan) how the final picture is enlarged to the screen when it is smaller\r\n"
+";   (a resolution scale under 100%, or a screen taller than 900 pixels). Each works on any GPU.\r\n"
+";   bilinear: soft. bicubic: Catmull-Rom, a little sharper, about as cheap.\r\n"
+";   fsr: AMD FidelityFX Super Resolution 1 (EASU + RCAS, MIT): sharp edges, an extra pass at screen size.\r\n"
+";   gsr: Snapdragon Game Super Resolution 1 (BSD-3-Clause): sharp edges in one pass, cheaper than fsr.\r\n"
+";   bicubic, fsr and gsr replace FXAA where they enlarge; fsr and gsr use their own sharpening below instead of sharpening.\r\n"
+"upscaling = bilinear\r\n"
+"\r\n"
+"; fsr_sharpness = 0 .. 100      (Vulkan) the sharpening of fsr (RCAS): 100 the strongest, 90 AMD's default\r\n"
+"fsr_sharpness = 90\r\n"
+"\r\n"
+"; gsr_sharpness = 0 .. 100      (Vulkan) the edge sharpness of gsr: 50 Qualcomm's default\r\n"
+"gsr_sharpness = 50\r\n"
+"\r\n"
+"; sharpening = 0 .. 100      (Vulkan) contrast-adaptive, with bilinear and bicubic: detail sharper, hard edges left alone (0 = off)\r\n"
 "sharpening = " DEF_SHARPEN "\r\n"
 
 "\r\n"
@@ -162,11 +178,45 @@ static void opt_path(char *out) {
     snprintf(out, PLAT_MAX_PATH, "%s/config/graphics.ini", plat_data_root());   /* Android: the app's data folder */
 #endif
 }
+/* one "key = value" of graphics.ini into o; 0: an unknown key */
+static int opt_key(GfxOptions *o, const char *key, const char *val) {
+    if (!plat_stricmp(key, "renderer")) o->renderer = !plat_stricmp(val, "opengl") || !plat_stricmp(val, "gl");
+    else if (!plat_stricmp(key, "window")) o->window_mode = !plat_stricmp(val, "borderless_fullscreen") || !plat_stricmp(val, "borderless") ? 1 : !plat_stricmp(val, "fullscreen") ? 2 : !plat_stricmp(val, "windowed") ? 0 : 3;
+    else if (!plat_stricmp(key, "width")) { int v = atoi(val); if (v >= 320 && v <= 16384) o->width = v; }
+    else if (!plat_stricmp(key, "height")) { int v = atoi(val); if (v >= 180 && v <= 16384) o->height = v; }
+    else if (!plat_stricmp(key, "vsync")) o->present = !plat_stricmp(val, "on") ? 1 : !plat_stricmp(val, "off") ? 2 : !plat_stricmp(val, "mailbox") ? 3 : 0;
+    else if (!plat_stricmp(key, "gpu")) { if (plat_stricmp(val, "auto")) snprintf(o->gpu, sizeof o->gpu, "%s", val); }
+    else if (!plat_stricmp(key, "console_mode")) o->handheld = !plat_stricmp(val, "handheld");
+    else if (!plat_stricmp(key, "resolution_scale")) { float v = (float)atof(val); o->scale = !plat_stricmp(val, "auto") ? 0.0f : v > 0 ? v : o->scale; }
+    else if (!plat_stricmp(key, "anisotropic_filtering")) { int v = atoi(val); o->aniso = v == 2 || v == 4 || v == 8 || v == 16 ? v : 0; }
+    else if (!plat_stricmp(key, "frame_time_overlay")) o->overlay = !plat_stricmp(val, "on") || !strcmp(val, "1");
+    else if (!plat_stricmp(key, "profile")) o->profile = !plat_stricmp(val, "low");
+    else if (!plat_stricmp(key, "frame_rate")) o->fps30 = atoi(val) == 30 ? 2 : 0;      /* 0.2.8: the 30 fps mode is gone; 2 = an old line, made fps_cap 30 below */
+    else if (!plat_stricmp(key, "steady_speed")) o->steady = !plat_stricmp(val, "on") || !strcmp(val, "1");
+    else if (!plat_stricmp(key, "fps_cap")) { int v = (int)(atof(val) + 0.5); o->fps_cap = v >= 10 && v < 60 ? v : 0; }
+    else if (!plat_stricmp(key, "sharpening")) { float v = (float)atof(val); o->sharpen = v < 0 ? 0 : v > 100 ? 1.0f : v / 100.0f; }
+    else if (!plat_stricmp(key, "dynamic_resolution")) o->dynres = plat_stricmp(val, "off") != 0;
+    else if (!plat_stricmp(key, "upscaling")) o->upscaler = !plat_stricmp(val, "gsr") ? 1 : !plat_stricmp(val, "fsr") ? 2 : !plat_stricmp(val, "bicubic") ? 3 : 0;
+    else if (!plat_stricmp(key, "fsr_sharpness")) { float v = (float)atof(val); o->fsr_sharp = v < 0 ? 0 : v > 100 ? 1.0f : v / 100.0f; }
+    else if (!plat_stricmp(key, "gsr_sharpness")) { float v = (float)atof(val); o->gsr_sharp = v < 0 ? 0 : v > 100 ? 1.0f : v / 100.0f; }
+    else if (!plat_stricmp(key, "anti_aliasing")) o->fxaa = !plat_stricmp(val, "fxaa");
+    else if (!plat_stricmp(key, "boost")) o->boost = !plat_stricmp(val, "off") ? 0 : !plat_stricmp(val, "on") ? 2 : 1;
+    else if (!plat_stricmp(key, "fps_counter")) o->fps_counter = plat_stricmp(val, "off") != 0;
+    else if (!plat_stricmp(key, "driver")) o->driver_system = !plat_stricmp(val, "system");
+    else if (!plat_stricmp(key, "shader_wait")) o->shader_skip = !plat_stricmp(val, "skip");
+    else if (!plat_stricmp(key, "diagnostics")) o->diag_off = plat_stricmp(val, "on") != 0;
+    else if (!plat_stricmp(key, "fps_average")) o->fps_avg = !plat_stricmp(val, "on");
+    else if (!plat_stricmp(key, "fps_low")) o->fps_low = !plat_stricmp(val, "on");
+    else if (!plat_stricmp(key, "frame_time")) o->frame_time = !plat_stricmp(val, "on");
+    else if (!plat_stricmp(key, "fps_size")) { float v = (float)atof(val); o->fps_size = v < 50 ? 0.5f : v > 200 ? 2.0f : v / 100.0f; }
+    else return 0;
+    return 1;
+}
 static void opt_load(void) {
     GfxOptions *o = &g_opt;
     int written = 0, unknown = 0;
     memset(o, 0, sizeof *o);
-    o->width = 1280; o->height = 720; o->scale = 0.0f; o->window_mode = 3; o->fps_counter = 1; o->dynres = 1; o->boost = 1; o->diag_off = 1;
+    o->width = 1280; o->height = 720; o->scale = 0.0f; o->window_mode = 3; o->fps_counter = 1; o->dynres = 1; o->boost = 1; o->diag_off = 1; o->fsr_sharp = 0.9f; o->gsr_sharp = 0.5f; o->fps_size = 1.0f;
 #ifdef __ANDROID__
     o->present = 3; o->scale = 1.0f; o->boost = 2; o->fxaa = 1; o->sharpen = 0.75f;      /* as DEF_* above: a file without these keys */
 #endif
@@ -186,30 +236,10 @@ static void opt_load(void) {
         if (!line[0] || line[0] == ';' || line[0] == '#' || line[0] == '[' || !(eq = strchr(line, '='))) continue;
         *eq = 0; val = eq + 1;
         trim(key); trim(val);
-        if (!plat_stricmp(key, "renderer")) o->renderer = !plat_stricmp(val, "opengl") || !plat_stricmp(val, "gl");
-        else if (!plat_stricmp(key, "window")) o->window_mode = !plat_stricmp(val, "borderless_fullscreen") || !plat_stricmp(val, "borderless") ? 1 : !plat_stricmp(val, "fullscreen") ? 2 : !plat_stricmp(val, "windowed") ? 0 : 3;
-        else if (!plat_stricmp(key, "width")) { int v = atoi(val); if (v >= 320 && v <= 16384) o->width = v; }
-        else if (!plat_stricmp(key, "height")) { int v = atoi(val); if (v >= 180 && v <= 16384) o->height = v; }
-        else if (!plat_stricmp(key, "vsync")) o->present = !plat_stricmp(val, "on") ? 1 : !plat_stricmp(val, "off") ? 2 : !plat_stricmp(val, "mailbox") ? 3 : 0;
-        else if (!plat_stricmp(key, "gpu")) { if (plat_stricmp(val, "auto")) snprintf(o->gpu, sizeof o->gpu, "%s", val); }
-        else if (!plat_stricmp(key, "console_mode")) o->handheld = !plat_stricmp(val, "handheld");
-        else if (!plat_stricmp(key, "resolution_scale")) { float v = (float)atof(val); o->scale = !plat_stricmp(val, "auto") ? 0.0f : v > 0 ? v : o->scale; }
-        else if (!plat_stricmp(key, "anisotropic_filtering")) { int v = atoi(val); o->aniso = v == 2 || v == 4 || v == 8 || v == 16 ? v : 0; }
-        else if (!plat_stricmp(key, "frame_time_overlay")) o->overlay = !plat_stricmp(val, "on") || !strcmp(val, "1");
-        else if (!plat_stricmp(key, "profile")) o->profile = !plat_stricmp(val, "low");
-        else if (!plat_stricmp(key, "frame_rate")) o->fps30 = atoi(val) == 30;
-        else if (!plat_stricmp(key, "fps_cap")) { int v = (int)(atof(val) + 0.5); o->fps_cap = v >= 10 && v < 60 ? v : 0; }
-        else if (!plat_stricmp(key, "sharpening")) { float v = (float)atof(val); o->sharpen = v < 0 ? 0 : v > 100 ? 1.0f : v / 100.0f; }
-        else if (!plat_stricmp(key, "dynamic_resolution")) o->dynres = plat_stricmp(val, "off") != 0;
-        else if (!plat_stricmp(key, "anti_aliasing")) o->fxaa = !plat_stricmp(val, "fxaa");
-        else if (!plat_stricmp(key, "boost")) o->boost = !plat_stricmp(val, "off") ? 0 : !plat_stricmp(val, "on") ? 2 : 1;
-        else if (!plat_stricmp(key, "fps_counter")) o->fps_counter = plat_stricmp(val, "off") != 0;
-        else if (!plat_stricmp(key, "driver")) o->driver_system = !plat_stricmp(val, "system");
-        else if (!plat_stricmp(key, "shader_wait")) o->shader_skip = !plat_stricmp(val, "skip");
-        else if (!plat_stricmp(key, "diagnostics")) o->diag_off = plat_stricmp(val, "on") != 0;
-        else unknown++;
+        if (!opt_key(o, key, val)) unknown++;
     }
     if (f) fclose(f);
+    if (o->fps30) { if (!o->fps_cap) o->fps_cap = 30; o->fps30 = 0; }      /* 0.2.8: frame_rate = 30 from before (the launcher rewrites it as fps_cap 30 with steady_speed on) */
     if (o->profile == 1) {       /* the low-end profile wins over the three keys it sets, wherever they stand in the file (values: O1_options.md, session 9) */
         o->scale = GFX_LOW_SCALE; o->aniso = 0; o->present = 0;
     }
@@ -221,6 +251,33 @@ static void opt_load(void) {
            o->gpu[0] ? o->gpu : "auto", o->handheld ? "handheld" : "docked", o->scale, o->aniso, o->overlay ? "on" : "off", unknown ? " (lines with an unknown key were ignored)" : "");
     if (o->scale != 1.0f && o->renderer) printf("graphics options: resolution_scale=%.2f is ignored by the OpenGL renderer (Vulkan only)\n", o->scale);
     if (o->scale != 1.0f && (o->scale < 0.25f || o->scale > 1.0f)) printf("graphics options: resolution_scale=%.2f is outside 0.25 .. 1.0: the nearest of the two is used\n", o->scale);
+    fflush(stdout);
+}
+/* Android port, 0.2.3: the in-game menu (GameActivity) writes graphics.ini and calls this. The keys the present pass reads
+ * every frame take effect at once: upscaling, fsr_sharpness, gsr_sharpness, sharpening, anti_aliasing, the performance overlay
+ * (fps_counter, fps_average, fps_low, frame_time, fps_size). The
+ * others need a new start, as before. */
+void gfx_options_reload_live(void) {
+    gfx_options();
+    GfxOptions t = g_opt;
+    FILE *f = fopen(g_opt.path, "rb");
+    if (!f) return;
+    char line[512];
+    while (fgets(line, sizeof line, f)) {
+        char *eq, *key = line, *val;
+        trim(line);
+        if (!line[0] || line[0] == ';' || line[0] == '#' || line[0] == '[' || !(eq = strchr(line, '='))) continue;
+        *eq = 0; val = eq + 1;
+        trim(key); trim(val);
+        opt_key(&t, key, val);
+    }
+    fclose(f);
+    if (t.fps30) { if (!t.fps_cap) t.fps_cap = 30; t.fps30 = 0; }
+    g_opt.fps_cap = t.fps_cap;                     /* 0.2.8: the FPS limit is in the in-game menu (display.c reads it every frame) */
+    g_opt.upscaler = t.upscaler; g_opt.fsr_sharp = t.fsr_sharp; g_opt.gsr_sharp = t.gsr_sharp; g_opt.sharpen = t.sharpen; g_opt.fxaa = t.fxaa; g_opt.fps_counter = t.fps_counter; g_opt.fps_avg = t.fps_avg; g_opt.fps_low = t.fps_low; g_opt.frame_time = t.frame_time; g_opt.fps_size = t.fps_size; g_opt.steady = t.steady;
+    static const char *k_up[] = {"bilinear", "gsr", "fsr", "bicubic"};
+    printf("graphics options: changed in the game: upscaling=%s fsr_sharpness=%.0f gsr_sharpness=%.0f sharpening=%.0f anti_aliasing=%s fps_counter=%s steady_speed=%s fps_cap=%d\n", k_up[t.upscaler & 3],
+           100.0f * t.fsr_sharp, 100.0f * t.gsr_sharp, 100.0f * t.sharpen, t.fxaa ? "fxaa" : "off", t.fps_counter ? "on" : "off", t.steady ? "on" : "off", t.fps_cap ? t.fps_cap : 60);
     fflush(stdout);
 }
 const GfxOptions *gfx_options(void) {

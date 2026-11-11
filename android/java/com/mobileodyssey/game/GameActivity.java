@@ -3,8 +3,9 @@
  * the navigation bar over the right edge in landscape, on top of the touch controls there (A, ZR, R). Immersive:
  * the bars come back for a moment with a swipe from the edge. The layout editor uses the same window (fullScreen()),
  * so a place there is the same place in the game.
- * Leaving the game: askExit (the touch Exit button, the controller's Exit key) asks first, with the game held; Exit
- * waits for any save in progress, then ends this process (":game" in the manifest) and the app's menu comes back. */
+ * The touch Exit button and the controller's Exit key call askExit: since 0.2.3 it opens the in-game menu (InGameMenu.java),
+ * with the game held. Leaving waits for any save in progress, then ends this process (":game" in the manifest) and the app's
+ * menu comes back; restarting does the same and the app's menu starts the game again (LauncherActivity.restartIfAsked). */
 package com.mobileodyssey.game;
 
 import android.app.Activity;
@@ -30,8 +31,12 @@ public class GameActivity extends NativeActivity {
     native void nativeHold(boolean on);                    /* android_main.c: the game stands still (as in the menus) */
     native void nativeQuiesce();                           /* android_main.c: waits for a save in progress, then no more file writes */
     native void nativeSaveCache(boolean leaving);          /* nvn_vk_m4.c: writes the pipeline cache if it has something new */
-    native void nativeLoadState(long[] out);               /* android_main.c: frames shown, pipelines made ahead, of how many, all made */
-    private Dialog exitDialog;
+    native void nativeLoadState(long[] out);               /* android_main.c: frames shown, pipelines made ahead, of how many, all made, first-start preparation running, done, of how many */
+    native void nativeSkipPrep();                          /* nvn_vk_m4.c: start the game now, the next start goes on with the preparation */
+    native void nativeReloadOptions();                     /* gfx_options.c: graphics.ini written by the in-game menu, the keys that take effect at once read again */
+    native void nativeMenuOpen(boolean on);                /* android_main.c: the in-game menu is shown (the game is not in the background meanwhile) */
+    native void nativeMenuInfo(int[] out);                 /* nvn_vk_draw.c: the game's picture size, its size on the screen, fps */
+    private InGameMenu menu;
 
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
@@ -48,7 +53,7 @@ public class GameActivity extends NativeActivity {
      * shows a frame: the opening animation stopped half way on it). Not focusable, not touchable: the game keeps the
      * focus and the input. Gone, faded, once the game has shown its own frames for a moment. */
     private Dialog loading;
-    private final android.os.Handler ui = new android.os.Handler(android.os.Looper.getMainLooper());
+    final android.os.Handler ui = new android.os.Handler(android.os.Looper.getMainLooper());
     private long loadStart;
     private void showLoading() {
         LinearLayout col = new LinearLayout(this);
@@ -78,6 +83,12 @@ public class GameActivity extends NativeActivity {
         note.setGravity(Gravity.CENTER);
         note.setPadding(px(24), px(14), px(24), 0);
         col.addView(note, new LinearLayout.LayoutParams(px(460), WindowManager.LayoutParams.WRAP_CONTENT));
+        Button skip = button("Skip for now", LauncherActivity.CARD2);
+        skip.setVisibility(android.view.View.GONE);
+        skip.setOnClickListener(v -> nativeSkipPrep());
+        LinearLayout.LayoutParams skipLp = new LinearLayout.LayoutParams(WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT);
+        skipLp.topMargin = px(16);
+        col.addView(skip, skipLp);
 
         Dialog d = new Dialog(this, android.R.style.Theme_Black_NoTitleBar_Fullscreen);
         d.setContentView(col);
@@ -96,14 +107,33 @@ public class GameActivity extends NativeActivity {
         WindowInsetsController c = w.getDecorView().getWindowInsetsController();
         if (c != null) { c.hide(WindowInsets.Type.systemBars()); c.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE); }
         loadStart = android.os.SystemClock.uptimeMillis();
-        long[] st = new long[4];
+        long[] st = new long[7];
         Runnable poll = new Runnable() {
-            long shownAt = -1;
+            long shownAt = -1, prepAt = -1;
             @Override public void run() {
                 if (loading == null || isFinishing()) return;
                 try { nativeLoadState(st); } catch (UnsatisfiedLinkError e) { ui.postDelayed(this, 100); return; }      /* the game's thread has not registered it yet */
                 long now = android.os.SystemClock.uptimeMillis();
                 if (st[0] > 0 && shownAt < 0) shownAt = now;
+                if (st[4] != 0) {                              /* 0.2.2, the first-start preparation: this window stays over the game, and takes touches for its button */
+                    if (prepAt < 0) {
+                        prepAt = now;
+                        w.clearFlags(WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE);
+                        note.setText("The first start builds the graphics for this phone. It can take a few minutes on some phones. "
+                                + "If you close the game, the work so far is kept.");
+                    }
+                    bar.setIndeterminate(false);
+                    bar.setMax((int)st[6]);
+                    bar.setProgress((int)st[5]);
+                    title.setText("Preparing graphics… " + (st[5] * 100 / st[6]) + "%");
+                    if (now - prepAt > 30000 && skip.getVisibility() != android.view.View.VISIBLE) {
+                        skip.setVisibility(android.view.View.VISIBLE);
+                        note.setText("The first start builds the graphics for this phone. It can take a few minutes on some phones. "
+                                + "If you close the game, the work so far is kept. If you skip, the game starts sooner but stutters more until the rest is ready.");
+                    }
+                    ui.postDelayed(this, 200);
+                    return;
+                }
                 if (shownAt >= 0 && now - shownAt > 600) { hideLoading(); return; }     /* the game's own frames for a moment */
                 if (st[2] > 0 && st[3] == 0) {                 /* the pipelines made ahead: from the cache in seconds, from nothing on a first start */
                     bar.setIndeterminate(false);
@@ -139,75 +169,24 @@ public class GameActivity extends NativeActivity {
         if (focus) fullScreen(this);                       /* again after a dialog, the notification shade, another app */
     }
 
-    /* Called by the game's input thread. A popup of the app's own look (LauncherActivity's colours) in the middle of the
-     * screen; outside it or the back gesture keeps playing. */
+    /* Called by the game's input thread: the in-game menu (InGameMenu.java). Outside it or the back gesture keeps playing. */
     public void askExit() {
         runOnUiThread(() -> {
-            if (exitDialog != null || isFinishing()) return;
-            nativeHold(true);
-            LinearLayout card = new LinearLayout(this);
-            card.setOrientation(LinearLayout.VERTICAL);
-            card.setPadding(px(24), px(22), px(24), px(20));
-            card.setBackground(round(LauncherActivity.CARD, 22));
-            TextView title = new TextView(this);
-            title.setText("Leave the game?");
-            title.setTextSize(21);
-            title.setTypeface(Typeface.DEFAULT_BOLD);
-            title.setTextColor(LauncherActivity.TEXT);
-            card.addView(title);
-            TextView msg = new TextView(this);
-            msg.setText("You go back to the app's menu. Progress since the game last saved is lost; a save in progress is "
-                    + "finished first.");
-            msg.setTextSize(14);
-            msg.setTextColor(LauncherActivity.DIM);
-            msg.setLineSpacing(0, 1.15f);
-            msg.setPadding(0, px(8), 0, px(20));
-            card.addView(msg);
-            LinearLayout row = new LinearLayout(this);
-            row.setOrientation(LinearLayout.HORIZONTAL);
-            Button stay = button("Keep playing", LauncherActivity.CARD2);
-            Button exit = button("Exit to the menu", LauncherActivity.ACCENT);
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, px(50), 1);
-            row.addView(stay, lp);
-            lp = new LinearLayout.LayoutParams(0, px(50), 1);
-            lp.setMargins(px(10), 0, 0, 0);
-            row.addView(exit, lp);
-            card.addView(row);
-
-            Dialog d = new Dialog(this);
-            d.requestWindowFeature(Window.FEATURE_NO_TITLE);
-            d.setContentView(card);
-            d.setCanceledOnTouchOutside(true);
-            Window w = d.getWindow();
-            w.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
-            w.setLayout(Math.min(px(440), getResources().getDisplayMetrics().widthPixels - px(32)), WindowManager.LayoutParams.WRAP_CONTENT);
-            w.setGravity(Gravity.CENTER);
-            w.addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
-            w.setDimAmount(0.6f);
-            stay.setOnClickListener(v -> d.dismiss());
-            exit.setOnClickListener(v -> { leaving = true; exit.setText("Leaving…"); exit.setEnabled(false); stay.setEnabled(false); leave(); });
-            d.setOnDismissListener(x -> {
-                if (leaving) return;
-                exitDialog = null;
-                nativeHold(false);
-                fullScreen(this);
-            });
-            exitDialog = d;
-            /* not focusable while it is shown, or the system bars come back with it; the bars of its own window hidden */
-            w.addFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE);
-            d.show();
-            WindowInsetsController c = w.getDecorView().getWindowInsetsController();
-            if (c != null) { c.hide(WindowInsets.Type.systemBars()); c.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE); }
-            w.clearFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE);
+            if (isFinishing() || leaving) return;
+            if (menu == null) menu = new InGameMenu(this);
+            if (!menu.showing()) menu.show();
         });
     }
     private boolean leaving;
-    private void leave() {
+    void leave(boolean restart) {
+        leaving = true;
         new Thread(() -> {
             nativeQuiesce();
             nativeSaveCache(true);
             runOnUiThread(() -> {
-                if (isTaskRoot()) startActivity(new Intent(this, LauncherActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                if (restart) startActivity(new Intent(this, LauncherActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                                               .putExtra(LauncherActivity.EXTRA_RESTART, true));
+                else if (isTaskRoot()) startActivity(new Intent(this, LauncherActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
                 finish();                                  /* the app's menu is under the game */
                 /* android_main.c ends this process (the game's only, the app stays) once the activity is destroyed */
             });
