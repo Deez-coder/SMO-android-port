@@ -12,11 +12,11 @@ Made with AI. Most of the code was written by Claude, Anthropic's AI assistant (
 
 ## Status: beta 0.4
 
-The game boots, plays and saves. Here's how it runs on the two phones we've measured the most, both on the phone's own driver.
+The game boots, plays and saves. Here's how it runs on the dev's phone, on the phone's own driver.
 
-Galaxy S24 Ultra (the dev's phone, Snapdragon 8 Gen 3 / Adreno 750): about 58 to 60 fps in Cascade at 100% scale.
+Galaxy S24 Ultra (Snapdragon 8 Gen 3 / Adreno 750): about 58 to 60 fps in Cascade at 100% scale.
 
-Xiaomi 2406APNFAG (u/CAPELINI_W's phone, MediaTek Dimensity 8300 / Mali-G615 MC6): about 40 fps, fairly stable, at handheld resolution, with no graphical issues. A 30 fps limit holds steady.
+More device benchmarks will be added here as more logs come in.
 
 Your results will likely be different. Speed depends a lot on the phone's chip, its GPU driver, how warm it gets and your settings, so we'd love to hear how yours does. Custom drivers are optional. The first start builds the graphics for your phone, which takes a few minutes and can be slow at first, but only once (and again after an update that changes the shaders).
 
