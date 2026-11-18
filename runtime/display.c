@@ -248,6 +248,7 @@ static void vsync_thread(void *arg) {
             if (g_vsync_event && vsync_signal_ok()) { os_signal_event(g_vsync_event); plat_atomic_inc(&g_vsync_signals); }
             plat_mutex_lock(&g_vsync_lock);
             plat_atomic_xchg(&g_vsync_n, n);
+            plat_spin_wake();
             plat_mutex_unlock(&g_vsync_lock);
             plat_cond_broadcast(&g_vsync_cv);
             nvn_tl(8 /* TL_VSYNC */, (int)(n & 0xffff));
@@ -276,6 +277,7 @@ static void vsync_thread(void *arg) {
             if (g_vsync_event && vsync_signal_ok()) { os_signal_event(g_vsync_event); plat_atomic_inc(&g_vsync_signals); }
             plat_mutex_lock(&g_vsync_lock);
             plat_atomic_xchg(&g_vsync_n, n);
+            plat_spin_wake();
             plat_mutex_unlock(&g_vsync_lock);
             plat_cond_broadcast(&g_vsync_cv);
             nvn_tl(8 /* TL_VSYNC */, (int)(n & 0xffff));
@@ -405,6 +407,7 @@ static void frame_queued(void) {
     g_latch = at;
     if (iv && pace_free()) {                                       /* by time: 1/60 s (times the interval) after the last, not before now */
         int cap = gfx_options()->fps30 ? 0 : gfx_options()->fps_cap;
+        if (gfx_framegen_on()) cap = 30;          /* 0.3.12: frame generation, a real and a made frame by turns at 60 Hz: the game goes at 30 (with the FPS limit at 60 it drew 60 a second, 1 logic step each, and half of them never reached the screen) */
         int64_t next = g_free_at + (int64_t)(cap ? (double)g_freq.QuadPart / (double)cap : (double)g_freq.QuadPart * (double)iv / g_rate);
         g_free_at = next > now.QuadPart ? next : now.QuadPart;
     }

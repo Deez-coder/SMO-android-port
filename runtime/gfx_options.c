@@ -86,6 +86,15 @@ static const char *const k_default_ini =
 ";   Needed with an fps_cap below 60. off: one step a frame, as the console.\r\n"
 "steady_speed = off\r\n"
 "\r\n"
+"; frame_generation = off | on | auto      (Vulkan) on: after each real frame one more is made from it along the camera's\r\n"
+";   and the moving objects' motion and shown on the next refresh: 30 real frames a second become 60 on a 60 Hz screen. The\r\n"
+";   game runs at most at half the refresh then, at its full speed (as with steady_speed). It looks smoother but answers like\r\n"
+";   30. auto: on only while the game cannot hold 60 but a real and a made frame fit, off again when it cannot keep up.\r\n"
+"frame_generation = off\r\n"
+"; frame_generation_quality = high | fast      fast: made frames follow the camera only (characters move at 30 in them),\r\n"
+";   for slower GPUs.\r\n"
+"frame_generation_quality = high\r\n"
+"\r\n"
 "; boost = auto | on | off      (Android) auto: while frames come later than the frame rate asks, the threads that set it\r\n"
 ";   keep their CPUs busy instead of sleeping, so the phone raises the clocks (more fps in heavy scenes, more heat\r\n"
 ";   while it is on); it stops by itself when the frames are on time again. on: always, also where it gains nothing.\r\n"
@@ -128,6 +137,18 @@ static const char *const k_default_ini =
 ";   on this PC). hold: the frame waits for it (a late frame, a correct picture). skip: in and around a fight the draw is\r\n"
 ";   left out until it is ready (no late frame; the object or effect is missing for some frames). The log counts both.\r\n"
 "shader_wait = hold\r\n"
+"\r\n"
+"; output_size = auto | full | game      (Android)\r\n"
+";   The size of the picture the game hands to the screen. game: the game's own picture size (at least 720 lines), and\r\n"
+";   the phone's display hardware enlarges it to the screen at no GPU cost; the touch controls are a little softer. full: the\r\n"
+";   screen's own size. auto: game on GPUs other than Snapdragon's with the Bilinear upscaler, else full.\r\n"
+"output_size = auto\r\n"
+"\r\n"
+"; pass_barriers = auto | light | full      (Vulkan)\r\n"
+";   How the GPU waits between two render passes. full: each pass waits until everything before it has finished (the\r\n"
+";   safest, slow on Mali: the GPU empties at each of the ~50 passes of a frame). light: a pass waits only for the parts of the\r\n"
+";   passes before it that it reads. auto: light on Mali GPUs, full elsewhere. Takes effect at the next start.\r\n"
+"pass_barriers = auto\r\n"
 "\r\n"
 "; diagnostics = off | on      (Vulkan, test option)\r\n"
 ";   on: on Mali GPUs, about once a minute a frame is measured and small pictures of it are kept for the log export (a short hitch).\r\n"
@@ -193,6 +214,8 @@ static int opt_key(GfxOptions *o, const char *key, const char *val) {
     else if (!plat_stricmp(key, "profile")) o->profile = !plat_stricmp(val, "low");
     else if (!plat_stricmp(key, "frame_rate")) o->fps30 = atoi(val) == 30 ? 2 : 0;      /* 0.2.8: the 30 fps mode is gone; 2 = an old line, made fps_cap 30 below */
     else if (!plat_stricmp(key, "steady_speed")) o->steady = !plat_stricmp(val, "on") || !strcmp(val, "1");
+    else if (!plat_stricmp(key, "frame_generation")) o->framegen = !plat_stricmp(val, "on") || !strcmp(val, "1") ? 1 : !plat_stricmp(val, "auto") ? 2 : 0;
+    else if (!plat_stricmp(key, "frame_generation_quality")) o->fg_fast = !plat_stricmp(val, "fast");
     else if (!plat_stricmp(key, "fps_cap")) { int v = (int)(atof(val) + 0.5); o->fps_cap = v >= 10 && v < 60 ? v : 0; }
     else if (!plat_stricmp(key, "sharpening")) { float v = (float)atof(val); o->sharpen = v < 0 ? 0 : v > 100 ? 1.0f : v / 100.0f; }
     else if (!plat_stricmp(key, "dynamic_resolution")) o->dynres = plat_stricmp(val, "off") != 0;
@@ -205,6 +228,8 @@ static int opt_key(GfxOptions *o, const char *key, const char *val) {
     else if (!plat_stricmp(key, "driver")) o->driver_system = !plat_stricmp(val, "system");
     else if (!plat_stricmp(key, "shader_wait")) o->shader_skip = !plat_stricmp(val, "skip");
     else if (!plat_stricmp(key, "diagnostics")) o->diag_off = plat_stricmp(val, "on") != 0;
+    else if (!plat_stricmp(key, "output_size")) o->output = !plat_stricmp(val, "full") ? 1 : !plat_stricmp(val, "game") ? 2 : 0;
+    else if (!plat_stricmp(key, "pass_barriers")) o->barriers = !plat_stricmp(val, "light") ? 1 : !plat_stricmp(val, "full") ? 2 : 0;
     else if (!plat_stricmp(key, "fps_average")) o->fps_avg = !plat_stricmp(val, "on");
     else if (!plat_stricmp(key, "fps_low")) o->fps_low = !plat_stricmp(val, "on");
     else if (!plat_stricmp(key, "frame_time")) o->frame_time = !plat_stricmp(val, "on");
@@ -275,10 +300,26 @@ void gfx_options_reload_live(void) {
     if (t.fps30) { if (!t.fps_cap) t.fps_cap = 30; t.fps30 = 0; }
     g_opt.fps_cap = t.fps_cap;                     /* 0.2.8: the FPS limit is in the in-game menu (display.c reads it every frame) */
     g_opt.upscaler = t.upscaler; g_opt.fsr_sharp = t.fsr_sharp; g_opt.gsr_sharp = t.gsr_sharp; g_opt.sharpen = t.sharpen; g_opt.fxaa = t.fxaa; g_opt.fps_counter = t.fps_counter; g_opt.fps_avg = t.fps_avg; g_opt.fps_low = t.fps_low; g_opt.frame_time = t.frame_time; g_opt.fps_size = t.fps_size; g_opt.steady = t.steady;
+    g_opt.framegen = t.framegen;                   /* 0.3.12: nvn_vk_motion.c fg_update switches it at the next real frame */
+    g_opt.fg_fast = t.fg_fast;
     static const char *k_up[] = {"bilinear", "gsr", "fsr", "bicubic"};
-    printf("graphics options: changed in the game: upscaling=%s fsr_sharpness=%.0f gsr_sharpness=%.0f sharpening=%.0f anti_aliasing=%s fps_counter=%s steady_speed=%s fps_cap=%d\n", k_up[t.upscaler & 3],
-           100.0f * t.fsr_sharp, 100.0f * t.gsr_sharp, 100.0f * t.sharpen, t.fxaa ? "fxaa" : "off", t.fps_counter ? "on" : "off", t.steady ? "on" : "off", t.fps_cap ? t.fps_cap : 60);
+    printf("graphics options: changed in the game: upscaling=%s fsr_sharpness=%.0f gsr_sharpness=%.0f sharpening=%.0f anti_aliasing=%s fps_counter=%s steady_speed=%s fps_cap=%d frame_generation=%s frame_generation_quality=%s\n", k_up[t.upscaler & 3],
+           100.0f * t.fsr_sharp, 100.0f * t.gsr_sharp, 100.0f * t.sharpen, t.fxaa ? "fxaa" : "off", t.fps_counter ? "on" : "off", t.steady ? "on" : "off", t.fps_cap ? t.fps_cap : 60, t.framegen == 2 ? "auto" : t.framegen ? "on" : "off", t.fg_fast ? "fast" : "high");
     fflush(stdout);
+}
+static int g_fg_auto_on;                          /* 0.3.22: frame_generation = auto, the render thread's decision */
+void gfx_framegen_auto_set(int on) { __atomic_store_n(&g_fg_auto_on, on != 0, __ATOMIC_RELAXED); }
+int gfx_framegen_on(void) {
+    static int env = -2;
+    if (env == -2) { const char *e = getenv("SMO_VK_FRAMEGEN"); env = e ? atoi(e) != 0 : -1; }
+    if (env >= 0) return env;
+    int m = gfx_options()->framegen;
+    return m == 2 ? __atomic_load_n(&g_fg_auto_on, __ATOMIC_RELAXED) : m != 0;
+}
+int gfx_framegen_fast(void) {
+    static int env = -2;
+    if (env == -2) { const char *e = getenv("SMO_VK_FG_FAST"); env = e ? atoi(e) != 0 : -1; }
+    return env >= 0 ? env : gfx_options()->fg_fast != 0;
 }
 const GfxOptions *gfx_options(void) {
     plat_once_run(&g_once, opt_load);

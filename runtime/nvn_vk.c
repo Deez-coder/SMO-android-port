@@ -129,6 +129,8 @@ static struct {
     VkImage images[16];
     uint32_t image_count;
     int rot;                     /* Android port: the swapchain's pre-rotation, 0..3 quarter turns clockwise (0 elsewhere) */
+    int win_w, win_h;            /* 0.3.1: the window's size (as the app sees it) the swapchain was made for; it can be smaller (out_h) */
+    int out_h;                   /* 0.3.1: the swapchain's height in the window's terms when smaller than the window (output_size), else 0 */
     VkImageView views[16];       /* Android port: views of the swapchain images (the present pass draws into them) */
     VkCommandPool pool;
     VkCommandBuffer cmd;
@@ -136,6 +138,7 @@ static struct {
     VkFence fence;
     int fence_pending, alive, validate;
 } V;
+static volatile int g_out_h_want;                  /* 0.3.1: the swapchain height (window terms) present_pass asks for, 0 = the window's */
 static volatile int64_t g_vk_frames, g_vk_recreated, g_vk_skipped, g_vk_errors, g_vk_messages, g_vk_missing_calls;
 static int g_vk_missing_warn = -1;
 /* 0.2.5: command buffers and pools reset with RELEASE_RESOURCES (nvn_vk_draw.c sets it: Arm's own driver). libmali keeps what
@@ -225,7 +228,12 @@ static int swapchain_create(void) {
         VkSurfaceTransformFlagsKHR tr = caps.currentTransform;
         V.rot = tr == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR ? 1 : tr == VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR ? 2 : tr == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR ? 3 : 0;
     }
-    { int w = 0, h = 0; plat_window_size(V.hwnd, &w, &h); if (w > 0 && h > 0) { ext.width = (uint32_t)(V.rot & 1 ? h : w); ext.height = (uint32_t)(V.rot & 1 ? w : h); } }
+    { int w = 0, h = 0; plat_window_size(V.hwnd, &w, &h);
+      V.win_w = w; V.win_h = h; V.out_h = 0;
+      if (w > 0 && h > 0 && g_out_h_want > 0 && g_out_h_want < h) {      /* 0.3.1, output_size: Android's swapchain scales to the window (the display hardware does it) */
+          V.out_h = g_out_h_want; w = (int)(((int64_t)w * g_out_h_want / h) & ~1); h = g_out_h_want;
+      }
+      if (w > 0 && h > 0) { ext.width = (uint32_t)(V.rot & 1 ? h : w); ext.height = (uint32_t)(V.rot & 1 ? w : h); } }
 #endif
     if (ext.width == 0xffffffffu) { int w = 0, h = 0; plat_window_size(V.hwnd, &w, &h); ext.width = (uint32_t)w; ext.height = (uint32_t)h; }
     if (ext.width < caps.minImageExtent.width) ext.width = caps.minImageExtent.width;
@@ -477,6 +485,9 @@ int nvn_vk_init(void *hwnd) {
         for (int i = 0; i < 4; i++) if (!strcmp(want, k_mode[i])) m = i;
         if (m >= 0 && have[m]) V.mode = m;
         else printf("nvn_vk: SMO_VK_PRESENT=%s is %s: using %s\n", want, m < 0 ? "not a mode (immediate, mailbox, fifo, fifo_relaxed)" : "not offered by the surface", k_mode[V.mode]);
+    }
+    {   const char *fg = getenv("SMO_VK_FRAMEGEN");     /* 0.3.10, frame generation: each real frame and the frame made after it get a refresh each */
+        if (fg && atoi(fg) && have[VK_PRESENT_MODE_FIFO_KHR] && V.mode != VK_PRESENT_MODE_FIFO_KHR) { V.mode = VK_PRESENT_MODE_FIFO_KHR; printf("nvn_vk: frame generation: present mode fifo\n"); }
     }
     if (V.mode == VK_PRESENT_MODE_FIFO_KHR || V.mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR)
         printf("nvn_vk: present mode %s: the display's own refresh now also holds the presents (a second clock next to display.c's)\n", k_mode[V.mode]);

@@ -389,6 +389,8 @@ int nvn_pool_range(uint64_t pool, uint64_t *mem, uint64_t *size) {
 int nvn_pool_flags(uint64_t pool) { return pool ? (int)nobj(pool)->flags : 0; }      /* for nvn_gl.c */
 static void pool_map(Ctx *c) { log_call(c); vp_note_use(A0); RET(nobj(A0)->memory); }
 static void pool_size(Ctx *c) { log_call(c); RET(nobj(A0)->size); }
+/* 0.3.7 (smo_linread.c): a memory pool's memory, as nvnMemoryPoolMap gives it */
+uint64_t nvn_stub_pool_memory(uint64_t pool) { return pool ? nobj(pool)->memory : 0; }
 static void buffer_builder_storage(Ctx *c) {                         /* (builder, pool, offset, size) */
     log_call(c);
     NvnObj *b = nobj(A0);

@@ -30,6 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 #include "plat.h"
 #include "android_host.h"
@@ -174,6 +175,89 @@ static int display_rotation(void) {                  /* Surface.ROTATION_0 .. 27
     return rot & 3;
 }
 
+/* 0.3.6, THE WINDOW'S FRAME RATE FOLLOWS FPS_CAP. The window asked for 60 Hz whatever the cap, so with fps_cap 40 a panel
+ * left at 60 Hz showed the frames for one and two refreshes by turns (16.7 and 33.3 ms: judder, however steady the
+ * game's 25 ms). A cap that does not divide 60 (40, 45, 50) is now asked for as the window's rate: Android then picks a
+ * refresh rate that rate divides (120 Hz for 40, 90 for 45) where the panel has one, and stays at 60 Hz where it has not,
+ * which plays as before. Caps that divide 60 (20, 30, 60) keep asking for 60 Hz (the heat fix of 2026-11-03). The render
+ * thread asks (android_window_rate), the looper thread applies it and logs the display's refresh rate 1.5 s later.
+ * The idea is from nx2android (perf_android.c: its 40 fps step asks the display for 120 Hz). */
+static float g_win_rate = 60.0f;                     /* the rate the window is asked for (g_win_lock) */
+static volatile int g_rate_req, g_rate_done;          /* requests from the render thread, applied by the looper thread */
+static volatile float g_rate_want = 60.0f;
+static int64_t g_rate_check_at;                       /* looper thread: when to log the display's refresh rate (0: not) */
+static int64_t mono_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (int64_t)t.tv_sec * 1000000000 + t.tv_nsec; }
+static jobject default_display(JNIEnv *env) {
+    jobject act = g_app->activity->clazz, d = NULL;
+    jclass ac = (*env)->GetObjectClass(env, act);
+    jmethodID gwm = (*env)->GetMethodID(env, ac, "getWindowManager", "()Landroid/view/WindowManager;");
+    jobject wm = gwm ? (*env)->CallObjectMethod(env, act, gwm) : NULL;
+    if (wm) {
+        jclass wc = (*env)->GetObjectClass(env, wm);
+        jmethodID gd = (*env)->GetMethodID(env, wc, "getDefaultDisplay", "()Landroid/view/Display;");
+        d = gd ? (*env)->CallObjectMethod(env, wm, gd) : NULL;
+    }
+    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); d = NULL; }
+    return d;
+}
+static float display_refresh(void) {                 /* the display's refresh rate now (Display.getRefreshRate), 0 = unknown */
+    JNIEnv *env = jni_env();
+    jobject d = default_display(env);
+    float hz = 0;
+    if (d) {
+        jclass dc = (*env)->GetObjectClass(env, d);
+        jmethodID gr = (*env)->GetMethodID(env, dc, "getRefreshRate", "()F");
+        if (gr) hz = (*env)->CallFloatMethod(env, d, gr);
+    }
+    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); hz = 0; }
+    return hz;
+}
+static void display_modes_log(void) {                /* once: the refresh rates the panel offers (Display.getSupportedModes) */
+    JNIEnv *env = jni_env();
+    jobject d = default_display(env);
+    char t[256]; int n = 0; t[0] = 0;
+    if (d) {
+        jclass dc = (*env)->GetObjectClass(env, d);
+        jmethodID gm = (*env)->GetMethodID(env, dc, "getSupportedModes", "()[Landroid/view/Display$Mode;");
+        jobjectArray modes = gm ? (jobjectArray)(*env)->CallObjectMethod(env, d, gm) : NULL;
+        float seen[16]; int ns = 0;
+        int cnt = modes && !(*env)->ExceptionCheck(env) ? (*env)->GetArrayLength(env, modes) : 0;
+        for (int i = 0; i < cnt && n < (int)sizeof t - 16; i++) {
+            jobject m = (*env)->GetObjectArrayElement(env, modes, i);
+            if (!m) continue;
+            jclass mc = (*env)->GetObjectClass(env, m);
+            jmethodID mr = (*env)->GetMethodID(env, mc, "getRefreshRate", "()F");
+            float hz = mr ? (*env)->CallFloatMethod(env, m, mr) : 0;
+            int k; for (k = 0; k < ns && fabsf(seen[k] - hz) > 0.5f; k++) {}
+            if (k == ns && ns < 16 && hz > 0) { seen[ns++] = hz; n += snprintf(t + n, sizeof t - n, "%s%.0f", ns > 1 ? ", " : "", hz); }
+            (*env)->DeleteLocalRef(env, mc); (*env)->DeleteLocalRef(env, m);
+        }
+    }
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    printf("android: display refresh rates offered: %s Hz (now %.0f Hz)%c", t[0] ? t : "unknown", display_refresh(), 10);
+}
+/* The render thread: the rate the window should ask for (fps). Applied on the looper thread. */
+void android_window_rate(float fps) {
+    if (getenv("SMO_FRAME_RATE")) return;             /* a test's fixed rate wins */
+    g_rate_want = fps;
+    __atomic_add_fetch(&g_rate_req, 1, __ATOMIC_SEQ_CST);
+    if (g_app && g_app->looper) ALooper_wake(g_app->looper);
+}
+static void rate_poll(void) {                         /* the looper thread, after each wake */
+    int req = g_rate_req;
+    if (req != g_rate_done) {
+        g_rate_done = req;
+        float fps = g_rate_want;
+        pthread_mutex_lock(&g_win_lock);
+        int changed = fps != g_win_rate, r = 0;
+        g_win_rate = fps;
+        if (changed && g_window) r = ANativeWindow_setFrameRate(g_window, fps, ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_DEFAULT);
+        pthread_mutex_unlock(&g_win_lock);
+        if (changed) { printf("android: window frame rate %.0f fps asked for (fps_cap)%s%c", fps, r ? " (refused)" : "", 10); g_rate_check_at = mono_ns() + 1500000000LL; }
+    }
+    if (g_rate_check_at && mono_ns() >= g_rate_check_at) { g_rate_check_at = 0; printf("android: display refresh rate now %.0f Hz%c", display_refresh(), 10); }
+}
+
 /* ---------------------------------------------------------------- keyboard (PLAT_VK_* numbers) */
 static volatile uint8_t g_keys[256];
 int plat_key_down(int vk) { return vk > 0 && vk < 256 && g_keys[vk]; }
@@ -238,25 +322,57 @@ static int32_t on_input(struct android_app *app, AInputEvent *ev) {
     return 0;
 }
 
+/* 0.4: the phone's RAM, kB (/proc/meminfo MemTotal, MemAvailable; -1: not readable), for the start line, the low-memory note and
+ * the memory line every 300 frames (nvn_vk_draw.c) */
+void android_meminfo(long *total_kb, long *avail_kb) {
+    *total_kb = *avail_kb = -1;
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return;
+    char line[128];
+    while (fgets(line, sizeof line, f)) {
+        if (!strncmp(line, "MemTotal:", 9)) *total_kb = atol(line + 9);
+        else if (!strncmp(line, "MemAvailable:", 13)) { *avail_kb = atol(line + 13); break; }
+    }
+    fclose(f);
+}
 /* ---------------------------------------------------------------- motion sensors: the phone as a handheld console */
 static ASensorEventQueue *g_sq;
 static const ASensor *g_accel, *g_gyro;
 static int g_rotation = 1;
+/* 0.3.22, BATTERY: the sensors ran at 200 readings a second each (5 ms) whenever the window had the focus, motion controls
+ * on or off, and every reading woke this thread. The game keeps only the latest one (android_motion), read once a frame:
+ * now 100 a second (SMO_SENSOR_US to change), and none while controls.ini says motion = off (nnpad_android.c calls
+ * android_sensors_wanted when it reads the file). */
+static volatile int g_sensors_wanted = 1, g_sensors_on, g_focus_sensors;
 static void sensors_start(void) {
+    g_focus_sensors = 1;
+    if (!g_sensors_wanted || g_sensors_on) return;
     ASensorManager *sm = ASensorManager_getInstanceForPackage("com.mobileodyssey.game");
     if (!sm) return;
     g_accel = ASensorManager_getDefaultSensor(sm, ASENSOR_TYPE_ACCELEROMETER);
     g_gyro = ASensorManager_getDefaultSensor(sm, ASENSOR_TYPE_GYROSCOPE);
     if (!g_sq) g_sq = ASensorManager_createEventQueue(sm, g_app->looper, LOOPER_ID_USER, NULL, NULL);
     if (!g_sq) return;
-    if (g_accel) { ASensorEventQueue_enableSensor(g_sq, g_accel); ASensorEventQueue_setEventRate(g_sq, g_accel, 5000); }
-    if (g_gyro) { ASensorEventQueue_enableSensor(g_sq, g_gyro); ASensorEventQueue_setEventRate(g_sq, g_gyro, 5000); }
+    const char *e = getenv("SMO_SENSOR_US");
+    int us = e && atoi(e) > 0 ? atoi(e) : 10000;
+    if (g_accel) { ASensorEventQueue_enableSensor(g_sq, g_accel); ASensorEventQueue_setEventRate(g_sq, g_accel, us); }
+    if (g_gyro) { ASensorEventQueue_enableSensor(g_sq, g_gyro); ASensorEventQueue_setEventRate(g_sq, g_gyro, us); }
+    g_sensors_on = 1;
     g_rotation = display_rotation();
+    static int said;
+    if (!said++) printf("android: motion sensors on, a reading every %d us%c", us, 10);
 }
-static void sensors_stop(void) {
-    if (!g_sq) return;
+static void sensors_off(void) {
+    if (!g_sq || !g_sensors_on) return;
+    g_sensors_on = 0;
     if (g_accel) ASensorEventQueue_disableSensor(g_sq, g_accel);
     if (g_gyro) ASensorEventQueue_disableSensor(g_sq, g_gyro);
+}
+static void sensors_stop(void) { g_focus_sensors = 0; sensors_off(); }
+void android_sensors_wanted(int on) {          /* from the game thread: controls.ini read */
+    g_sensors_wanted = on;
+    if (!on && g_sensors_on) { sensors_off(); printf("android: motion sensors off (motion = off)%c", 10); }
+    else if (on && g_focus_sensors && !g_sensors_on) sensors_start();
 }
 /* device axes (x right, y up, z out of the screen in the natural orientation) -> the screen's axes as the player holds
  * it: the axes a game controller reports (SDL / Android: x right, y up, z toward the player) */
@@ -372,7 +488,7 @@ static void on_cmd(struct android_app *app, int32_t cmd) {
              * 120 Hz for whole sessions. With DEFAULT (and GameActivity's touch boost off) 10 of 13 runs stayed at 60
              * Hz after 8 swipes on a Galaxy S24 Ultra; three still went to 120. */
             const char *e = getenv("SMO_FRAME_RATE");
-            float fps = e ? (float)atof(e) : 60.0f;
+            float fps = e ? (float)atof(e) : g_win_rate;      /* 0.3.6: the rate fps_cap asks for (android_window_rate) */
             if (fps > 0 && app->window) {
                 int r = ANativeWindow_setFrameRate(app->window, fps, getenv("SMO_FRAME_RATE_VIDEO") ? ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE : ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_DEFAULT);
                 printf("android: window frame rate %.0f fps asked for%s\n", fps, r ? " (refused)" : "");
@@ -387,11 +503,16 @@ static void on_cmd(struct android_app *app, int32_t cmd) {
         pthread_mutex_unlock(&g_win_lock);
         break;
     case APP_CMD_GAINED_FOCUS: g_focused = 1; sensors_start(); break;
-    case APP_CMD_LOST_FOCUS: g_focused = 0; sensors_stop(); break;
+    case APP_CMD_LOST_FOCUS: {
+        g_focused = 0; sensors_stop();
+        static int n;                                 /* 0.3.1: a notification, the shade, a floating window: the game keeps running (nnmisc.c oe_window_state) */
+        if (++n <= 20) printf("android: the window lost the focus (%d)%s\n", n, g_visible ? " while still shown: the game keeps running" : "");
+        break;
+    }
     case APP_CMD_RESUME: g_visible = 1; break;
     case APP_CMD_PAUSE: case APP_CMD_STOP: g_visible = 0; break;
     case APP_CMD_CONFIG_CHANGED: g_rotation = display_rotation(); break;
-    case APP_CMD_LOW_MEMORY: printf("android: the system is low on memory\n"); break;
+    case APP_CMD_LOW_MEMORY: { long t, a; android_meminfo(&t, &a); printf("android: the system is low on memory (the phone has %ld MB, %ld MB available now)\n", t >> 10, a >> 10); fflush(stdout); break; }
     }
 }
 
@@ -413,6 +534,7 @@ void android_main(struct android_app *app) {
     }
     set_language(app);
     register_natives();
+    display_modes_log();
     {   /* <files>/config/env.txt: KEY=VALUE lines (# comments) set before the game starts, the Android stand-in for the
          * environment variables of the Windows build (SMO_SHOT, SMO_VK_DEBUG, ...: see the runtime's sources) */
         char p[PLAT_MAX_PATH], line[512];
@@ -431,6 +553,7 @@ void android_main(struct android_app *app) {
     }
     ANativeActivity_setWindowFlags(app->activity, AWINDOW_FLAG_FULLSCREEN | AWINDOW_FLAG_KEEP_SCREEN_ON, 0);
     printf("smo: Android host, data folder %s\n", g_root);
+    { long t, a; android_meminfo(&t, &a); printf("android: the phone has %ld MB of RAM, %ld MB available at the start\n", t >> 10, a >> 10); }
     int ok = need_file("dump/base/elf/main.elf") & need_file("dump/base/elf/sdk.elf") & need_file("dump/base/exefs/main.npdm") & need_file("romfs");
     if (ok) {
         pthread_attr_t a;
@@ -443,10 +566,12 @@ void android_main(struct android_app *app) {
     for (;;) {
         int events, id;
         struct android_poll_source *src;
-        while ((id = ALooper_pollOnce(-1, NULL, &events, (void **)&src)) >= 0) {
+        while ((id = ALooper_pollOnce(g_rate_check_at ? 500 : -1, NULL, &events, (void **)&src)) >= 0) {
             if (src) src->process(app, src);
             if (id == LOOPER_ID_USER) sensors_read();
             if (app->destroyRequested) { printf("smo: the activity is destroyed\n"); fflush(stdout); _exit(0); }
+            if (g_rate_req != g_rate_done || g_rate_check_at) rate_poll();
         }
+        rate_poll();                                  /* woken (android_window_rate) or the check's time */
     }
 }

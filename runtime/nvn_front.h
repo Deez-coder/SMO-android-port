@@ -96,8 +96,8 @@ typedef struct { Tex *tex; View view; } TargetRef;
 
 /* ---------------------------------------------------------------- render-thread jobs (arguments of RBackend members) */
 typedef struct { int count; const uint64_t *handles; } SubmitJob;
-typedef struct { Window *win; int index; } PresentJob;
-typedef struct { SyncObj *o; int flags; uint64_t timeout; int result; } SyncJob;
+typedef struct { Window *win; int index; int cam_ok, cam_steps, pl_ok; float cam_view[12], cam_proj[16], pl[3]; } PresentJob;      /* cam_*: 0.3.9, the frame's camera (smo_camera.c; nvn_vk_motion.c) */
+typedef struct { SyncObj *o; int flags; uint64_t timeout; int result; int64_t t_start; int was_done; } SyncJob;      /* 0.3.8: t_start (plat_qpc when the render thread took the job), was_done (the fence had finished by then): the queue time of SyncWait */
 typedef struct { Tex *tex; View view; int has_view; int region[6]; const void *data; int64_t row_stride; } WriteJob;
 typedef struct { Tex *tex; View view; int has_view, to_pool; int region[6]; void *out; int64_t row_stride, image_stride; } ReadJob;      /* to_pool: nvnTextureInvalidateTexels */
 

@@ -28,8 +28,15 @@ typedef struct {
     int steady;              /* steady_speed = on: the game's logic runs as often as the time since the last frame asks (1..3 steps, smo_framerate.c), so the game keeps its speed below 60 fps; re-read in the game (gfx_options_reload_live) */
     int fps30;               /* frame_rate = 30: 30 frames a second are drawn and the game's logic runs twice a frame (full speed, smo_framerate.c) */
     int diag_off;            /* diagnostics = off (default, 1; an old "auto" line counts as off) | on (ARM GPUs: nvn_vk_draw.c diag_present, eq_begin) */
+    int barriers;            /* pass_barriers = auto (0) | light (1) | full (2): the barrier between two render passes (nvn_vk_draw.c image_barrier, 0.3.4) */
+    int output;              /* output_size = auto (0) | full (1) | game (2): the size of the picture handed to the screen (nvn_vk_draw.c present_pass, 0.3.1) */
     int boost;               /* boost = auto (default, 1) | on (2, always) | off (0): the frame's threads keep their CPUs' clocks up while frames are late (Android, android_perf.c) */
+    int framegen;            /* frame_generation = off (default, 0) | on (1) | auto (2): a frame made after each real frame (nvn_vk_motion.c; 0.3.12; auto 0.3.22: fg_auto_tick); live; env SMO_VK_FRAMEGEN wins */
+    int fg_fast;             /* frame_generation_quality = high (default, 0) | fast (1): made frames moved along the camera only (no moving objects, no forward pass; 0.3.22); live */
 } GfxOptions;
 const GfxOptions *gfx_options(void);      /* any thread; read once (the file is written with defaults when it does not exist) */
 void gfx_options_reload_live(void);   /* the in-game menu: re-reads the keys that take effect at once (gfx_options.c) */
+int gfx_framegen_on(void);            /* 0.3.12: frame generation wanted now (SMO_VK_FRAMEGEN=0/1, else frame_generation; auto: what fg_auto_tick decided); any thread */
+void gfx_framegen_auto_set(int on);   /* 0.3.22: frame_generation = auto: the render thread's decision (nvn_vk_motion.c fg_auto_tick) */
+int gfx_framegen_fast(void);          /* 0.3.22: frame_generation_quality = fast (SMO_VK_FG_FAST=0/1 wins) */
 #endif

@@ -22,6 +22,7 @@
 #include <media/NdkMediaCodec.h>
 #include <media/NdkMediaFormat.h>
 #include <media/NdkMediaDataSource.h>
+#include <sched.h>
 #include "runtime.h"
 #include "hostrt.h"
 
@@ -67,6 +68,17 @@ typedef struct Ext {
     char path[260];
     unsigned long long samples_read;
     volatile uint64_t gen;                            /* bumped by SeekTo: samples read before it are refused by the decoders */
+    /* 0.3.21, DECODING AHEAD ON A THREAD OF ITS OWN: the game's thread that reads samples used to decode them itself
+     * (pump_track: feed the codec, wait for its output in 2-5 ms steps). The throw-Cappy clip (480x544, 1.8 s) loops until
+     * Cappy is thrown and every loop decodes it again: on a Xiaomi (SM8735, Android 16) the logic steps went from 3 to
+     * 30-57 ms while it played, single-digit fps. The worker keeps each selected track decoded target[] samples ahead
+     * (non-blocking codec calls, one step per hold of the lock); the reader only decodes itself when the queue is empty.
+     * SMO_MOVIE_PREFETCH=0: as before. */
+    plat_cond cv;
+    plat_thread *worker;
+    int wquit, target[MAX_TRACKS];
+    unsigned long long reader_waits, ahead_hits;
+    double reader_wait_ms;
 } Ext;
 
 /* Decoder buffer model, as in the real library [subsdk DecoderImpl 0x1e440 Flush, 0x1fa30 AcquireInputBufferIndex,
@@ -209,6 +221,7 @@ static void codec_close(Ext *e, int i) {
     q_clear(e, i);
 }
 
+static void worker_start(Ext *e);
 static int ext_select(Ext *e, int i, int on) {
     if (!e->rd || i < 0 || i >= e->ntracks) return ST_INVALID;
     Track *tr = &e->tr[i];
@@ -232,6 +245,12 @@ static int ext_select(Ext *e, int i, int on) {
             e->codec[i] = cd;
             tr->cfmt = tr->kind == 0 ? 21 : 0; tr->stride = tr->w; tr->slice = tr->h; tr->cl = tr->ct = 0;
             tr->codec_eos = tr->in_eos = 0;
+            if (tr->kind == 0) {                       /* about 16 MB of frames ahead, 4 to 48 */
+                size_t fb = (size_t)(tr->w > 0 ? tr->w : 1280) * (size_t)(tr->h > 0 ? tr->h : 720) * 3 / 2;
+                size_t n = ((size_t)16 << 20) / (fb ? fb : 1);
+                e->target[i] = n < 4 ? 4 : n > 48 ? 48 : (int)n;
+            } else e->target[i] = 64;
+            worker_start(e);
         }
     } else {
         AMediaExtractor_unselectTrack(e->rd, (size_t)i);
@@ -323,12 +342,12 @@ static int drain(Ext *e, int t, int64_t timeout_us) {
 }
 
 /* feeds the extractor's next sample to its track's codec (or the end of the stream to every codec) */
-static int feed(Ext *e) {
+static int feed(Ext *e, int64_t tmo) {
     if (e->src_eos) {
         int any = 0;
         for (int t = 0; t < e->ntracks; t++) {
             if (!e->tr[t].selected || !e->codec[t] || e->tr[t].in_eos) continue;
-            ssize_t ib = AMediaCodec_dequeueInputBuffer(e->codec[t], 2000);
+            ssize_t ib = AMediaCodec_dequeueInputBuffer(e->codec[t], tmo);
             if (ib >= 0) { AMediaCodec_queueInputBuffer(e->codec[t], (size_t)ib, 0, 0, 0, AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM); e->tr[t].in_eos = 1; any = 1; }
         }
         return any;
@@ -336,7 +355,7 @@ static int feed(Ext *e) {
     ssize_t t = AMediaExtractor_getSampleTrackIndex(e->rd);
     if (t < 0) { e->src_eos = 1; return 1; }
     if (t >= e->ntracks || !e->tr[t].selected || !e->codec[t]) { AMediaExtractor_advance(e->rd); return 1; }
-    ssize_t ib = AMediaCodec_dequeueInputBuffer(e->codec[t], 2000);
+    ssize_t ib = AMediaCodec_dequeueInputBuffer(e->codec[t], tmo);
     if (ib < 0) return 0;
     size_t cap = 0;
     uint8_t *buf = AMediaCodec_getInputBuffer(e->codec[t], (size_t)ib, &cap);
@@ -349,18 +368,65 @@ static int feed(Ext *e) {
 
 /* the next decoded sample of track want (0: none, the track has ended) */
 static int pump_track(Ext *e, int want) {
+    if (e->qn[want]) { e->ahead_hits++; return 1; }
+    int waited = !e->tr[want].codec_eos && !e->tr[want].failed;
+    plat_li f0, t0, t1; f0.QuadPart = plat_qpf(); t0.QuadPart = plat_qpc();
+    int r = 0;
     for (int guard = 0; guard < 20000; guard++) {
-        if (e->qn[want]) return 1;
-        if (e->tr[want].codec_eos || e->tr[want].failed) return 0;
+        if (e->qn[want]) { r = 1; break; }
+        if (e->tr[want].codec_eos || e->tr[want].failed) break;
         int moved = 0;
         for (int t = 0; t < e->ntracks; t++) if (e->tr[t].selected) while (drain(e, t, 0)) moved = 1;
-        if (e->qn[want]) return 1;
-        moved |= feed(e);
+        if (e->qn[want]) { r = 1; break; }
+        moved |= feed(e, 2000);
         if (!moved) drain(e, want, 5000);
+        if (guard == 19999) {
+            printf("movie: track %d gives no decoded sample (codec stuck): treated as its end\n", want);
+            e->tr[want].failed = 1;
+        }
     }
-    printf("movie: track %d gives no decoded sample (codec stuck): treated as its end\n", want);
-    e->tr[want].failed = 1;
-    return 0;
+    if (waited) { t1.QuadPart = plat_qpc(); e->reader_waits++; e->reader_wait_ms += (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / f0.QuadPart; }
+    return r;
+}
+
+/* the worker: more decoded samples are wanted (a track nobody reads stops it before its queue is full) */
+static int want_more(Ext *e) {
+    if (!e->rd || e->eos) return 0;
+    int any = 0;
+    for (int t = 0; t < e->ntracks; t++) {
+        const Track *tr = &e->tr[t];
+        if (!tr->selected || !e->codec[t] || tr->codec_eos || tr->failed) continue;
+        if (e->qn[t] >= QMAX - 4) return 0;
+        if (e->qn[t] < e->target[t]) any = 1;
+    }
+    return any;
+}
+static void ext_worker(void *arg) {
+    Ext *e = arg;
+    ext_lock(e);
+    while (!e->wquit) {
+        int moved = 0;
+        if (want_more(e)) {
+            for (int t = 0; t < e->ntracks && !moved; t++) if (e->tr[t].selected) moved = drain(e, t, 0);
+            if (!moved) moved = feed(e, 0);
+        }
+        if (moved) { ext_unlock(e); sched_yield(); ext_lock(e); }      /* the game's reader gets the lock between steps */
+        else plat_cond_wait(&e->cv, &e->cs, 2);
+    }
+    ext_unlock(e);
+}
+static void worker_start(Ext *e) {      /* caller holds the lock */
+    static int on = -1;
+    if (on < 0) { const char *v = getenv("SMO_MOVIE_PREFETCH"); on = !(v && !atoi(v)); }
+    if (!on || e->worker) return;
+    e->worker = plat_thread_start(ext_worker, e, 0, "movie-decode");
+    printf("movie: decoding ahead on a thread of its own%s\n", e->worker ? "" : " FAILED (decoded by the reader)");
+}
+static void worker_stop(Ext *e) {       /* caller does NOT hold the lock */
+    if (!e->worker) return;
+    ext_lock(e); e->wquit = 1; plat_cond_broadcast(&e->cv); ext_unlock(e);
+    plat_thread_join(e->worker);
+    e->worker = NULL;
 }
 
 /* The current sample of the extractor, as NuMediaExtractor defines it: the one with the SMALLEST TIMESTAMP among the
@@ -381,7 +447,11 @@ static int ext_fill(Ext *e) {
         }
         if (e->ahead[i].have && (best < 0 || e->ahead[i].us < e->ahead[best].us)) best = i;
     }
-    if (best < 0) { if (!e->eos) printf("movie: end of stream after %llu samples\n", e->samples_read); e->eos = 1; return ST_END; }
+    if (best < 0) {
+        if (!e->eos) printf("movie: end of stream after %llu samples (the reader found %llu decoded ahead, waited %llu times, %.1f ms)\n",
+                            e->samples_read, e->ahead_hits, e->reader_waits, e->reader_wait_ms);
+        e->eos = 1; return ST_END;
+    }
     e->have_pending = 1; e->pending = e->ahead[best].s; e->pend_track = best; e->pend_us = e->ahead[best].us; e->pend_consumed = 0;
     return ST_OK;
 }
@@ -390,6 +460,7 @@ static int ext_fill(Ext *e) {
 static void ext_dtor_common(Ctx *c, int deleting) {
     Ext *e = ext_of(A0);
     if (e) {
+        worker_stop(e);
         ext_lock(e);
         release_pending(e);
         release_ahead(e, -1);
@@ -521,6 +592,7 @@ static void ext_SeekTo(Ctx *c) {                      /* (int64 timeUs) */
         q_clear(e, i);
         if (e->codec[i]) AMediaCodec_flush(e->codec[i]);
     }
+    plat_cond_broadcast(&e->cv);
     ext_unlock(e);
     printf("movie: SeekTo(%.3f s) %d\n", (int64_t)A1 / 1e6, (int)hr);
     RET(hr == AMEDIA_OK ? ST_OK : ST_FAILED);
@@ -1013,6 +1085,7 @@ static void extractor_ctor(Ctx *c) {                  /* Extractor(ContainerType
     build_vtables();
     Ext *e = calloc(1, sizeof *e);
     plat_mutex_init(&e->cs);
+    plat_cond_init(&e->cv);
     wr64(A0, (uint64_t)(uintptr_t)g_ext_vtable);
     wr64(A0 + 8, (uint64_t)(uintptr_t)e);
     input_mark("movie");
@@ -1175,6 +1248,68 @@ static const ImportDef movie_mf_imports[] = {
     {"_ZNK5movie9MediaData8ContainsEPKc", mdata_Contains}, {"_ZNK5movie9MediaData12CountEntriesEv", mdata_CountEntries},
 };
 
+/* 0.3.22, SELF-TEST of the decoding (SMO_MOVIE_SELFTEST=<clip, default content:/MovieData/PlayGuideMovieCapThrow.mp4>): 15 s
+ * after the start, on a thread of its own, the clip goes through the same extractor code the game uses: opened, its video
+ * track selected, every sample taken at 30 a second (as the game shows them), sought back to the start three times (the clip
+ * loops so), then the extractor is destroyed (the decoding thread joined). It prints what the reader found ready and how long
+ * it waited, per pass. The game's own playback is not touched. */
+static void movie_selftest_main(void *arg) {
+    const char *path = arg;
+    plat_sleep_ms(15000);
+    char host[PLAT_MAX_PATH];
+    int fs_host_path(const char *guest, char *out, size_t n);       /* nnfs.c */
+    FILE *f = fopen(fs_host_path(path, host, sizeof host) ? host : path, "rb");
+    if (!f) { printf("movie selftest: %s: not found\n", path); return; }
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    unsigned char *data = malloc((size_t)sz);
+    size_t got = data ? fread(data, 1, (size_t)sz, f) : 0;
+    fclose(f);
+    if (got != (size_t)sz) { free(data); printf("movie selftest: %s: read failed\n", path); return; }
+    Ext *e = calloc(1, sizeof *e);
+    plat_mutex_init(&e->cs); plat_cond_init(&e->cv);
+    snprintf(e->path, sizeof e->path, "%s", path);
+    if (!ext_open_bytes(e, data, (size_t)sz)) { printf("movie selftest: not opened\n"); return; }
+    ext_lock(e);
+    for (int i = 0; i < e->ntracks; i++) if (e->tr[i].kind == 0) ext_select(e, i, 1);
+    ext_unlock(e);
+    for (int pass = 0; pass < 4; pass++) {
+        unsigned long long h0 = e->ahead_hits, w0 = e->reader_waits; double ms0 = e->reader_wait_ms;
+        int n = 0; double worst = 0;
+        for (;;) {
+            plat_li fq, t0, t1; fq.QuadPart = plat_qpf(); t0.QuadPart = plat_qpc();
+            ext_lock(e);
+            int r = ext_fill(e);
+            if (r == ST_OK) release_pending(e);
+            ext_unlock(e);
+            t1.QuadPart = plat_qpc();
+            double ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / fq.QuadPart;
+            if (ms > worst) worst = ms;
+            if (r != ST_OK) break;
+            n++;
+            plat_sleep_ms(33);
+        }
+        printf("movie selftest: pass %d: %d samples, found ready %llu, waited %llu times (%.1f ms in all), longest call %.1f ms\n",
+               pass, n, e->ahead_hits - h0, e->reader_waits - w0, e->reader_wait_ms - ms0, worst);
+        ext_lock(e);                                  /* as ext_SeekTo */
+        release_pending(e); release_ahead(e, -1); e->gen++;
+        AMediaExtractor_seekTo(e->rd, 0, AMEDIAEXTRACTOR_SEEK_PREVIOUS_SYNC);
+        e->eos = 0; e->src_eos = 0;
+        for (int i = 0; i < e->ntracks; i++) { Track *tr = &e->tr[i]; tr->eos = tr->codec_eos = tr->in_eos = 0; q_clear(e, i); if (e->codec[i]) AMediaCodec_flush(e->codec[i]); }
+        plat_cond_broadcast(&e->cv);
+        ext_unlock(e);
+    }
+    worker_stop(e);                                   /* as ext_dtor_common */
+    ext_lock(e);
+    release_pending(e); release_ahead(e, -1);
+    for (int i = 0; i < MAX_TRACKS; i++) { codec_close(e, i); if (e->fmt[i]) { AMediaFormat_delete(e->fmt[i]); e->fmt[i] = NULL; } }
+    if (e->rd) AMediaExtractor_delete(e->rd);
+    if (e->ds) AMediaDataSource_delete(e->ds);
+    free(e->bytes);
+    ext_unlock(e);
+    plat_mutex_destroy(&e->cs);
+    free(e);
+    printf("movie selftest: done, the extractor and its decoding thread are gone\n");
+}
 void register_movie_mf_imports(void) {
     const char *env = getenv("SMO_MOVIE");
     if (env && atoi(env) == 0) { printf("movie: SMO_MOVIE=0, keeping the failing placeholder\n"); return; }
@@ -1182,4 +1317,6 @@ void register_movie_mf_imports(void) {
     plat_mutex_init(&g_init_lock);
     register_imports(movie_mf_imports, (int)(sizeof movie_mf_imports / sizeof movie_mf_imports[0]));
     printf("movie: the video player is Android's (AMediaExtractor + AMediaCodec)\n");
+    const char *st = getenv("SMO_MOVIE_SELFTEST");
+    if (st) plat_thread_detach(plat_thread_start(movie_selftest_main, (void *)(st[0] && strcmp(st, "1") ? st : "content:/MovieData/PlayGuideMovieCapThrow.mp4"), 0, "movie-selftest"));
 }

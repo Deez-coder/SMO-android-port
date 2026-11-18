@@ -175,6 +175,13 @@ void plat_sleep_ns(int64_t ns);
 extern _Thread_local int plat_spin_hot_;              /* plat_posix.c */
 extern int64_t plat_spinhot_ns_;                      /* plat_posix.c: the hot threads' spin, changed at run time (android_perf.c) */
 static inline void plat_spin_mark_hot(void) { plat_spin_hot_ = 1; }
+/* 0.3.22 test switch SMO_SPIN_HOT_MASK: which of the frame's threads spin (1 the render thread, 2 the presenting thread,
+ * 4 the thread that waits for the window sync; default 7, all three, as before). */
+static inline void plat_spin_mark_hot_role(int bit) {
+    static int mask = -1;
+    if (mask < 0) { const char *e = getenv("SMO_SPIN_HOT_MASK"); mask = e ? atoi(e) : 7; }
+    if (mask & bit) plat_spin_hot_ = 1;
+}
 static inline int plat_spin_is_hot(void) { return plat_spin_hot_; }
 static inline int64_t plat_spinhot_ns(void) {
     int64_t h = __atomic_load_n(&plat_spinhot_ns_, __ATOMIC_RELAXED);
@@ -190,6 +197,7 @@ static inline int64_t plat_spinhot_ns(void) {
 static inline void plat_spinhot_set_ns(int64_t ns) { __atomic_store_n(&plat_spinhot_ns_, ns, __ATOMIC_RELAXED); }
 #else
 static inline void plat_spin_mark_hot(void) {}
+static inline void plat_spin_mark_hot_role(int bit) { (void)bit; }
 static inline int plat_spin_is_hot(void) { return 0; }
 static inline int64_t plat_spinhot_ns(void) { return 0; }
 #endif
@@ -214,13 +222,39 @@ static inline int plat_spin_yield_on(void) {
     if (on < 0) { const char *e = getenv("SMO_SPIN_YIELD"); on = e && atoi(e) != 0; __atomic_store_n(&plat_spin_yield_, on, __ATOMIC_RELAXED); }
     return on;
 }
+/* 0.3.22, HOW A SPINNING THREAD WAITS (arm64, test switch SMO_SPIN_PAUSE): the spin is there to keep the CPU clocks up (the
+ * governor sees a running thread), not to do anything, yet the bare loop runs loads flat out at those clocks. 0: the bare
+ * loop (as before). 1: an ISB each round (the pipeline stalls, Rust's spin_loop hint on arm64). 2: WFE, the core waits
+ * clock-gated for an event: the kernel's timer event stream (evtstrm, 10 kHz: at most 100 us) or the SEV that
+ * plat_spin_wake() sends where a waited-for condition is set; the time is checked every round. The thread still runs,
+ * as far as the scheduler knows. Whether the governor (WALT counts cycles) still raises the clocks is what the test
+ * measures. */
+#if defined(__aarch64__) && !defined(_WIN32)
+extern int plat_spin_pause_;                         /* plat_posix.c: -1 until read */
+#ifndef PLAT_SPIN_PAUSE_DEFAULT
+#define PLAT_SPIN_PAUSE_DEFAULT 0
+#endif
+static inline int plat_spin_pause_mode(void) {
+    int m = __atomic_load_n(&plat_spin_pause_, __ATOMIC_RELAXED);
+    if (m < 0) { const char *e = getenv("SMO_SPIN_PAUSE"); m = e ? atoi(e) : PLAT_SPIN_PAUSE_DEFAULT; __atomic_store_n(&plat_spin_pause_, m, __ATOMIC_RELAXED); }
+    return m;
+}
+static inline void plat_spin_pause(int m) { if (m == 2) __asm__ __volatile__("wfe" ::: "memory"); else if (m == 1) __asm__ __volatile__("isb" ::: "memory"); }
+static inline void plat_spin_wake(void) { __asm__ __volatile__("dsb ishst\n\tsev" ::: "memory"); }
+#else
+static inline int plat_spin_pause_mode(void) { return 0; }
+static inline void plat_spin_pause(int m) { (void)m; plat_cpu_relax(); }
+static inline void plat_spin_wake(void) {}
+#endif
 /* Spins while cond holds, at most plat_spin_ns(); cond reads shared state with atomic loads. */
 #define PLAT_SPIN_WHILE(cond) do { \
         int64_t ps_ns_ = plat_spin_ns(); \
         if (ps_ns_ > 0) { \
             int64_t ps_end_ = plat_qpc() + ps_ns_ * plat_qpf() / 1000000000; \
-            int ps_y_ = plat_spin_yield_on(); \
-            for (unsigned ps_i_ = 1; (cond); ps_i_++) { plat_cpu_relax(); if (!(ps_i_ & 63)) { if (plat_qpc() >= ps_end_) break; if (ps_y_ && !(ps_i_ & 255)) plat_yield(); } } \
+            int ps_y_ = plat_spin_yield_on(), ps_m_ = plat_spin_pause_mode(); \
+            for (unsigned ps_i_ = 1; (cond); ps_i_++) { \
+                if (ps_m_ == 2) { plat_spin_pause(2); if (plat_qpc() >= ps_end_) break; continue; } \
+                plat_spin_pause(ps_m_); if (!(ps_i_ & 63)) { if (plat_qpc() >= ps_end_) break; if (ps_y_ && !(ps_i_ & 255)) plat_yield(); } } \
         } \
     } while (0)
 

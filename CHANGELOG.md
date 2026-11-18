@@ -3,6 +3,246 @@
 Every build handed out gets its own number (`android:versionName` in `android/AndroidManifest.xml`, shown on the
 launcher and written into exported logs). The APK is named after it: `odyssey-<version>.apk`.
 
+## Beta 0.4
+
+The public release after 0.3 (version code 52). It holds everything in the test builds 0.3.1 to 0.3.21 below, plus:
+
+**More in the logs** (no cost per frame: read once every 10 s or 300 frames). Every perf line now ends with frame generation's state (off, on, or auto and what Auto decided; quality; how many objects were drawn again and the budget's limit). A second memory line every 300 frames: the GPU memory the driver reports for the whole process (VK_EXT_memory_budget; not offered by the S24's driver) and the phone's RAM and how much is available. At the start: the phone's RAM; the low-memory note now says how much is available. The time budget's lines say how many real frames were late. The quality is logged when it is set or changed.
+
+**CPU boost does what the player set, with a warning under it.** The pause of 0.3.1 (issue 23: the spin stopped while the GPU was the limit, in Auto and Always) is now off by default (`SMO_BOOST_GPU_CHECK=1` turns it on again): the user wants the setting obeyed. While boost is on (Auto or Always) the launcher's Graphics page shows a note: it raises the frame rate, the phone gets warmer and the battery drains faster, and if it gives no noticeable boost on the phone it might not be worth turning on.
+
+**Log: BC formats one by one on GPUs without BC.** A tester's Galaxy S24 with the Exynos 2400 (Xclipse 940, Android 17, public 0.3) had every BC texture re-encoded to ETC2 on the CPU (the driver reports the BC feature off) and three 5 s freezes at level loads with the world loader registering textures; other ports note the Xclipse lacks only BC6H / BC7. The log now lists which BC formats the driver offers one by one, so a next build can read those natively. A log line at start only; not run on a phone yet (built while the S24 was disconnected).
+
+**The object budget cuts only while real frames are late.** In the 0.3.21 build the S24 went from 64 to 36 objects at a replay cost of 2.8-3.5 ms with every real frame on time. Now fewer only while more than 5% of real frames are late and the cost is over the 3 ms budget, or the cost is over 6 ms; more again while real frames are on time. S24: 55-64 objects (as many as there were) with 98% of real frames on time; at resolution 1.70 it kept 57-64 (the objects cost 1.6 ms there; the GPU as a whole was the limit).
+
+## Beta 0.3.21 (test build)
+
+**Frame generation settings** (launcher Graphics page and in-game menu, live): **Off / On / Auto** and **quality High / Fast** (graphics.ini `frame_generation = off | on | auto`, `frame_generation_quality = high | fast`).
+- Auto turns it on only while the game cannot hold 60 but a real and a made frame fit (5 one-second windows in a row at about 37-54 fps, and the GPU time of a real frame plus frame generation's own under 30 ms: measured once it has run, estimated from the render size before), and off again when it cannot keep up (under 85% of real frames on time for 4 s, under 50% for 2 s). It then waits 30 s before trying again, doubled up to 8 minutes when it failed again within a minute. Each switch is in log.txt (`nvn_vk_fg: auto`). Tested on the S24: stays off where 60 holds; at resolution 1.70 (47-52 fps) it came on, saw the real frames late and went off; switching on costs one hitch the first time (~160 ms: its shaders are made and the swapchain is made again for FIFO).
+- Fast: made frames follow the camera only (no moving objects drawn again, no forward pass, no copy of the last real frame): S24 GPU 3.9 ms a pair instead of 8.0 (warp 0.82 ms instead of 2.35), real frames 100% on time. Meant for slower GPUs (the Helio G99 tester: warp 10.5 ms, per-object motion 5.7-6.7 ms of the render thread at High).
+- **Moving objects by a time budget**: the number drawn again follows what the replay costs (render thread + GPU, 3 ms a frame; `SMO_VK_MO_BUDGET_US`, 0 = the fixed 64 as before), at most 64, at least 8 (nearest first). On the S24 it stays at 64; with a 1 ms budget it settled at 8-15 objects and their GPU time went 2.2 -> 1.0 ms.
+
+**RAM: about 570 MB less GPU memory.** Each of the 16 command-buffer slots kept a descriptor pool made for 8192 sets while a command buffer takes ~30-200, and the driver keeps all of it. Pools are now 8 times smaller; when one runs out the next is made, as before (`SMO_VK_DPOOL_DIV`, 1 = as before). Measured on the S24 (Cascade gameplay, `dumpsys gpu --gpumem`): the game's GPU memory 2312 MB before, 1744 MB with the change in the same run order (1487 MB in the final check), fps unchanged (59.6-59.8); Mali's path (1809 MB) and frame generation (1825 MB) ran without errors. Releasing the command pools' memory instead saved nothing and cost fps, so it is not used. Reported: a phone with 8 GB had the system UI killed while playing.
+
+**Videos decode on a thread of their own (single-digit fps while a tutorial clip played).** The game's thread that reads the video used to decode every frame itself, waiting on the phone's decoder in 2-5 ms steps. The throw-Cappy clip (480x544, 1.8 s) loops until Cappy is thrown, and every loop decoded it again: on a Xiaomi (SM8735 / Adreno 825, Android 16) the game's logic steps went from 3 ms to 30-57 ms while it played. A decoding thread now keeps each track a few frames ahead (about 16 MB of frames); the game's thread only decodes itself when nothing is ready. The "end of stream" log line now says how often the game still had to wait and for how long. `SMO_MOVIE_PREFETCH=0`: as before. Checked with a self-test (`SMO_MOVIE_SELFTEST=1`: 15 s after the start the throw-Cappy clip goes through the same extractor code, 4 passes with a seek back to the start each, then the extractor is destroyed) on the S24: all 55 samples every pass, the reader found 54 ready and waited once per pass (the first frame after the seek, 7.5-10.7 ms; 89 ms the very first time), against 13-20 waits and 85-100 ms per pass without the decoding thread; the thread ends cleanly. Not yet seen in the game's own tutorial clip (the Action Guide in the pause menu closes at once and opens no video; left for later).
+
+**Battery: motion sensors only when used.** The accelerometer and gyroscope sent 200 readings a second each whenever the game had the focus, with motion controls on or off, and every reading woke a thread; the game keeps only the latest reading, once a frame. Now they are off while motion controls are off (launcher, controls.ini `motion = off`) and read 100 times a second when on (`SMO_SENSOR_US` to change).
+
+**CPU boost: the launcher says what each choice costs** (Always: most fps, warmest, most battery; Auto: only while frames are late; Off: cooler, longer battery, fewer fps in heavy scenes). Defaults unchanged. Measured why there is no cheaper boost (S24, Cascade, ~2.5 min each from cool): the heat comes from the high clocks the spin buys, which are also the fps. A lower-power spin (ISB, `SMO_SPIN_PAUSE=1`) gave the same fps and the same heat in a repeat (+11.9 vs +12.3 C); WFE (`=2`) lost fps (57-59.6, the clocks jumped); spinning fewer threads (`SMO_SPIN_HOT_MASK`, 1 render, 2 presenting, 4 window sync; default 7) saved nothing, and the render thread alone made the game logic 45% slower per step (5.8 vs 4.0 ms), hidden by the 60 cap. The switches stay for tests, off.
+
+**Render thread: two ideas measured and left off.** Resetting finished command buffers' pools on a helper thread (`SMO_VK_BG_RESET=1`, off) took vkResetCommandPool (~0.9 ms a frame) off the render thread, but the driver then allocated GPU memory while recording and began passes more slowly: render thread ~8.2 ms a frame either way in six runs (normal and Mali paths), no crashes. Keeping stream copies across frames for memory the CPU cannot write directly is not possible in SMO: 6.88 of the 6.94 MB copied a frame lie in CPU-uncached pools (the measurement was taken out again).
+
+**Mist and fences, tests kept off by default.** The mist that vanishes in Cascade with the waterfall on the left of the screen comes back when the CPU waits for the GPU before the mist pass (`SMO_VK_WAIT_FMT=0x29`, mode 1), not with a GPU barrier (mode 4). That wait costs frame rate (CPU and GPU no longer overlap), so it stays off and the issue is parked. Also kept, on by default: compute results copied back at fences, reads of pending compute results wait for them, a barrier between passes that write the same attachments (`SMO_VK_FENCE_LAND=0`, `SMO_VK_PEND_WAIT=0`, `SMO_VK_ATT_BARRIER=0` turn them off). Neither fixed the mist; no fps change was seen in the S24 runs (59.4-59.9 fps).
+
+## Beta 0.3.20
+
+**Frame generation: more moving objects get their own motion.** At most 64 objects a frame are drawn again into the motion data (was 32), and a rigid budget of 80000 vertices (was 40000). Measured on the S24 in Cascade with every moving object drawn again (`SMO_VK_MO_ALL=1`, about 100 a frame): 2.35 ms of GPU and 0.72 ms of render thread, against 1.83 ms and 0.56 ms at 32, real frames 99% on time either way; about a third of those redraws draw nothing (hidden or off screen). The coins near Mario were already drawn again in 0.3.19 (the user had seen them at 30 on the build before); with 64 the ones further away are too. A budget by time instead of a number is planned with the frame generation settings.
+
+**Checked and dropped:** the strip without mist along the right and bottom at a resolution scale below 100% (0.3.19 notes) does not exist: both of the mist pass's targets are scaled alike (the capture log gives colour targets at the game's size and depth targets at their own); no pass with targets scaled unalike was logged in either capture session.
+
+## Beta 0.3.19
+
+**Frame generation: Mario's cap moves with him in made frames** (the user on the S24: the hat looked late, shaking, as if at 30, while the rest of Mario was smooth).
+- The cap is two rigid meshes (2736 + 3117 vertices). The moving objects drawn again into the motion data were chosen skinned ones first, then rigid ones within a vertex budget of 12000, at most 24 a frame: Mario's body (drawn twice by the game) and the skinned characters around filled the slots, and the cap only got the camera's motion. Now skinned and rigid ones are taken together, nearest to the camera first; at most 32 a frame and a rigid budget of 40000 vertices (the cost is per draw, not per vertex; on the Mali tester's phone all of them took 0.13-0.19 ms of GPU). Checked in the S24 log (both cap meshes drawn again, the GPU cost of the redraws unchanged at ~1.8 ms) and by the user in play: the hat goes smoothly with Mario.
+
+**The see-through triangle in the Cascade waterfall mist is gone** (the user's screenshot; reported on other emulators too).
+- Found with frame captures at the spot: the triangle is made by the pass that scales the half-size mist into the scene, one full-screen draw (program #23331). It draws 9 vertices from a vertex range of 36 bytes, 3 vertices. A vertex fetched past the range the game bound reads zeros on the Switch, so the 6 extra vertices make zero-area triangles there (found by the nxnative project for this same pass, its issue 558; the idea only, their code was not read). Since 0.1.x this port copied the game's memory after the range for such draws, and whatever followed became two more triangles that blended the mist in a second time: straight edges through the screen, moving with the camera, going with the mist. Such a stream is now its bound bytes followed by zeros as far as the draw reads (`SMO_VK_VTXGROW=2`: the old way). The user: the triangle is gone.
+- Ruled out on the way, each by a session of the user's at the spot: primitive restart (SMO restarts at 0xffffffff with 16-bit indices: never on NVN either), depth clamp (`SMO_VK_DCLAMP=0`), resolution scale (1.0), the occlusion-based conditional draws (`SMO_VK_COND_ALL=1` draws all of them), no near/far clipping for draws without a depth target (tried, reverted).
+
+**Still open:** the waterfall mist disappears or flickers when it is away from the centre of the screen (not frame generation; not the conditional draws, not depth clamp, not the resolution scale). Seen in the captures and to fix later: at resolution scale 0.9 the mist pass's depth target is made 0.9 times its size (360x203) while its colour target is not (400x225), so the mist is not drawn in a strip along the right and bottom edges.
+
+**For testing:** frame captures (`SMO_VK_DIAG=<frames>` in env.txt) also save the alpha channel of targets that have one (`_a.bmp`); a log line when the game's primitive restart index is one Vulkan does not use.
+
+## Beta 0.3.18
+
+**Frame generation: no ghost of Mario when the camera circles him** (the user on the S24: with the camera close, rotating around Mario left a copy of his edge; 0.3.17's wider range did not fix it).
+- Found with a screen recording of the user's test (60 fps, every other frame a made one): only the made frames showed a second copy of the back of Mario's head and cap. As the camera circles him, the background slides past and a strip of it that he hid comes into view in the made frame; the real frame has no picture of it, and the gap was filled by fetching along the background's motion, which points into Mario: his edge was copied into the gap. Now a gap's fetch that would land on something clearly nearer than the gap's own surface takes the picture as it is there instead (moving arms and legs keep the old fill, which fetches the background behind them).
+- The user then saw only a slim, see-through outline; a second recording showed it as a thin line of the cap's colour in the sky, its shape shifted by the background's motion: the sky pixels right against Mario carry a little of his colour (FXAA, the 3D picture scaled to the window) and moved with the background. A background fetch right against something nearer is now taken 2 pixels farther into the background.
+- A third recording showed what was left: against a textured background (the waterfall cliffs) a seam in Mario's shape, where the strip that came into view was filled with the background as it was, not moved like the background around it. That strip was hidden in this real frame but shown in the last one (as the camera circles, the background behind Mario passes from one side to the other), so each real frame's scene is now kept (one image copy a real frame) and the next made frame fetches such strips from it, one real frame further back along the background's vector. Only where the last frame showed something as far away there (its distance image is kept too), and never for the sky, whose vectors are not usable: a first try without these checks fetched whole copies of Mario into the sky.
+- The user's verdict on the S24 after rotating the camera around Mario up close: "very minimal and pretty clean", good enough.
+
+## Beta 0.3.17
+
+**Frame generation: no afterimages when the camera is close** (the user saw them on the S24 with the camera right next to Mario or a prop, less shaky than before; possibly there before too).
+- The forward pass (0.3.14) keeps each pixel's vector in 10 + 10 bits so that one atomic picks the nearest; they held up to 64 pixels a real frame at 1/8 pixel. What moved farther (things close to the camera, fast camera turns: in saved frames of a camera pan up to 15% of the pixels already moved more than 32) fell back to the old look-up, which leaves moving things where they were: an afterimage. The vector is now kept on a square-root scale: up to 512 pixels, 0.1 pixel steps near 0, 2 near 512 (half of that in the made frame).
+- Checked on the S24: Mario running and a fast camera pan, real frames 98-100% on time; the made frames lie between their real frames with no doubling. The close-camera case itself is to be checked in play.
+
+## Beta 0.3.16
+
+**Frame generation on Mali, second step** (after the tester's 0.3.15 log, Dimensity 8300 / Mali-G615, handheld).
+- 0.3.15's cached-memory request did not apply on his phone: his driver offers no memory that is both shared with the GPU, coherent and CPU-cached (the log: "keep buffer in memory type 0 (flags 0x7)"). Hashing the game's own memory alone brought the per-object motion's render thread time from 5-14 ms to about 4 ms a frame. Now every CPU read of those copies goes to a second copy in ordinary memory, whatever memory the driver offers (the GPU still reads its own copy).
+- His frame with frame generation on was 46-50 ms (about 20 real frames a second; 30-50% on time), and on his phone a frame is the sum of the game logic, the render thread and the GPU: frame generation's extra render thread time goes straight into the frame time. The log's "present" part had grown from 0.8 to 9.5 ms but did not say why (it also counted the made frame's present twice). **New log line** every 300 frames, `nvn_vk_present:`: the motion pass and moving objects, the end-of-frame barrier, the acquire and the present call, and for frame generation the made frame's build and its present, each with the time spent waiting for the GPU. On the S24 it shows the made frame's build waiting 11.9 ms for the GPU a frame: there that is the 30 fps pacing (real frames 99.7% on time); on the Mali phone it will show whether the wait is real GPU work.
+- Checked on the S24: per-object motion 0.54 ms a frame, real frames 99.7% on time, the moving objects still drawn into the motion data (7196 redraws wrote pixels, 4 did not).
+
+## Beta 0.3.15
+
+**Frame generation: less work for the render thread on Mali** (after the tester's 0.3.14 log, Dimensity 8300 / Mali-G615, handheld).
+- The tester: "It feels and looks like 60 fps", input latency the same as without it, a few minor visual errors (Mario doubled in a photo; he sees that without frame generation too). The HUD is now kept apart in handheld on his phone (HUD copy 0.3 ms) and frame generation's GPU time is about 4 ms per real + made pair.
+- But only 50-75% of his real frames came on time (38-51 ms each instead of 33), the render thread was the limit (25-35 ms a frame), and the game lowered its 3D size to its minimum (640x360). The per-object motion took 5-14 ms of the render thread a frame on his phone against 0.6 ms on the S24. Its copies of the game's buffers were kept in GPU-shared memory of the first host-visible kind, which on Arm's driver is not cached for the CPU, and the CPU read them back (their check for changes, the matching with last frame's draws) at uncached speed. Now the copies go into CPU-cached memory when the GPU offers it (the log says which: "nvn_vk_mo: keep buffer in memory type"), and the check reads the game's own memory instead of the copy.
+- Checked on the S24 (whose driver already gave cached memory: the work stays at 0.55 ms a frame): keep buffer in memory type 6, CPU-cached; real frames 99% on time; saved frames of Mario running still show in-between poses. The gain on Mali is still to be measured in the tester's next log.
+
+## Beta 0.3.14
+
+**Frame generation fixes after the Mali tester's 0.3.13 log** (test feature, off by default).
+- **Frame generation no longer drops the frame rate on slower phones.** On the tester's Dimensity 8300 (Mali-G615) 0.3.13 ran at about 47 fps without it and fell to 5-10 fps with it: the moving-objects motion read and checked the game's large shared buffers again for every draw, which kept the render thread busy for ~170 ms a frame. Each buffer is now copied and checked once a frame, with a faster check. On the S24 that work now costs the render thread about 0.6 ms a frame; real frames on time: 99%.
+- **No more shaking.** The made frame's view of the real frame was briefly cached in a way that could go stale when the game made its window textures again, so some made frames showed an older picture (seen as shaking). The view now belongs to the texture itself. (Making it again every frame, as 0.3.13 did, had made the GPU wait for itself every frame.)
+- **The HUD stays sharp in handheld mode too.** In handheld the game draws its picture into the top-left 1280x720 of its 1600x900 window texture and draws the HUD into a 1280x720 texture; 0.3.13 only looked for a HUD texture of the window's full size, so in handheld it moved the HUD with the picture (the tester's log: "HUD copy 0.000 ms"), and it treated the whole 1600x900 as the picture, so made frames were slightly stretched and their motion was off. Now the made frame is built inside the part the screen shows, and the HUD texture only needs the picture's shape. Checked on the S24 in both modes with saved real and made frames: the HUD is in place and sharp, the scene moved under it.
+- **Mario's and the enemies' animations now move in made frames too** (they had stayed at 30 while the camera was smooth; the user noticed it on the S24). The moving objects' own motion was measured right (about 2000 of Mario's pixels got their own vectors), but the made frame was built by looking up the motion at each of its own pixels: the place an arm moves to still held the background's motion, and the place it left still pointed at the arm, so moving parts stayed where they were (saved frames of 0.3.13's way: each made frame had the pose of the real frame before it). Now every pixel is pushed forward to where it lands, the one nearest the camera wins where several land on the same place, and a place something moved away from takes the background next to it. Saved frames of Mario running now show in-between poses (arms and feet half way); fast-moving hands can smear a little. The user played it on the S24: animations smooth, no shaking. Cost on the S24: about 1.5 ms more GPU time per real + made pair (7.4-8.0 ms in all instead of 6.1-6.8). `SMO_VK_FG_SCATTER=0` (env.txt) brings back the old look-up for comparison.
+
+## Beta 0.3.13
+
+**Frame generation: characters and moving objects get their own motion** (test feature, off by default; "Frame generation (test)" in the menus).
+- Before, a made frame moved the picture only along the camera's motion (and Mario's position), so Mario's arms and legs, creatures and other moving things stayed put in made frames and updated at 30. Now the moving objects of the scene are drawn again into the motion data with their position from the frame before (the game's own vertex code run with last frame's bones and transforms), so they move in made frames too. The user compared on and off on the S24 at 30 real frames: on looks better.
+- Up to 24 objects a frame are drawn again: characters first (Mario, creatures), the nearest to the camera first, then small moving things. Objects that would not show (hidden, off screen) are left out automatically (each redraw counts the pixels it wrote). Plants swaying in the wind keep the camera motion.
+- The check of which pixels belong to an object now uses the scene's depth as the main 3D pass left it (later passes wrote over Mario's body and hid him from it); Mario's second, duplicate set of draws is skipped.
+- Cost on the S24: about 1.5 ms more GPU time per real frame (frame generation in all about 5.5 ms per real + made pair). On Mali: to be measured (the `nvn_vk_fgtime` log line shows it every 300 made frames).
+- Still open: effects and particles keep the camera motion; Mario's cap is sometimes left out.
+
+**More in the logs** (to find what holds the frame rate back on slower phones, without another build):
+- Every 30 s: the game logic's longest waits, named (which object, which game thread woke it, and where in the game's code it waited, three levels deep), and every busy thread's CPU use and the processor it ran on; once, each processor's top clock. On the S24 this already shows the game's logic waiting for its "view update" and "clipping" helper threads (al::waitUpdateCalcView, al::ClippingActorHolder::update), which are barely busy themselves but share processors with other busy threads.
+- With every 1800 frames: the logic's waiting split by kind (game objects, the renderer's jobs, the present, spinning).
+- With frame generation on: how many real frames came on time and how many came late enough that their made frame stayed on screen two refreshes.
+
+## Beta 0.3.12
+
+**Frame generation is in the menus** (test feature, off by default): Graphics in the app and the in-game menu, "Frame generation (test)". It switches live, no restart.
+- On: after each real frame one more is made from it (along the camera's and Mario's motion, the HUD kept sharp) and shown on the next refresh, so 30 real frames a second show as 60 on a 60 Hz screen. It looks smoother but still answers like 30.
+- While it is on, the game is paced at 30 real frames a second, keeps its normal speed by itself (as with Steady game speed, whatever that switch says), and the window asks for 60 Hz; the FPS limit is not needed. Checked on the S24 with only the new switch on (FPS limit 60, Steady speed off): 2.03 logic steps a frame at 30 real frames, full speed. A first try without the 30 pacing let the game draw 60 frames a second, half of which never reached the screen.
+- The fps counter shows real and made frames apart, e.g. `30 FG 30`.
+- **GPU cost, measured on the S24 (Adreno 750)** with GPU timestamps around frame generation's own work: about 4.6 ms per real + made pair. In the real frame: motion pass 0.65 ms, HUD copy 0.27 ms. The made frame: warp 1.0 ms, its own present pass (upscaling, FXAA, sharpening at screen size) 2.6 ms. The frame's total GPU time went from 14.2 to 18.2 ms; the Mali code path gave the same on this phone. A Mali GPU will need more; the log line `nvn_vk_fgtime` reports it every 300 made frames.
+- Switching it on and off in the in-game menu while playing works: tested on the S24 by the user, 8 switches in one run, each taking effect at once (the log shows "frame generation on / off" after each). A first try failed only because the test run had read a separate test settings file while the menu wrote graphics.ini.
+
+## Beta 0.3.11 (internal, not handed out)
+
+**Frame generation: the world no longer shakes** (test switch `SMO_VK_FRAMEGEN=1`). Two fixes, both checked on the S24 against the real frames:
+- **The motion vectors were about twice too long.** The scene's depth is in the -1..1 convention (z = 2d - 1), not 0..1 as 0.3.9 concluded from a test that was the wrong one. Fitted against the pictures (the next real frame rebuilt from the last one moved along the vectors), the vectors now match at exactly 1.0x in every part of the screen; before they needed 0.6-0.7x. Every made frame overshot, so the world went forward too far and the next real frame barely moved.
+- **The made frame is one game step ahead**, not a fixed half frame: it is shown one refresh later and the game runs one 1/60 s step per refresh. At an FPS limit of 30 with steady speed, about 1 frame in 20 has 1 or 3 logic steps instead of 2 (a real frame a little early or late); a fixed half frame pushed those made frames too far or not far enough. The game's step count now travels with each frame's camera.
+- Result: the made frame sits 0.43-0.50 of the way to the next real frame for 2-step frames (ideal 0.50) and about 0.33 for 3-step ones (ideal 0.33). Before: 0.47-0.88.
+- Test switches added: `SMO_VK_MOTION_SHOT` also saves the raw vectors (`motion_<frame>_<w>x<h>.rg16f`); `SMO_VK_MOTION_FOCAL=<s>` scales the projection (test only); `SMO_VK_MOTION_ZMAP=0` brings back z = d.
+- **Step 4, first version: Mario's own motion.** Mario's position is read each logic step (`PlayerActorHakoniwa::movement`, kept with the frame's camera); pixels inside a capsule around him (radius 60, height 180 game units) get his movement on top of the camera's. In free play on the S24 the made frame's Mario now moves part of the way along his path (about 4-5 px from the ideal spot, against about 8 px without). Left: the strip he uncovers as he moves shows broken pixels for that one frame, and his arms and legs keep the real frame's pose. `SMO_VK_FG_MARIO=0` turns it off; `=<r>,<h>` sets the capsule.
+- Still open: the strip behind a moving Mario, the screen edge stretch, GPU cost on Mali.
+
+## Beta 0.3.10 (internal, not handed out)
+
+**Frame generation, steps 2 and 3** (test switch `SMO_VK_FRAMEGEN=1`; off by default, nothing changes in normal play). After each real frame, one more frame is made and shown on the next refresh: at an FPS limit of 30, 60 frames reach the screen while the game runs at 30.
+- The made frame is the real one pushed half a frame ahead along the camera motion (step 1's vectors). The swapchain switches to FIFO, so real and made frames each get one refresh; checked on the S24, real and made presents alternate evenly.
+- The HUD is kept apart (step 3): the game's scene is copied before the HUD is drawn over it, the scene is moved, and the HUD is put back exactly where it is. On the S24 the HUD is identical in real and made frames, and the scene is 16 px ahead during a camera turn.
+- The fps counter shows real and made frames apart: `29 FG 31` means 29 real and 31 made frames a second. AVG, 1% LOW and MS stay the real frames'.
+- **Not ready for players:** Mario and anything else that moves on its own is moved with the scenery in made frames, so he jitters (step 4 will give objects their own motion). The screen edge where new scenery comes in is stretched. The GPU cost on Mali is not measured yet.
+
+## Beta 0.3.9 (internal, not handed out)
+
+**Frame generation, step 1: camera motion vectors** (docs/FRAME_GENERATION_PLAN.md). No frames are generated yet, and nothing changes in normal play: this is off unless a test switch asks for it.
+- The game's camera is read once a frame in `StageScene::drawMain` through the game's own functions (view matrix and this frame's projection), and handed to the renderer with the frame it belongs to.
+- At the present, a small compute pass turns the scene's depth and the camera of this frame and the last into per-pixel motion (RG16F, in pixels). The approach follows Super Odyssey PC Recomp's camera motion vectors (MIT; notices in the source).
+- Checked on the Galaxy S24 Ultra in Cascade:
+  - Still camera: exactly zero motion.
+  - Steady camera turn: one coherent field, about 20 px a frame to the right, with parallax around Mario.
+  - Computing them every frame left the frame rate at its 58-59 fps cap.
+- Three problems found and fixed on the way:
+  - This port's depth is 0..1 (the fork's is -1..1).
+  - Qualcomm's driver ran 8x8 compute groups as 8x1, so only the top eighth of the image got vectors; groups are now 64x1.
+  - A later pass with as many targets replaced the scene's depth, which gave NaN motion.
+- Test switches: `SMO_VK_MOTION=1` (vectors every frame) and `SMO_VK_MOTION_SHOT=<frame>,...` (save a motion picture and a summary line).
+
+## Beta 0.3.8 (test build, not released)
+
+Includes 0.3.7's Cap Kingdom fog fix.
+
+**The render thread no longer waits for the GPU before most conditional draws.** SMO decides whether to draw many objects from occlusion counts (about 320 decisions a frame in Cascade). Before comparing the counts, the renderer waited for every outstanding compute-shader result, even though compute shaders never write those counts. That stopped the render thread for about 2 ms a frame while the GPU caught up. Now it waits only when something still outstanding (a queued report, or compute results not yet landed) can write the two counts being compared; otherwise the counts in memory are already final. The Mali tester's render thread waited for the GPU about 3.8 ms a frame in 0.3.6, so this should matter more on his phone.
+
+Checked on the Galaxy S24 Ultra, imitating Mali's driver path, Cascade, the same view in both runs:
+- 46.4-48.2 fps with the change, 38.3-45.1 (mostly 39-40) without.
+- Render thread 14.9 instead of 18.1 ms a frame; its wait for the GPU 0.5 instead of 2.2 ms.
+- Screenshots of the same moment match (same objects drawn).
+
+`SMO_VK_COND_NARROW=0` brings back the old wait.
+
+Also:
+- The renderer looks up compute results only when a range can overlap them (a bounds check before two list walks).
+- New log lines for the next Mali logs: where the render thread waits for the GPU (`nvn_vk_waitwho`, every 300 frames), how long the game's fence waits take (`SyncWait`), and how many conditional draws skipped the wait (`nvn_vk_cond`).
+- Two changes tested and left off by default because the same-view A/B showed no gain: a small front cache for buffer lookups (`SMO_VK_RFRONT=1`) and binding the index buffer once per command buffer (`SMO_VK_IBONCE=1`).
+- Showing frames asynchronously (`SMO_PRESENT_ASYNC=1`) was A/B tested again in the same view: no gain. The game's wait only moves to its window-texture wait (display pacing). Our fence waits barely queue (0.04-0.08 ms; 83-89% of the fences have finished when their wait runs).
+
+## Beta 0.3.7 (test build, not released)
+
+**Cap Kingdom's fog reacts to Mario again.** The game works out the height of Cap Kingdom's fog surface by reading the fog's texture on the CPU (`al::getF32FromLinearTextureF16` and two sibling functions). On the Switch the GPU draws straight into that memory. In the port the drawing lives in a Vulkan image, so the game always read zeroes: it took the fog for flat at the wrong height and refused Mario's and Cappy's ripples in it. Now, when the game reads such a texture, the GPU's picture of it is copied back into the game's memory. The copy is recorded without waiting for the GPU and arrives a frame or two later, which is fine for a fog surface. Super Odyssey PC Recomp found and documented this (MIT); our implementation is our own.
+
+Checked on the Galaxy S24 Ultra in Cap Kingdom:
+- The fog reads now return real values (0.533-0.539; Super Odyssey PC Recomp documents the same texel as half-float 0x384f = 0.5386). Without the fix every read was 0.
+- Speed is unchanged: 56 fps with the fix, 54-57 without it, in the same place.
+- Two earlier attempts were too slow. Waiting for the GPU at each read gave 30 fps. Looking the texture up at every texel read (the game reads thousands a frame) took the game logic from 4 to 30 ms a frame. Each texture is now looked up and copied once a frame.
+- Not checked yet: whether Mario's ripples visibly show in the fog.
+
+`SMO_FOG_READBACK=0` turns it off.
+
+## Beta 0.3.6 (test build, not released)
+
+(0.3.5 was an internal test, never handed out.)
+
+**A steady 40 fps on 120 Hz screens.** The window always asked the display for 60 Hz. With the FPS limit at 40, a screen at 60 Hz showed the frames for one and two refreshes by turns (16.7 and 33.3 ms), so 40 fps juddered even when the game kept an even 25 ms. Now a limit that doesn't divide 60 (40, 45, 50) is asked for as the window's rate. Android then picks a refresh rate it divides (120 Hz for 40, 90 Hz for 45) where the screen has one. A screen without such a rate stays at 60 Hz and plays as before. Limits that divide 60 (20, 30, 60) still ask for 60 Hz, to keep the heat fix of 0.3.x. The log lists the refresh rates the screen offers at start, and the rate in use 1.5 s after each change.
+
+**The GPU's time goes to Android's performance hints (Android 15+).** Until now the hint session got only each frame's total time. Now it also gets the GPU's time, so a phone that uses it can raise the GPU's clock with the CPUs'. It's up to the phone whether it does. The log says whether the GPU time was accepted. The hints' target follows the FPS limit too (25 ms at 40 fps), so a capped game no longer asks for 60 fps clocks. `SMO_PERF_GPU=0` sends the total only, as before.
+
+Both ideas come from nx2android's perf_android.c (MIT; no code copied).
+
+Checked on the Galaxy S24 Ultra, Cascade:
+- **FPS limit 40:** the screen offers 120, 80, 60, 48, 30, 24 and 10 Hz. With the limit at 40 it switched to 80 Hz (SurfaceFlinger's active mode during play), and frames held 25.0 ms (median; 40.0 fps, 1% low 33-36 in steady play). The GPU time reports were accepted.
+- **No limit:** the window still asks for 60 Hz, and gameplay ran at 59.2-59.7 fps, the same as 0.3.3.
+- **A side finding:** at the 40 limit the S24's GPU took 12-14 ms a frame for the same scene. With slack, the GPU's clock goes down. So the GPU time in a slow frame says less about the work than it seems.
+
+## Beta 0.3.4 (test build, not released)
+
+**Mali: the GPU no longer empties between the steps of a frame.** The Mali tester's 0.3.3 log timed every render pass of a frame on his Mali-G615: 15.2 ms of work in 53 passes, and 11.6 ms of the GPU standing idle between them. Before almost every pass there was a gap of 0.14-0.3 ms, because each pass waited for everything before it to finish completely (a "full" barrier), even passes of one draw into a 256x256 target. Now a pass waits only for the parts of earlier passes it actually reads ("light" barriers, as Arm recommends; LAS Recomp measured 14.8 to 13.65 ms a frame with them on a Mali-G610). This mode existed since 0.1.7 but stayed off on Mali. It also used to switch itself off within a minute of play, because a few of the game's vertex shaders read small render targets (the exposure value, 2x1, and some 4x4 and 128x128 ones). Now only those targets get a barrier that includes the vertex stage, and every other pass keeps the light one (the log names each such target once).
+
+Checked on the Galaxy S24 Ultra imitating the Mali driver: the picture is the same with light and full barriers (screenshots of the same moment compared), and light barriers stay on for the whole run. The GPU's idle time between passes went from 20.5 to 16.0 ms in the measured frame, but fps stayed the same (41-44), since the S24 imitation is limited by the render thread and Adreno does not stall at barriers the way Mali does. The gain on Mali itself is not measured yet.
+
+New setting **Pass barriers** (launcher, Graphics; `pass_barriers = auto | light | full` in graphics.ini): Auto = Light on Mali, Full elsewhere. Full is the old behaviour, to try if the picture shows glitches. It takes effect when the game starts. `SMO_VK_SPLIT_BARRIER=0/1` overrides it.
+
+The per-pass GPU times of 0.3.3 stay in the log, so the next log shows how much of the gap is gone.
+
+## Beta 0.3.3 (test build, not released)
+
+A second diagnostic build for Mali phones: the same game as 0.3.2.
+
+**Why:** the Mali tester's 0.3.2 log showed the GPU as the main limit, busy 16-20 ms per frame. Most of it is fixed: 719 draws took 16.1 ms and 1528 draws 19.9 ms, with the 3D view at 640x360. A frame has 49-55 render passes, and the log could not say which of them cost the time.
+
+**New in the log:** once every 3000 frames (about a minute), the GPU time of every render pass of one frame is measured (`nvn_vk_passtime:` lines): the 15 most expensive passes, the passes grouped by their targets (size and formats) with their total time, and every pass in order with its size, formats, which attachments it loads or clears, its draws and what ended it. The measured frame waits for the GPU once, a short hitch every minute or so. `SMO_VK_PASSTIME=0` turns it off.
+
+Checked on the Galaxy S24 Ultra, Cascade: the samples appear every 3000 frames, and fps is as before (own path 58.9-59.7 fps; Mali imitation 39.5-39.8, 0.3.2 40.8-44.5).
+
+## Beta 0.3.2 (test build, not released)
+
+A diagnostic build for Mali phones: the same game as 0.3.1, with a log that says where each frame's time goes.
+
+**Why:** the Mali tester's 0.3.1 log (Dimensity 8300 / Mali-G615) showed about 27 ms per frame in a heavy area, made of about 18 ms of GPU time, 15 ms on the render thread and 22 ms of "game logic". None of them filled the frame, the log could not say where most of the render thread's time went, and the logic figure turned out to include waiting for the frame before.
+
+**New in the log:**
+- `nvn_vk_rt:` every 300 frames: draws, render passes, pipeline binds and submissions per frame (and how many of them split a pass), the time the GPU was actually busy, and the render thread's time split into the parts of each draw (before it, shader variants, textures, buffers, pass begin, pipeline and state, descriptors, after it), pass ends, command buffer starts, submissions, waiting for the GPU, the rest of the replay and the present.
+- The `perf: per frame` line now shows the GPU's busy time beside its command buffers' summed time (on a tiled GPU the sum can count time twice), the render thread's wait for the GPU, and the game logic's waiting time with the logic's own work per step. "Likely limit" is judged on the parts' own work; when no part fills the frame it says so and names the largest.
+
+Nothing else changed: the same settings, the same CPU boost rule. Checked on the Galaxy S24 Ultra, Cascade: the new lines appear and fps is unchanged (own path with boost on: 59.9 fps, 0.3.1 58.9; Mali imitation: 40.8-44.5 fps, 0.3.1 40.1-42.5). With boost on, the time the logic step spins before a wait counts as waiting (the S24's logic: 2.8-3.7 ms of work a step, 7-9 ms waiting).
+
+## Beta 0.3.1 (test build, not released)
+
+Fixes for GitHub issues 22 and 23, and work aimed at Mali phones.
+
+**The game no longer freezes when a notification comes in (issue 23).** Some phones take the focus away from the game window for a pop-up notification, the notification shade, a floating window or the assistant, while the game is still on screen. The port treated that like the HOME menu and suspended the game until the focus came back: issue 22's log shows freezes of 60 ms to 1.2 s. Now the game keeps running as long as its window is shown; only leaving the app suspends it. Checked on the Galaxy S24 Ultra by pulling the notification shade down during play. `SMO_FOCUS_STRICT=1` brings back the old behaviour.
+
+**Mali: command memory is no longer freed and allocated about 10 times a frame.** Since 0.2.5, on Arm's driver every command pool gave its memory back at each reset (against a slow memory growth), and since 0.2.15 a frame has about 10 submissions (the tester's logs: 8.6-10.7). Now each pool gives it back every 64th reset (about every 100 frames), which still keeps the growth bounded. Galaxy S24 Ultra imitating the tester's driver (no push descriptors, no dynamic vertex input, no extended dynamic state 3, memory given back at each reset), Cascade, GPU at 231 MHz: **28.6-29.9 fps before, 40.1-42.5 fps now**, render thread 20 ms a frame before, 17 ms now. Not run on a Mali phone yet (the cost on Arm's own driver may differ). `SMO_VK_CB_RELEASE_EVERY=<n>` sets the interval (1 = every reset).
+- Also tried in the same setup, and kept as they were: submitting later when the GPU runs out of work (40 draws between passes, 200 in a pass: 35.5-36.7 fps) and 0.2.14's fixed counts (35.7-38.2 fps). `SMO_VK_STARVE=<between>,<in a pass>` sets the counts for tests.
+
+**Less heat when the GPU is the limit (issue 23).** CPU boost keeps the frame's threads spinning so the CPU clocks stay up. When the GPU is what the frame waits for (its own time per frame, from the GPU timestamps, at least 85% of the frame), that spinning only heats the phone and takes thermal room from the GPU. Now boost pauses in every second where the GPU is the limit and starts again when it is not, for both Auto and Always. The log says when (`CPU boost paused, the GPU is the limit`). `SMO_BOOST_GPU_CHECK=0` turns the check off.
+
+**A cheaper last pass, the one that draws the picture to the screen (issue 22).** A Mali-G57 MC2 spent about 12 ms a frame in the menus, even at 25% resolution scale, where almost nothing else is drawn. That pass runs at the screen's full size whatever the game's resolution.
+- **New "Output size" setting** (launcher, Graphics > Quality; `output_size` in graphics.ini): Game's size hands the picture to the screen at the game's own size (at least 720 lines) and the phone's display hardware enlarges it at no GPU cost. On a 2400 x 1080 screen that is 1600 x 720 for handheld (56% fewer pixels) and 2000 x 900 for docked. The touch controls look a little softer. **Auto (the default) uses it on phones without a Snapdragon GPU when the upscaler is Bilinear;** Snapdragon phones and the other upscalers keep the full screen. S24 Ultra, docked, the pass at 231 MHz: 0.85 ms at full size, 0.62 ms at the game's size (900 x 1950).
+- **The pass's shader carries only what the frame uses:** FXAA, sharpening, supersampling and the fps text are now specialisation constants, so the driver drops the code a frame cannot reach. S24 Ultra with FXAA and sharpening off, same GPU clock: 1.09 ms before, 0.84 ms now; with both on, the same within the noise of one frame. GPUs with fewer registers per thread, like Mali, should gain more. `SMO_PP_LEAN=0` brings back 0.3's shader.
+- Measured on the S24 Ultra: the touch controls are about a quarter of this pass (0.63 ms with them, about 0.48 ms without at the same clock).
+
+**Issue 22's picture.** The very blocky picture in issue 22 comes from its resolution scale, set to 25% (400 x 225 for docked). That is the setting working as asked. A 50-75% scale with the GSR or FSR upscaler looks much better for a similar cost; on that phone (Helio G99, Mali-G57 MC2) the last pass was the larger cost anyway, which Output size now cuts.
+
+**Test switches:** `SMO_TOUCH_SHOW=0/1` hides or shows the touch controls without changing controls.ini; `SMO_OUTPUT=1/2` forces full or game output size.
+
 ## Beta 0.3
 
 The third public release. This entry lists everything added and fixed since 0.2. The test build entries below (0.2.1 to 0.2.15) have the measurements and the details of each change.

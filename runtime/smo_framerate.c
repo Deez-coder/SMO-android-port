@@ -29,18 +29,39 @@ static int g_twice = -1, g_steady_env = -2;
 static int64_t g_calcs, g_frames, g_steps, g_multi[STEADY_MAX + 1], g_calc_ticks;
 static int64_t g_last;
 static int64_t g_calc_total;                     /* 0.3: every logic step's time since the start (smo_framerate_totals) */
+/* 0.3.2: the part of the logic steps' time the calc thread spent blocked (a guest event, condition variable, semaphore, message
+ * queue or mutex in os_threads.c; a wait for the render thread in nvn_gl.c). The tester's log (Mali-G615) had "game logic" at
+ * 21-25 ms a frame and the wait for the frame before at 13-17: the step waits for the drawing, so its own work was far less. */
+_Thread_local int smo_t_in_calc;
+static volatile int64_t g_calc_wait_ns;
+void smo_calc_wait_add(int64_t ns) { if (ns > 0) __atomic_fetch_add(&g_calc_wait_ns, ns, __ATOMIC_RELAXED); }
+/* 0.3.13: the same waits by kind, printed with the 1800-frame line: 0 nn::os objects (events, condition variables, semaphores,
+ * message queues, mutexes: os_threads.c; nn_waitmap lines name them), 1 a synchronous job of the render thread (nvn_gl.c gl_run),
+ * 2 the present (nvn_gl.c, a free window texture), 3 spinning before blocking (os_threads.c). The tester's 0.3.8 log: the logic
+ * waited ~25 ms of a ~36 ms frame, and nothing said on what. */
+static volatile int64_t g_calc_wait_k[4];
+void smo_calc_wait_add_k(int kind, int64_t ns) { if (ns > 0) { __atomic_fetch_add(&g_calc_wait_ns, ns, __ATOMIC_RELAXED); __atomic_fetch_add(&g_calc_wait_k[kind & 3], ns, __ATOMIC_RELAXED); } }
+double smo_framerate_wait_ms(void) { return (double)__atomic_load_n(&g_calc_wait_ns, __ATOMIC_RELAXED) / 1e6; }
 static double g_acc;
+/* 0.3.11: the logic steps of the frame being drawn (set before its calcs; procDraw_, and so StageScene::drawMain, runs after them on
+ * this thread). smo_camera.c keeps it with the frame's camera: frame generation extrapolates one step, the camera motion over
+ * this frame divided by its steps (nvn_vk_motion.c). */
+volatile int smo_frame_steps = 1;
 
 static int steady_on(void) {
     if (g_steady_env == -2) { const char *e = getenv("SMO_STEADY"); g_steady_env = e ? atoi(e) != 0 : -1; }
-    return g_steady_env >= 0 ? g_steady_env : gfx_options()->steady;
+    if (g_steady_env >= 0) return g_steady_env;
+    if (gfx_framegen_on()) return 1;               /* 0.3.12: frame generation runs the game at 30 (display.c): it keeps its speed */
+    return gfx_options()->steady;
 }
 
 static void calc_once(Ctx *c, uint64_t self, uint64_t ret, int first) {
     if (!first) { c->x[0] = self; c->x[30] = ret; }
     plat_li t0, t1;
     t0.QuadPart = plat_qpc();
+    smo_t_in_calc = 1;
     __real_f_4000731fdc(c);
+    smo_t_in_calc = 0;
     t1.QuadPart = plat_qpc();
     g_calc_ticks += t1.QuadPart - t0.QuadPart;
     g_calc_total += t1.QuadPart - t0.QuadPart;
@@ -70,6 +91,7 @@ void __wrap_f_4000731fdc(Ctx *c) {
         if (g_acc < -0.5) g_acc = -0.5;                         /* above 60 fps: one step a frame, not owed later */
     } else g_acc = 0.0;
     g_last = now.QuadPart;
+    smo_frame_steps = n;
     int64_t c0 = g_calc_ticks;
     for (int i = 0; i < n; i++) calc_once(c, self, ret, i == 0);
     int64_t cd = g_calc_ticks - c0;
@@ -96,6 +118,9 @@ void __wrap_f_4000731fdc(Ctx *c) {
                (long long)(g_frames - 1800), (long long)g_frames, (double)g_steps / 1800.0, (long long)g_multi[1], (long long)g_multi[2], (long long)g_multi[3],
                g_steps ? (double)g_calc_ticks * 1000.0 / (double)fq.QuadPart / (double)g_steps : 0.0, g_twice ? " (frame_rate = 30)" : steady_on() ? " (steady_speed on)" : "");
         fflush(stdout);
+        {   int64_t k[4]; for (int i = 0; i < 4; i++) k[i] = __atomic_exchange_n(&g_calc_wait_k[i], 0, __ATOMIC_RELAXED);
+            printf("smo_framerate: the logic's waiting in those frames, per frame: nn::os objects %.2f ms, render thread jobs %.2f ms, the present %.2f ms, spinning %.2f ms\n",
+                   (double)k[0] / 1e6 / 1800.0, (double)k[1] / 1e6 / 1800.0, (double)k[2] / 1e6 / 1800.0, (double)k[3] / 1e6 / 1800.0); }
         g_steps = 0; g_calc_ticks = 0; g_multi[1] = g_multi[2] = g_multi[3] = 0;
     }
 }

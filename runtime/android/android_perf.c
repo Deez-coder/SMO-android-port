@@ -36,6 +36,18 @@ static int (*p_set_threads)(APerformanceHintSession *, const pid_t *, size_t);  
 static void (*p_close)(APerformanceHintSession *);
 static int (*p_prefer_efficiency)(APerformanceHintSession *, int);                       /* Android 15+ */
 static int (*p_workload_increase)(APerformanceHintSession *, int, int, const char *);   /* Android 16+ */
+/* 0.3.6: the frame's GPU time to the hint session (Android 15+: reportActualWorkDuration2 with an AWorkDuration). The idea is from
+ * nx2android (perf_android.c, MIT): a GPU whose governor sees slack lowers its clock until the work fills the frame, so the
+ * GPU time measured says little; a system that takes the GPU time can raise the GPU's clock with the CPUs'. Whether a
+ * phone's power HAL uses it is up to the phone. SMO_PERF_GPU=0: the total only, as before. */
+typedef struct AWorkDuration AWorkDuration;
+static int (*p_report2)(APerformanceHintSession *, AWorkDuration *);
+static AWorkDuration *(*p_wd_create)(void);
+static void (*p_wd_start)(AWorkDuration *, int64_t), (*p_wd_total)(AWorkDuration *, int64_t), (*p_wd_cpu)(AWorkDuration *, int64_t), (*p_wd_gpu)(AWorkDuration *, int64_t);
+static int (*p_update_target)(APerformanceHintSession *, int64_t);                       /* Android 13+ */
+static AWorkDuration *g_wd;
+int64_t nvn_vk_gpu_busy_ns(void);                  /* nvn_vk_draw.c */
+void android_window_rate(float fps);                /* android_main.c */
 
 #define PERF_MAX_TIDS 64
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -59,13 +71,26 @@ static int perf_on(void) {
         p_close = (void (*)(APerformanceHintSession *))dlsym(lib, "APerformanceHint_closeSession");
         p_prefer_efficiency = (int (*)(APerformanceHintSession *, int))dlsym(lib, "APerformanceHint_setPreferPowerEfficiency");
         p_workload_increase = (int (*)(APerformanceHintSession *, int, int, const char *))dlsym(lib, "APerformanceHint_notifyWorkloadIncrease");
+        p_update_target = (int (*)(APerformanceHintSession *, int64_t))dlsym(lib, "APerformanceHint_updateTargetWorkDuration");
+        {   const char *g = getenv("SMO_PERF_GPU");
+            if (!(g && !atoi(g))) {
+                p_report2 = (int (*)(APerformanceHintSession *, AWorkDuration *))dlsym(lib, "APerformanceHint_reportActualWorkDuration2");
+                p_wd_create = (AWorkDuration *(*)(void))dlsym(lib, "AWorkDuration_create");
+                p_wd_start = (void (*)(AWorkDuration *, int64_t))dlsym(lib, "AWorkDuration_setWorkPeriodStartTimestampNanos");
+                p_wd_total = (void (*)(AWorkDuration *, int64_t))dlsym(lib, "AWorkDuration_setActualTotalDurationNanos");
+                p_wd_cpu = (void (*)(AWorkDuration *, int64_t))dlsym(lib, "AWorkDuration_setActualCpuDurationNanos");
+                p_wd_gpu = (void (*)(AWorkDuration *, int64_t))dlsym(lib, "AWorkDuration_setActualGpuDurationNanos");
+                if (p_report2 && p_wd_create && p_wd_start && p_wd_total && p_wd_cpu && p_wd_gpu) g_wd = p_wd_create();
+            }
+        }
     }
     if ((e = getenv("SMO_PERF_TARGET_US")) && atoll(e) > 0) g_target_ns = atoll(e) * 1000;
     g_boost = (e = getenv("SMO_PERF_BOOST")) && atoi(e);
     g_state = p_get_manager && p_create && p_report && p_close;
     printf("android_perf: performance hints %s\n", g_state ? "available (APerformanceHint): the game's threads get the clocks a 60 fps frame needs" : "not on this system (Android 13+ has them)");
-    if (g_state) printf("android_perf: target %.2f ms, SMO_PERF_BOOST %s (power-efficiency call %s, workload-rise call %s)\n", g_target_ns / 1e6,
-                        g_boost ? "on" : "off", p_prefer_efficiency ? "there" : "missing", p_workload_increase ? "there" : "missing");
+    if (g_state) printf("android_perf: target %.2f ms, SMO_PERF_BOOST %s (power-efficiency call %s, workload-rise call %s, GPU time reports %s)\n", g_target_ns / 1e6,
+                        g_boost ? "on" : "off", p_prefer_efficiency ? "there" : "missing", p_workload_increase ? "there" : "missing",
+                        g_wd ? "there" : (getenv("SMO_PERF_GPU") && !atoi(getenv("SMO_PERF_GPU")) ? "off (SMO_PERF_GPU=0)" : "missing (Android 15+)"));
     return g_state;
 }
 
@@ -105,11 +130,12 @@ static void spin_start(void) {
 
 /* 0.3: what a frame's time went to, from the running totals of the renderer (nvn_vk_draw.c nvn_vk_totals) and of the game's
  * logic (smo_framerate.c); the perf and hitch lines take differences of two snapshots. */
-void nvn_vk_totals(double t[9]);
+void nvn_vk_totals(double t[10]);
 void smo_framerate_totals(double *logic_ms, int64_t *steps);
 void smo_render_size(unsigned *w, unsigned *h, unsigned *asked_w);
-typedef struct { double t[9], logic; int64_t steps; } Totals;
-static void totals_now(Totals *x) { nvn_vk_totals(x->t); smo_framerate_totals(&x->logic, &x->steps); }
+typedef struct { double t[10], logic, wait; int64_t steps; } Totals;
+double smo_framerate_wait_ms(void);
+static void totals_now(Totals *x) { nvn_vk_totals(x->t); smo_framerate_totals(&x->logic, &x->steps); x->wait = smo_framerate_wait_ms(); }
 
 /* The GPU's clock, where the system lets an app read it: Adreno (kgsl), MediaTek's GED (Mali on Dimensity), a devfreq node
  * of the GPU (Exynos, Tensor, others). Many phones refuse all of them (SELinux); the first perf line says which one works,
@@ -226,9 +252,17 @@ static void perf_line(int64_t dt) {
         if (hr >= 0.0f && hr == hr) h += (size_t)snprintf(heat + h, sizeof heat - h, ", headroom %.2f", hr);
         if (bt > -1000) snprintf(heat + h, sizeof heat - h, ", battery %.1f C", bt / 10.0);
     }
-    printf("perf: %.1f fps, 1%% low %.1f, worst frame %.1f ms over %d frames (%s, scale %s); CPU MHz %s; thermal %s%s%s%c",
+    char fgs[112];                                     /* 0.4: frame generation (mode, Auto's decision, quality, objects drawn again) */
+    {   int fm = o->framegen, fon = gfx_framegen_on();
+        int nvn_vk_fg_objects(int *cap);
+        int cap = 0, taken = nvn_vk_fg_objects(&cap);
+        if (!fon) snprintf(fgs, sizeof fgs, "; frame generation %s", fm == 2 ? "auto (off now)" : "off");
+        else if (gfx_framegen_fast()) snprintf(fgs, sizeof fgs, "; frame generation %s, quality fast", fm == 2 ? "auto (on now)" : "on");
+        else snprintf(fgs, sizeof fgs, "; frame generation %s, quality high, %d objects drawn again (at most %d)", fm == 2 ? "auto (on now)" : "on", taken, cap > 64 ? 64 : cap);
+    }
+    printf("perf: %.1f fps, 1%% low %.1f, worst frame %.1f ms over %d frames (%s, scale %s); CPU MHz %s; thermal %s%s%s%s%c",
            nf * 1000.0 / sum, 1000.0 * slow / slow_sum, worst, nf, mode, scale, at ? cpu : "unknown",
-           ts >= 0 && ts <= 6 ? k_thermal[ts] : "unknown", heat, gpu, 10);
+           ts >= 0 && ts <= 6 ? k_thermal[ts] : "unknown", heat, gpu, fgs, 10);
     /* 0.3: where the frames' time went in these 10 s, per frame. The game's logic and the render thread run side by side, and the
      * GPU after them, so a frame takes about the longest of the three; the one close to the frame's time is the limit. */
     {   static Totals prev;
@@ -241,22 +275,40 @@ static void perf_line(int64_t dt) {
             double render = (cur.t[0] - prev.t[0] + cur.t[1] - prev.t[1]) / n, pipes = (cur.t[2] - prev.t[2] + cur.t[3] - prev.t[3]) / n;
             double holds = (cur.t[7] - prev.t[7]) / n, gpu_n = cur.t[6] - prev.t[6], gpu_ms = gpu_n > 0 ? (cur.t[5] - prev.t[5]) / n : -1.0;
             long long nholds = (long long)(cur.t[8] - prev.t[8]);
+            /* 0.3.2: each part's own work, without its waits: the logic step without its blocking waits (smo_framerate.c), the render
+             * thread without its waits for the GPU, and the GPU's busy time (the union of its command buffers' spans; their sum
+             * can count time twice on a tiled GPU). The tester's 0.3.1 log said "the game's logic" where the step was waiting for
+             * the drawing. */
+            double lwait = (cur.wait - prev.wait) / n, logic_work = logic - lwait;
+            double rwait = (cur.t[4] - prev.t[4]) / n, render_work = render - rwait;
+            double busy = gpu_n > 0 ? (cur.t[9] - prev.t[9]) / n : -1.0, gpu_work = busy >= 0 ? busy : gpu_ms;
+            if (logic_work < 0) logic_work = 0;
+            if (render_work < 0) render_work = 0;
             const char *limit = "mixed (no one part fills the frame)";
             double cap_ms = o->fps30 ? 33.333 : o->fps_cap ? 1000.0 / o->fps_cap : 16.667;
+            char mixed[96];
             if (frame <= cap_ms * 1.05) limit = o->fps30 || o->fps_cap ? "the fps cap (frames on time)" : "60 fps (frames on time)";
-            else if (gpu_ms >= 0 && gpu_ms >= frame * 0.8) limit = "the GPU";
+            else if (gpu_work >= 0 && gpu_work >= frame * 0.8) limit = "the GPU";
             else if (holds >= frame * 0.3) limit = "shaders being prepared (holds)";
-            else if (logic >= frame * 0.8) limit = "the game's logic (CPU)";
-            else if (render >= frame * 0.8) limit = "the render thread (CPU)";
+            else if (logic_work >= frame * 0.8) limit = "the game's logic (CPU)";
+            else if (render_work >= frame * 0.8) limit = "the render thread (CPU)";
+            else {                                     /* no part fills the frame: they wait for each other; the largest is named */
+                const char *big = "the GPU"; double bv = gpu_work;
+                if (render_work > bv) { big = "the render thread"; bv = render_work; }
+                if (logic_work > bv) { big = "the game's logic"; bv = logic_work; }
+                snprintf(mixed, sizeof mixed, "mixed: the parts wait for each other (largest: %s, %.0f%% of the frame)", big, frame > 0 ? 100.0 * bv / frame : 0.0);
+                limit = mixed;
+            }
             unsigned rw, rh, aw;
             smo_render_size(&rw, &rh, &aw);
             char size[64];                             /* no 3D view yet: the menus before the game */
             if (rw) snprintf(size, sizeof size, "3D %ux%u%s", rw, rh, aw && rw < aw ? " (the game lowered it)" : "");
             else snprintf(size, sizeof size, "no 3D view yet");
-            char gpus[32];
-            if (gpu_ms >= 0) snprintf(gpus, sizeof gpus, "%.1f", gpu_ms); else snprintf(gpus, sizeof gpus, "unknown");
-            printf("perf: per frame %.1f ms: GPU %s, render thread %.1f (making pipelines and shader stages %.1f; %lld holds, %.0f ms in all), game logic %.1f (%.2f steps of %.1f) | likely limit: %s | %s, %s, steady speed %s, %d frames over 50 ms%c",
-                   frame, gpus, render, pipes, nholds, holds * n, logic, steps, steps > 0 ? logic / steps : 0.0, limit,
+            char gpus[64];
+            if (gpu_ms >= 0 && busy >= 0) snprintf(gpus, sizeof gpus, "busy %.1f (command buffers %.1f)", busy, gpu_ms);
+            else if (gpu_ms >= 0) snprintf(gpus, sizeof gpus, "%.1f", gpu_ms); else snprintf(gpus, sizeof gpus, "unknown");
+            printf("perf: per frame %.1f ms: GPU %s, render thread %.1f (waiting for the GPU %.1f; making pipelines and shader stages %.1f; %lld holds, %.0f ms in all), game logic %.1f (waiting %.1f; %.2f steps of %.1f working) | likely limit: %s | %s, %s, steady speed %s, %d frames over 50 ms%c",
+                   frame, gpus, render, rwait, pipes, nholds, holds * n, logic, lwait, steps, steps > 0 ? logic_work / steps : 0.0, limit,
                    o->handheld ? "handheld" : "docked", size, o->steady ? "on" : "off", g_slow_frames, 10);
         }
         prev = cur; have_prev = 1;
@@ -332,8 +384,26 @@ static void spin_test_poll(void) {
 #define BOOST_SPIN_NS   16000000
 #define BOOST_HOLD_NS   10000000000LL
 #define BOOST_HOLD_MAX  120000000000LL
+/* 0.3.1 (issue 23, heat on Mali): spinning only helps when the CPU side is what the frame waits for. When the GPU is the
+ * limit (its own time per frame, from the GPU timestamps, at least 85% of the frame), the spinning threads wait for the GPU
+ * at full clock: heat and battery for nothing, and on a phone the CPU's heat lowers the GPU's clock too. So in a one-second
+ * window where the GPU is the limit, the spin stops (boost = auto and boost = on alike) and starts again once it is not.
+ * Without GPU times (SMO_VK_GPUTIME=0, or a GPU without timestamps) nothing changes.
+ * 0.4: OFF by default (the user: boost does what the player set, no pause of its own; the launcher's note under CPU boost says
+ * it may not be worth it where it gains little). SMO_BOOST_GPU_CHECK=1 turns the pause on again. */
+static int boost_gpu_bound(int64_t win_ns, int win_n) {
+    static int check = -1;
+    static double gpu0, n0;
+    if (check < 0) { const char *e = getenv("SMO_BOOST_GPU_CHECK"); check = e && atoi(e) != 0; }
+    double t[10];
+    nvn_vk_totals(t);
+    double gpu = t[5] - gpu0, n = t[6] - n0;
+    gpu0 = t[5]; n0 = t[6];
+    if (!check || n <= 0 || win_n <= 0) return 0;
+    return gpu / win_n >= 0.85 * (win_ns / 1e6) / win_n;
+}
 static void boost_frame(int64_t now, int64_t dt) {
-    static int mode = -1, on, slow_run;
+    static int mode = -1, on, slow_run, gpu_run, gpu_off;
     static int64_t target, win_sum, win_start, hold = BOOST_HOLD_NS, until, off_at;
     static int win_n;
     if (mode < 0) {
@@ -344,25 +414,32 @@ static void boost_frame(int64_t now, int64_t dt) {
         printf("android_perf: CPU boost %s%c", mode == 2 ? "on (graphics.ini boost = on: the frame's threads always spin)" : mode ? "auto (the frame's threads spin while the frames are late)" : "off", 10);
         if (mode) plat_spinhot_set_ns(mode == 2 ? BOOST_SPIN_NS : 0);
     }
-    if (mode != 1 || dt <= 0 || dt > 100000000) return;
+    if (!mode || dt <= 0 || dt > 100000000) return;
     if (!win_n) win_start = now;
     win_sum += dt;
     win_n++;
     if (now - win_start < 1000000000) return;
     int slow = win_sum > (int64_t)win_n * target / 100 * 105;
     double fps = win_n * 1e9 / (double)win_sum;
+    int gpu_bound = boost_gpu_bound(win_sum, win_n);
     win_sum = 0;
     win_n = 0;
+    gpu_run = gpu_bound ? gpu_run + 1 : 0;
+    if (mode == 2) {                                   /* always on, but not while the GPU is the limit */
+        if (!gpu_off && gpu_run >= 2) { gpu_off = 1; plat_spinhot_set_ns(0); printf("android_perf: CPU boost paused, the GPU is the limit (%.1f fps)%c", fps, 10); }
+        else if (gpu_off && !gpu_bound) { gpu_off = 0; plat_spinhot_set_ns(BOOST_SPIN_NS); printf("android_perf: CPU boost on again, the GPU is not the limit (%.1f fps)%c", fps, 10); }
+        return;
+    }
     if (on) {
-        if (now < until) return;
+        if (now < until && gpu_run < 2) return;
         on = 0;
         slow_run = 0;
         off_at = now;
         plat_spinhot_set_ns(0);
-        printf("android_perf: CPU boost off, %.1f fps with it (a look whether the frames keep up without)%c", fps, 10);
+        printf("android_perf: CPU boost off, %.1f fps with it (%s)%c", fps, gpu_run >= 2 ? "the GPU is the limit" : "a look whether the frames keep up without", 10);
         return;
     }
-    slow_run = slow ? slow_run + 1 : 0;
+    slow_run = slow && !gpu_bound ? slow_run + 1 : 0;
     if (slow_run < 2) return;
     hold = off_at && now - off_at < 8000000000LL ? (hold * 2 > BOOST_HOLD_MAX ? BOOST_HOLD_MAX : hold * 2) : BOOST_HOLD_NS;
     on = 1;
@@ -385,6 +462,25 @@ void android_perf_frame(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     int64_t now = (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec, dt = last_ns ? now - last_ns : 0;
     last_ns = now;
+    {   /* 0.3.6: the window's rate and the hints' target follow fps_cap (android_main.c android_window_rate). 0.3.12: with frame
+         * generation on, 60 Hz and the real frames' 30 (a real and a made frame by turns, FIFO), whatever the FPS limit says */
+        static int last_cap = -1;
+        int fg = gfx_framegen_on();
+        int cap = fg ? 30 : gfx_options()->fps30 ? 30 : gfx_options()->fps_cap;
+        if (cap + (fg ? 1000 : 0) != last_cap) {
+            last_cap = cap + (fg ? 1000 : 0);
+            android_window_rate(fg ? 60.0f : cap > 0 && 60 % cap ? (float)cap : 60.0f);
+            int64_t t = cap > 0 ? 1000000000LL / cap : 16666667;
+            const char *e = getenv("SMO_PERF_TARGET_US");
+            if (!(e && atoll(e) > 0) && t != g_target_ns) {
+                g_target_ns = t;
+                pthread_mutex_lock(&g_lock);
+                if (g_session && p_update_target) p_update_target(g_session, t);
+                pthread_mutex_unlock(&g_lock);
+                printf("android_perf: hint target %.2f ms (fps_cap %d)%c", t / 1e6, cap, 10);
+            }
+        }
+    }
     hitch_check(dt);
     perf_line(dt);
     boost_frame(now, dt);
@@ -410,6 +506,17 @@ void android_perf_frame(void) {
     }
     APerformanceHintSession *s = g_session;
     pthread_mutex_unlock(&g_lock);
-    if (s && dt > 0) p_report(s, dt > 100000000 ? 100000000 : dt);      /* at most 100 ms: a loading pause is no frame */
+    static int64_t gpu_last;                       /* 0.3.6: the GPU's busy time since the last report */
+    int64_t gpu_now = nvn_vk_gpu_busy_ns(), gpu = gpu_last && gpu_now > gpu_last ? gpu_now - gpu_last : 0;
+    gpu_last = gpu_now;
+    if (s && dt > 0) {
+        int64_t w = dt > 100000000 ? 100000000 : dt;      /* at most 100 ms: a loading pause is no frame */
+        if (gpu > w) gpu = w;
+        int r = -1;
+        if (g_wd && gpu > 0) { p_wd_start(g_wd, now - w); p_wd_total(g_wd, w); p_wd_cpu(g_wd, w); p_wd_gpu(g_wd, gpu); r = p_report2(s, g_wd); }
+        if (r != 0) p_report(s, w);
+        static int said;
+        if (g_wd && gpu > 0 && !said++) printf("android_perf: the frames' GPU time goes to the hint session too (%s)%c", r ? "REFUSED: the total only" : "taken", 10);
+    }
     if (s && g_boost && p_workload_increase) p_workload_increase(s, 1, 0, "frame");
 }

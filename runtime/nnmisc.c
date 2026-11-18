@@ -296,9 +296,16 @@ static void oe_window_state(int *ours, int *minimised) {
     if (*ours) { g_oe_was_foreground = 1; g_oe_window = fg; }
     *minimised = g_oe_window && IsIconic(g_oe_window);
 #else
-    *ours = plat_window_focused();
-    if (*ours) g_oe_was_foreground = 1;
+    /* 0.3.1 (issue 23, "lag when a notification comes"): Android takes the window's focus away for a notification some phones
+     * show over the game, the notification shade, a floating window or the assistant, with the game still on screen. That
+     * counted as "obscured", and in the game's focus handling mode it suspended the game until the focus came back: logs show
+     * freezes of 60-1200 ms. A window that is still shown now counts as in focus; only a window that is gone or not visible
+     * (the app in the background) suspends. SMO_FOCUS_STRICT=1: as before. */
+    static int strict = -1;
+    if (strict < 0) strict = getenv("SMO_FOCUS_STRICT") && atoi(getenv("SMO_FOCUS_STRICT"));
     *minimised = plat_window_minimized(NULL);
+    *ours = plat_window_focused() || (!strict && !*minimised);
+    if (*ours) g_oe_was_foreground = 1;
 #endif
 }
 static uint32_t  oe_watch(void * unused) {

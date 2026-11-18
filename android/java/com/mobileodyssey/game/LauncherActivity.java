@@ -276,8 +276,21 @@ public class LauncherActivity extends Activity {
         fpsWarn.setPadding(0, dp(2), 0, dp(6));
         c.addView(fpsWarn);
         fpsWarnUpdate(g);
+        c.addView(choice(g, "frame_generation", "Frame generation", new String[]{"off", "on", "auto"}, new String[]{"Off", "On", "Auto"}, "off",
+                "Makes one extra frame after each real one from the camera's and the characters' motion, so 30 real frames a second show as 60. "
+                + "Looks smoother but still answers like 30. While it is on the game runs at up to half your screen's refresh, at its normal speed. "
+                + "Auto: on only while your phone cannot hold 60 but can keep up with it, off again when it cannot. Can also be switched in the in-game menu."));
+        c.addView(choice(g, "frame_generation_quality", "Frame generation quality", new String[]{"high", "fast"}, new String[]{"High", "Fast"}, "high",
+                "Fast: for slower GPUs. Made frames follow only the camera, so characters and moving objects look like 30 in them."));
         c.addView(choice(g, "boost", "CPU boost", new String[]{"auto", "on", "off"}, new String[]{"Auto", "Always", "Off"}, "on",
-                "Keeps the phone's CPU clocks up so heavy scenes hold the frame rate. Auto: only while frames are late. Always: everywhere, warmer."));
+                "Keeps the phone's CPU clocks up so heavy scenes hold the frame rate. Always: the most fps, the warmest, the most battery. "
+                + "Auto: only while frames are late. Off: cooler and longer battery life, fewer fps in heavy scenes."));
+        if (!"off".equalsIgnoreCase(g.get("boost", "on"))) {      /* 0.4: the warning while boost is on (the page is built again at each choice) */
+            TextView bw = text("⚠ CPU boost raises the frame rate, but your phone gets warmer and the battery drains faster while it is on. "
+                    + "If it does not give you a noticeable boost on your phone, it might not be worth turning on.", 12, WARN, true);
+            bw.setPadding(0, dp(2), 0, dp(6));
+            c.addView(bw);
+        }
         c.addView(choice(g, "shader_wait", "New shaders", new String[]{"hold", "skip"}, new String[]{"Wait", "Skip until ready"}, "hold",
                 "Skip avoids a stutter the first time an effect appears; the effect is missing for a moment instead."));
         c.addView(choice(g, "diagnostics", "Diagnostics", new String[]{"off", "on"}, new String[]{"Off", "On"}, "off",
@@ -312,6 +325,16 @@ public class LauncherActivity extends Activity {
                 + "and a little even at 100% on most phones). All four work on any GPU. Bilinear: soft. Bicubic: a little sharper. "
                 + "FSR 1 and GSR: sharp edges, so a lower scale looks closer to full; GSR is the cheaper of the two. "
                 + "Bicubic, FSR and GSR replace FXAA where they enlarge."));
+        q.addView(choice(g, "output_size", "Output size", new String[]{"auto", "full", "game"},
+                new String[]{"Auto", "Full screen", "Game's size"}, "auto",
+                "Game's size: the picture goes to the screen at the game's own size and your phone's display hardware enlarges it, "
+                + "which saves GPU time and heat (most on Mali phones). The touch controls look a little softer. "
+                + "Auto: Game's size on non-Snapdragon phones with the Bilinear upscaler, Full screen otherwise."));
+        q.addView(choice(g, "pass_barriers", "Pass barriers", new String[]{"auto", "light", "full"},
+                new String[]{"Auto", "Light", "Full"}, "auto",
+                "How the GPU waits between the steps of drawing a frame. Light: each step waits only for what it uses, so the GPU "
+                + "keeps busy (much faster on Mali phones). Full: each step waits for everything before it (the safest; try it if "
+                + "the picture shows glitches). Auto: Light on Mali, Full on other GPUs. Takes effect when the game starts."));
         q.addView(slider(g, "sharpening", "Sharpening (Bilinear, Bicubic)", 0, 100, 5, 75, "%", 1f,
                 "Contrast-adaptive: brings back fine detail (useful with FXAA or a high resolution scale) without hardening edges. 0 = off. "
                 + "FSR and GSR use their own sharpening below instead."));
@@ -868,7 +891,7 @@ public class LauncherActivity extends Activity {
     void fpsWarnUpdate(Ini g) {
         if (fpsWarn == null || !g.file.getName().equals("graphics.ini")) return;
         float cap = parse(g.get("fps_cap", "60"), 60f);
-        boolean st = "on".equalsIgnoreCase(g.get("steady_speed", "off"));
+        boolean st = "on".equalsIgnoreCase(g.get("steady_speed", "off")) || "on".equalsIgnoreCase(g.get("frame_generation", "off"));      /* frame generation keeps the speed itself */
         fpsWarn.setVisibility(cap > 0 && cap < 59.5f && !st ? View.VISIBLE : View.GONE);
     }
 

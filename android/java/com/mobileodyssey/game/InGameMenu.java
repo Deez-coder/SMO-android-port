@@ -225,6 +225,10 @@ class InGameMenu {
         fpsWarn.setPadding(dp(4), dp(2), dp(4), dp(6));
         g.addView(fpsWarn);
         fpsWarnUpdate();
+        g.addView(choice(gfx, "frame_generation", "Frame generation", new String[]{"off", "on", "auto"}, new String[]{"Off", "On", "Auto"}, "off", true));      /* 0.3.12: live (nvn_vk_motion.c fg_update); 0.3.22: auto (fg_auto_tick) */
+        g.addView(choice(gfx, "frame_generation_quality", "Frame generation quality", new String[]{"high", "fast"}, new String[]{"High", "Fast"}, "high", true));      /* 0.3.22: live */
+        g.addView(small("Makes one extra frame after each real one: 60 on screen while the game runs at 30. Looks smoother, still answers like 30. The game keeps its speed by itself. "
+                + "Auto: on only while your phone cannot hold 60 but can keep up with it. Fast: for slower GPUs, characters move at 30 in the made frames."));
         content.addView(g);
 
         LinearLayout f = card();
@@ -287,7 +291,7 @@ class InGameMenu {
     private void fpsWarnUpdate() {
         if (fpsWarn == null) return;
         float cap = LauncherActivity.parse(gfx.get("fps_cap", "60"), 60f);
-        boolean st = "on".equalsIgnoreCase(gfx.get("steady_speed", "off"));
+        boolean st = "on".equalsIgnoreCase(gfx.get("steady_speed", "off")) || "on".equalsIgnoreCase(gfx.get("frame_generation", "off"));      /* frame generation keeps the speed itself */
         fpsWarn.setVisibility(cap > 0 && cap < 59.5f && !st ? View.VISIBLE : View.GONE);
     }
 

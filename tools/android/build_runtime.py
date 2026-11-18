@@ -24,7 +24,7 @@ RT = os.path.join(A.REPO, 'runtime')
 GEN = T.build('gen')
 LIFT = T.build('lift', 'main')
 WINDOWS_ONLY = {'smo_guide.c', 'nnmovie_mf.c', 'nnpad_sdl.c', 'vk_glslang_shim.c', 'vk_shaderc_shim.c', 'gamedll.c', 'game_shim.c',
-                'nvn_vk_draw.c', 'nvn_vk_store.c', 'nvn_vk_m4.c', 'nvn_vk_wd.c'}      # the last four are #included by nvn_vk.c
+                'nvn_vk_draw.c', 'nvn_vk_store.c', 'nvn_vk_m4.c', 'nvn_vk_wd.c', 'nvn_vk_motion.c', 'nvn_vk_objmo.c'}      # the last four are #included by nvn_vk.c
 GEN_SOURCES = ['sdkdata.c', 'sdklift_gen.c']
 # libadrenotools (a custom Vulkan driver such as Mesa Turnip, runtime/android/android_driver.c): its source in
 # ../external/libadrenotools and its arm64 build in build-android there (BUILDING.md); ADRENOTOOLS overrides the folder.
@@ -77,7 +77,7 @@ def main():
     os.makedirs(lib_dir, exist_ok=True)
     clang = A.clang()
     deps = glob.glob(os.path.join(RT, '*.h')) + glob.glob(os.path.join(RT, '*.inc')) + glob.glob(os.path.join(RT, 'android', '*.h')) + \
-        glob.glob(os.path.join(GEN, '*.h')) + [os.path.join(RT, n) for n in ('nvn_vk_draw.c', 'nvn_vk_store.c', 'nvn_vk_m4.c', 'nvn_vk_wd.c')]
+        glob.glob(os.path.join(GEN, '*.h')) + [os.path.join(RT, n) for n in ('nvn_vk_draw.c', 'nvn_vk_store.c', 'nvn_vk_m4.c', 'nvn_vk_wd.c', 'nvn_vk_motion.c', 'nvn_vk_objmo.c')]
     newest = max(os.path.getmtime(d) for d in deps)
     todo, objs = [], []
     for src in sources():
@@ -112,7 +112,7 @@ def main():
     print('libadrenotools: %s' % ('linked (a custom Vulkan driver can be used)' if have_adrenotools(abi) else 'not built: the system Vulkan driver only'))
     cmd = [A.llvm_bin('clang++')] + A.target_flags(abi) + ['-shared', '-o', out, '@' + rsp] + sclibs + \
         ['-static-libstdc++', '-landroid', '-lnativewindow', '-llog', '-laaudio', '-lmediandk', '-lm', '-ldl',
-         '-Wl,-z,max-page-size=16384', '-Wl,-Bsymbolic', '-Wl,--wrap=f_400072e61c', '-Wl,--wrap=f_4000731fdc', '-Wl,--wrap=f_4000a58394', '-Wl,--gc-sections', '-Wl,--no-undefined', '-Wl,-soname,libsmo.so',
+         '-Wl,-z,max-page-size=16384', '-Wl,-Bsymbolic', '-Wl,--wrap=f_400072e61c', '-Wl,--wrap=f_4000731fdc', '-Wl,--wrap=f_4000a58394', '-Wl,--wrap=f_4000a2b794', '-Wl,--wrap=f_4000a2b81c', '-Wl,--wrap=f_4000a2b8e0', '-Wl,--wrap=f_40004ccaf8', '-Wl,--wrap=f_400041dd34', '-Wl,--gc-sections', '-Wl,--no-undefined', '-Wl,-soname,libsmo.so',
          '-u', 'ANativeActivity_onCreate', '-Wl,--Map=' + out + '.map']
     t1 = time.time()
     r = subprocess.run(cmd, capture_output=True, text=True)

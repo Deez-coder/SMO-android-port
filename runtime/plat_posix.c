@@ -362,6 +362,7 @@ plat_event *plat_event_create(int manual_reset, int initial) {
 void plat_event_set(plat_event *e) {
     pthread_mutex_lock(&e->m);
     e->set = 1;
+    plat_spin_wake();
     if (e->manual) pthread_cond_broadcast(&e->c);
     else pthread_cond_signal(&e->c);
     pthread_mutex_unlock(&e->m);
@@ -373,6 +374,7 @@ void plat_event_reset(plat_event *e) {
     pthread_mutex_unlock(&e->m);
 }
 
+int plat_spin_pause_ = -1;                             /* plat.h: how a spinning thread waits (0.3.22) */
 int plat_spin_yield_ = -1;                             /* plat.h: spinning gives way (0.2.15) */
 _Thread_local int plat_spin_hot_;                     /* plat.h: spinning before blocking */
 int64_t plat_spinhot_ns_ = -1;                        /* plat.h: the hot threads' spin; -1 until SMO_SPINHOT_US is read */

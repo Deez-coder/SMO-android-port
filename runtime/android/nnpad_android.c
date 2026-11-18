@@ -99,6 +99,9 @@ static float dist_h(float ax, float ay, float bx, float by) {            /* dist
 }
 static int touch_visible(int64_t now) {              /* auto: hidden from a controller's input until the next touch */
     (void)now;
+    static int env = -2;                              /* 0.3.1, tests: SMO_TOUCH_SHOW=0 hides them, 1 shows them (controls.ini untouched) */
+    if (env == -2) env = getenv("SMO_TOUCH_SHOW") ? atoi(getenv("SMO_TOUCH_SHOW")) != 0 : -1;
+    if (env >= 0) return env;
     if (g_cfg.touch_mode == 2) return 0;
     if (g_cfg.touch_mode == 1) return 1;
     return g_last_touch_ms >= g_last_pad_ms;
@@ -408,6 +411,8 @@ static void load_config(int force) {
     printf("nnpad: controls: layout %s, touch %s (opacity %.2f, scale %.2f), dead zone %.2f, camera %s speed %.2f, motion %s\n",
            g_cfg.layout_labels ? "labels" : "positional", g_cfg.touch_mode == 1 ? "on" : g_cfg.touch_mode == 2 ? "off" : "auto",
            g_cfg.opacity, g_cfg.scale, g_cfg.deadzone, g_cfg.camera_stick ? "stick" : "drag", g_cfg.camera, g_cfg.motion ? "on" : "off");
+    void android_sensors_wanted(int on);          /* android_main.c: no sensor readings while motion = off */
+    android_sensors_wanted(g_cfg.motion);
 }
 
 static void save_touch_mode(void) {               /* g_lock held: the touch line of controls.ini, the rest as it is */

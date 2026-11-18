@@ -557,12 +557,14 @@ static void os_SetTlsValue(Ctx *c) { t_tls[A0 & 63] = A1; }
  * thread, object): how often, how long, and which thread signalled (or unlocked) the object last and how long after
  * that signal the waiter ran again. Every 10 s the 30 largest are printed as "nn_waitmap:" lines, per second. */
 static int g_wm = -1;
-typedef struct { uint64_t waiter, obj, by; int kind; int64_t n, ns, max_ns, lat_ns, lat_n; } WmEnt;
+extern _Thread_local int smo_t_in_calc;           /* smo_framerate.c */
+static _Thread_local uint64_t t_wm_lr, t_wm_fp;     /* 0.3.13: the guest return address and frame pointer of the nn::os call that waits (set by the wrappers) */
+typedef struct { uint64_t waiter, obj, by, lr, lr2, lr3; int kind, calc; int64_t n, ns, max_ns, lat_ns, lat_n; } WmEnt;      /* calc: waited inside a logic step; lr2, lr3: the callers above (frame pointer chain) */
 #define WM_N 2048
 static WmEnt g_wm_t[WM_N];
 static int g_wm_lock;
 static int64_t g_wm_t0;
-static int wm_on(void) { if (g_wm < 0) { const char *e = getenv("SMO_WAITMAP"); g_wm = e && atoi(e); } return g_wm; }
+static int wm_on(void) { if (g_wm < 0) { const char *e = getenv("SMO_WAITMAP"); g_wm = e ? atoi(e) != 0 : 1; } return g_wm; }      /* 0.3.13: on by default (the tester's logs: what the game's logic waits ~25 ms a frame on); SMO_WAITMAP=0 off */
 static int64_t wm_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec; }
 static const char *wm_name(uint64_t key, char *buf, size_t n) {
     if (!key) return "host";
@@ -571,30 +573,88 @@ static const char *wm_name(uint64_t key, char *buf, size_t n) {
     return buf;
 }
 static void wm_signal(Obj *o) { if (g_wm > 0) { o->sig_by = t_thread; o->sig_t = wm_now(); } }
+#if defined(__ANDROID__) || defined(__linux__)
+#include <dirent.h>
+/* 0.3.13: with every nn_waitmap report, each busy thread's CPU use over the same span and the processor it ran on last
+ * (/proc/self/task/<tid>/stat: utime, stime, processor), and once the processors' top clocks: whether the game's helper threads
+ * (view update, clipping: the logic waits for them, al::waitUpdateCalcView) are busy all the time, and on which cores. */
+static struct { int tid; uint64_t ticks; } g_wmt[512]; static int g_wmt_n; static double g_wm_thr_sec;
+const char *guest_thread_name_of(uint32_t tid);
+static void wm_threads(double sec) {
+    static int said;
+    if (!said) {
+        said = 1;
+        char line[512]; int n = 0;
+        for (int c = 0; c < 16 && n < 480; c++) {
+            char p[96]; snprintf(p, sizeof p, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", c);
+            FILE *f = fopen(p, "r"); if (!f) continue; long khz = 0; if (fscanf(f, "%ld", &khz) != 1) khz = 0; fclose(f);
+            n += snprintf(line + n, sizeof line - n, " cpu%d %.2f GHz", c, khz / 1e6);
+        }
+        printf("nn_threads: processors' top clocks:%s\n", line);
+    }
+    DIR *d = opendir("/proc/self/task");
+    if (!d) return;
+    struct { int tid, cpu; double pct; char comm[20]; } top[512]; int n = 0;
+    long hz = sysconf(_SC_CLK_TCK); if (hz <= 0) hz = 100;
+    struct dirent *de;
+    while ((de = readdir(d)) && n < 512) {
+        int tid = atoi(de->d_name); if (tid <= 0) continue;
+        char p[64], buf[512]; snprintf(p, sizeof p, "/proc/self/task/%d/stat", tid);
+        FILE *f = fopen(p, "r"); if (!f) continue; size_t got = fread(buf, 1, sizeof buf - 1, f); fclose(f); buf[got] = 0;
+        char *lp = strchr(buf, '('), *rp = strrchr(buf, ')'); if (!lp || !rp) continue;
+        size_t cl = (size_t)(rp - lp - 1); if (cl > 19) cl = 19;
+        unsigned long ut = 0, st = 0; int cpu = -1, field = 3; char *s = rp + 2, *tok, *save = NULL;
+        for (tok = strtok_r(s, " ", &save); tok; tok = strtok_r(NULL, " ", &save), field++) {
+            if (field == 14) ut = strtoul(tok, NULL, 10); else if (field == 15) st = strtoul(tok, NULL, 10); else if (field == 39) { cpu = atoi(tok); break; }
+        }
+        uint64_t ticks = ut + st, prev = ticks; int i;
+        for (i = 0; i < g_wmt_n && g_wmt[i].tid != tid; i++) {}
+        if (i < g_wmt_n) prev = g_wmt[i].ticks; else if (g_wmt_n < 512) { g_wmt[g_wmt_n].tid = tid; i = g_wmt_n++; }
+        if (i < 512) g_wmt[i].ticks = ticks;
+        top[n].tid = tid; top[n].cpu = cpu; top[n].pct = (double)(ticks - prev) / (double)hz / sec * 100.0; memcpy(top[n].comm, lp + 1, cl); top[n].comm[cl] = 0; n++;
+    }
+    closedir(d);
+    char line[1024]; int w = 0; line[0] = 0;
+    for (int k = 0; k < 12; k++) {
+        int best = -1;
+        for (int i = 0; i < n; i++) if (top[i].pct >= 2.0 && (best < 0 || top[i].pct > top[best].pct)) best = i;
+        if (best < 0) break;
+        const char *gn = guest_thread_name_of((uint32_t)top[best].tid);
+        w += snprintf(line + w, sizeof line - w, " | %s %.0f%% cpu%d", gn ? gn : top[best].comm, top[best].pct, top[best].cpu);
+        top[best].pct = 0;
+        if (w > (int)sizeof line - 80) break;
+    }
+    if (w) printf("nn_threads: CPU use over the last %.0f s (of one processor) and the processor last used%s\n", sec, line);
+}
+#else
+static double g_wm_thr_sec; static void wm_threads(double sec) { (void)sec; }
+#endif
 static void wm_print(int64_t now) {                /* g_wm_lock held */
     static const char *const kind[] = {"event", "system event", "condition variable", "semaphore", "message queue (receive)", "message queue (send)", "mutex", "WaitAny"};
     double sec = (double)(now - g_wm_t0) / 1e9;
-    int order[30], n = 0;
-    for (int k = 0; k < 30; k++) {
+    int order[14], n = 0, ncalc = 0;
+    for (int pass = 0; pass < 2; pass++) for (int k = 0; k < (pass ? 6 : 8); k++) {      /* inside a logic step first (the game's logic waiting), then the other threads */
         int best = -1;
         for (int i = 0; i < WM_N; i++) {
-            if (!g_wm_t[i].n) continue;
+            if (!g_wm_t[i].n || g_wm_t[i].calc != !pass) continue;
             int used = 0;
             for (int j = 0; j < n; j++) used |= order[j] == i;
             if (!used && (best < 0 || g_wm_t[i].ns > g_wm_t[best].ns)) best = i;
         }
         if (best < 0) break;
-        order[n++] = best;
+        order[n++] = best; if (!pass) ncalc++;
     }
     printf("nn_waitmap: the largest blocking waits of the last %.1f s (per second: count, ms waited; the longest; the wake-up after the last signal)\n", sec);
     for (int k = 0; k < n; k++) {
         WmEnt *e = &g_wm_t[order[k]];
         char a[64], b[64];
-        printf("nn_waitmap:   %-24s waits on %-24s %llx: %6.1f/s %7.1f ms/s, longest %6.1f ms, last signalled by %-24s wake-up %5.0f us\n",
-               wm_name(e->waiter, a, sizeof a), kind[e->kind], (unsigned long long)e->obj, (double)e->n / sec, (double)e->ns / 1e6 / sec, (double)e->max_ns / 1e6,
-               wm_name(e->by, b, sizeof b), e->lat_n ? (double)e->lat_ns / (double)e->lat_n / 1e3 : 0.0);
+        #define WM_MAIN(x) ((x) >= 0x4000000000ull && (x) < 0x4010000000ull ? (x) - 0x4000000000ull : (x))      /* main+offset (main_functions.tsv) */
+        printf("nn_waitmap: %s %-24s waits on %-24s %llx: %6.1f/s %7.1f ms/s, longest %6.1f ms, last signalled by %-24s wake-up %5.0f us, called from main+0x%llx < 0x%llx < 0x%llx\n",
+               k < ncalc ? "LOGIC" : "     ", wm_name(e->waiter, a, sizeof a), kind[e->kind], (unsigned long long)e->obj, (double)e->n / sec, (double)e->ns / 1e6 / sec, (double)e->max_ns / 1e6,
+               wm_name(e->by, b, sizeof b), e->lat_n ? (double)e->lat_ns / (double)e->lat_n / 1e3 : 0.0, (unsigned long long)WM_MAIN(e->lr), (unsigned long long)WM_MAIN(e->lr2), (unsigned long long)WM_MAIN(e->lr3));
     }
     fflush(stdout);
+    g_wm_thr_sec = sec;                            /* wm_threads after the lock is let go (wm_note): it reads /proc for every thread */
     memset(g_wm_t, 0, sizeof g_wm_t);
     g_wm_t0 = now;
 }
@@ -603,27 +663,36 @@ static void wm_note(int kind, Obj *o, int64_t t0) {
     if (ns < 20000) return;                        /* under 20 us: not a wait that blocked */
     while (__atomic_exchange_n(&g_wm_lock, 1, __ATOMIC_ACQUIRE)) {}
     if (!g_wm_t0) g_wm_t0 = t1;
-    unsigned h = (unsigned)(((t_thread >> 4) ^ (o->key * 31)) * 2654435761u) % WM_N;
+    int calc = smo_t_in_calc != 0;
+    unsigned h = (unsigned)(((t_thread >> 4) ^ (o->key * 31) ^ (unsigned)calc) * 2654435761u) % WM_N;
     for (int probe = 0; probe < 32; probe++, h = (h + 1) % WM_N) {
         WmEnt *e = &g_wm_t[h];
-        if (e->n && (e->waiter != t_thread || e->obj != o->key || e->kind != kind)) continue;
-        e->waiter = t_thread; e->obj = o->key; e->kind = kind; e->by = o->sig_by;
+        if (e->n && (e->waiter != t_thread || e->obj != o->key || e->kind != kind || e->calc != calc)) continue;
+        e->waiter = t_thread; e->obj = o->key; e->kind = kind; e->by = o->sig_by; e->lr = t_wm_lr; e->calc = calc;
+        {   uint64_t fp = t_wm_fp; e->lr2 = e->lr3 = 0;      /* frame record: [fp] = caller's fp, [fp + 8] = return address */
+            if (fp > 0x10000 && fp < 0x8000000000ull && !(fp & 7)) { e->lr2 = *(const uint64_t *)(uintptr_t)(fp + 8); uint64_t f2 = *(const uint64_t *)(uintptr_t)fp;
+                if (f2 > fp && f2 < 0x8000000000ull && !(f2 & 7)) e->lr3 = *(const uint64_t *)(uintptr_t)(f2 + 8); } }
         e->n++; e->ns += ns; if (ns > e->max_ns) e->max_ns = ns;
         if (o->sig_t > t0) { e->lat_ns += t1 - o->sig_t; e->lat_n++; }
         break;
     }
-    if (t1 - g_wm_t0 > 10000000000LL) wm_print(t1);
+    if (t1 - g_wm_t0 > 30000000000LL) wm_print(t1);      /* 0.3.13: every 30 s (it is on by default now) */
+    double thr_sec = g_wm_thr_sec; g_wm_thr_sec = 0;
     __atomic_store_n(&g_wm_lock, 0, __ATOMIC_RELEASE);
+    if (thr_sec > 0) wm_threads(thr_sec);
 }
-#define WM_BEGIN int64_t wm_t0_ = wm_on() ? wm_now() : 0
-#define WM_END(kind, o) do { if (wm_t0_) wm_note(kind, o, wm_t0_); } while (0)
+extern _Thread_local int smo_t_in_calc;           /* smo_framerate.c (0.3.2): this thread is inside a logic step; its blocking waits are counted */
+void smo_calc_wait_add(int64_t ns);
+void smo_calc_wait_add_k(int kind, int64_t ns);      /* smo_framerate.c, 0.3.13: by kind */
+#define WM_BEGIN int64_t wm_t0_ = wm_on() || smo_t_in_calc ? wm_now() : 0
+#define WM_END(kind, o) do { if (wm_t0_) { if (smo_t_in_calc) smo_calc_wait_add_k(0, wm_now() - wm_t0_); if (g_wm > 0) wm_note(kind, o, wm_t0_); } } while (0)
 
 /* ---------------------------------------------------------------- mutexes */
 static void mtx_init(Ctx *c) { (void)obj(A0); }
-static void mtx_lock(Ctx *c) {
+static void mtx_lock(Ctx *c) { t_wm_lr = c->x[30]; t_wm_fp = c->x[29];
     Obj *o = obj(A0);
-    if (wm_on() && !plat_mutex_trylock(&o->cs)) { WM_BEGIN; plat_mutex_lock(&o->cs); WM_END(6, o); return; }
-    if (!g_wm) plat_mutex_lock(&o->cs);
+    if (wm_on() || smo_t_in_calc) { if (!plat_mutex_trylock(&o->cs)) { WM_BEGIN; plat_mutex_lock(&o->cs); WM_END(6, o); } return; }
+    plat_mutex_lock(&o->cs);
 }
 static void mtx_unlock(Ctx *c) { Obj *o = obj(A0); wm_signal(o); plat_mutex_unlock(&o->cs); }
 static void mtx_trylock(Ctx *c) { RET(plat_mutex_trylock(&obj(A0)->cs) ? 1 : 0); }
@@ -645,6 +714,7 @@ static void ev_signal(Ctx *c) {
     plat_mutex_lock(&o->cs);
     wm_signal(o);
     o->signaled = 1;
+    plat_spin_wake();
     plat_cond_broadcast(&o->cv);
     plat_mutex_unlock(&o->cs);
 }
@@ -655,6 +725,7 @@ void os_signal_event(uint64_t key) {
     plat_mutex_lock(&o->cs);
     wm_signal(o);
     o->signaled = 1;
+    plat_spin_wake();
     plat_cond_broadcast(&o->cv);
     plat_mutex_unlock(&o->cs);
 }
@@ -662,7 +733,7 @@ void os_clear_event(uint64_t key) { Obj *o = obj(key); plat_mutex_lock(&o->cs); 
 static void ev_clear(Ctx *c) { Obj *o = obj(A0); plat_mutex_lock(&o->cs); o->signaled = 0; plat_mutex_unlock(&o->cs); }
 static int ev_wait_ms(Obj *o, uint32_t ms) {
     int ok = 1;
-    if (ms) PLAT_SPIN_WHILE(!__atomic_load_n(&o->signaled, __ATOMIC_ACQUIRE));       /* plat.h: spinning before blocking */
+    if (ms) { int64_t sp0_ = smo_t_in_calc || g_wm > 0 ? wm_now() : 0; PLAT_SPIN_WHILE(!__atomic_load_n(&o->signaled, __ATOMIC_ACQUIRE)); if (sp0_) { if (smo_t_in_calc) smo_calc_wait_add_k(3, wm_now() - sp0_); if (g_wm > 0 && __atomic_load_n(&o->signaled, __ATOMIC_ACQUIRE)) wm_note(0, o, sp0_); } }      /* plat.h: spinning before blocking (0.3.2: inside a logic step, counted as its waiting) */
     WM_BEGIN;
     plat_mutex_lock(&o->cs);
     while (!o->signaled) {
@@ -673,9 +744,9 @@ static int ev_wait_ms(Obj *o, uint32_t ms) {
     plat_mutex_unlock(&o->cs);
     return ok;
 }
-static void ev_wait(Ctx *c) { ev_wait_ms(obj(A0), PLAT_INFINITE); }
-static void ev_trywait(Ctx *c) { RET(ev_wait_ms(obj(A0), 0)); }
-static void ev_timedwait(Ctx *c) { RET(ev_wait_ms(obj(A0), ns_to_ms((int64_t)A1))); }
+static void ev_wait(Ctx *c) { t_wm_lr = c->x[30]; t_wm_fp = c->x[29]; ev_wait_ms(obj(A0), PLAT_INFINITE); }
+static void ev_trywait(Ctx *c) { t_wm_lr = c->x[30]; t_wm_fp = c->x[29]; RET(ev_wait_ms(obj(A0), 0)); }
+static void ev_timedwait(Ctx *c) { t_wm_lr = c->x[30]; t_wm_fp = c->x[29]; RET(ev_wait_ms(obj(A0), ns_to_ms((int64_t)A1))); }
 
 /* ---- SMO port: system events shared through kernel handles.
  * [doc] A SystemEvent is a kernel event: CreateSystemEvent makes it with a readable and a writable handle; another
@@ -697,7 +768,7 @@ static Obj *handle_obj(uint32_t h) { uint32_t i = h - 0x50000u; return i < MAX_H
 static int sev_wait(uint64_t key, uint32_t ms) {
     Obj *raw = obj_raw(key), *o = obj(key);
     int ok = 1;
-    if (ms) PLAT_SPIN_WHILE(!__atomic_load_n(&o->signaled, __ATOMIC_ACQUIRE));
+    if (ms) { int64_t sp0_ = smo_t_in_calc || g_wm > 0 ? wm_now() : 0; PLAT_SPIN_WHILE(!__atomic_load_n(&o->signaled, __ATOMIC_ACQUIRE)); if (sp0_) { if (smo_t_in_calc) smo_calc_wait_add_k(3, wm_now() - sp0_); if (g_wm > 0 && __atomic_load_n(&o->signaled, __ATOMIC_ACQUIRE)) wm_note(1, o, sp0_); } }
     WM_BEGIN;
     plat_mutex_lock(&o->cs);
     while (!o->signaled) {
@@ -752,13 +823,13 @@ static void sev_get_readable(Ctx *c) { Obj *o = obj(A0); if (!o->rhandle) o->rha
 static void sev_get_writable(Ctx *c) { Obj *o = obj(A0); if (!o->whandle) o->whandle = handle_new(o); RET(o->whandle); }
 static void sev_detach(Ctx *c) { obj_raw(A0)->alias = NULL; RET(0); }
 static void sev_destroy(Ctx *c) { obj_raw(A0)->alias = NULL; }
-static void sev_wait_h(Ctx *c) { sev_wait(A0, PLAT_INFINITE); }
-static void sev_trywait_h(Ctx *c) { RET(sev_wait(A0, 0)); }
-static void sev_timedwait_h(Ctx *c) { RET(sev_wait(A0, ns_to_ms((int64_t)A1))); }
+static void sev_wait_h(Ctx *c) { t_wm_lr = c->x[30]; t_wm_fp = c->x[29]; sev_wait(A0, PLAT_INFINITE); }
+static void sev_trywait_h(Ctx *c) { t_wm_lr = c->x[30]; t_wm_fp = c->x[29]; RET(sev_wait(A0, 0)); }
+static void sev_timedwait_h(Ctx *c) { t_wm_lr = c->x[30]; t_wm_fp = c->x[29]; RET(sev_wait(A0, ns_to_ms((int64_t)A1))); }
 
 /* ---------------------------------------------------------------- condition variables */
-static void cv_wait(Ctx *c) { WM_BEGIN; plat_cond_wait(&obj(A0)->cv, &obj(A1)->cs, PLAT_INFINITE); WM_END(2, obj(A0)); }
-static void cv_timedwait(Ctx *c) {                    /* returns ConditionVariableStatus: 0 timeout, 1 signalled */
+static void cv_wait(Ctx *c) { t_wm_lr = c->x[30]; t_wm_fp = c->x[29]; WM_BEGIN; plat_cond_wait(&obj(A0)->cv, &obj(A1)->cs, PLAT_INFINITE); WM_END(2, obj(A0)); }
+static void cv_timedwait(Ctx *c) { t_wm_lr = c->x[30]; t_wm_fp = c->x[29];                    /* returns ConditionVariableStatus: 0 timeout, 1 signalled */
     WM_BEGIN;
     RET(plat_cond_wait(&obj(A0)->cv, &obj(A1)->cs, ns_to_ms((int64_t)A2)) ? 1 : 0);
     WM_END(2, obj(A0));
@@ -766,8 +837,8 @@ static void cv_timedwait(Ctx *c) {                    /* returns ConditionVariab
 static void cv_signal(Ctx *c) { wm_signal(obj(A0)); plat_cond_signal(&obj(A0)->cv); }
 static void cv_broadcast(Ctx *c) { wm_signal(obj(A0)); plat_cond_broadcast(&obj(A0)->cv); }
 /* std::condition_variable: the argument is a unique_lock<mutex> whose first word is the mutex pointer */
-static void std_cv_wait(Ctx *c) { WM_BEGIN; plat_cond_wait(&obj(A0)->cv, &obj(rd64(A1))->cs, PLAT_INFINITE); WM_END(2, obj(A0)); }
-static void std_cv_timedwait(Ctx *c) {                /* deadline: system_clock nanoseconds since 1970 */
+static void std_cv_wait(Ctx *c) { t_wm_lr = c->x[30]; t_wm_fp = c->x[29]; WM_BEGIN; plat_cond_wait(&obj(A0)->cv, &obj(rd64(A1))->cs, PLAT_INFINITE); WM_END(2, obj(A0)); }
+static void std_cv_timedwait(Ctx *c) { t_wm_lr = c->x[30]; t_wm_fp = c->x[29];                /* deadline: system_clock nanoseconds since 1970 */
     struct timespec ts;
     timespec_get(&ts, TIME_UTC);
     int64_t now = (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
@@ -776,7 +847,7 @@ static void std_cv_timedwait(Ctx *c) {                /* deadline: system_clock 
 
 /* ---------------------------------------------------------------- semaphores */
 static void sem_init(Ctx *c) { obj_reset(A0); Obj *o = obj(A0); o->count = (int)A1; o->max = (int)A2; }
-static void sem_acquire(Ctx *c) {
+static void sem_acquire(Ctx *c) { t_wm_lr = c->x[30]; t_wm_fp = c->x[29];
     Obj *o = obj(A0);
     WM_BEGIN;
     plat_mutex_lock(&o->cs);
@@ -838,13 +909,13 @@ static int mq_get(Obj *o, uint64_t out, uint32_t ms) {
     plat_mutex_unlock(&o->cs);
     return ok;
 }
-static void mq_send(Ctx *c) { mq_put(obj(A0), A1, 0, PLAT_INFINITE); }
-static void mq_trysend(Ctx *c) { RET(mq_put(obj(A0), A1, 0, 0)); }
-static void mq_jam(Ctx *c) { mq_put(obj(A0), A1, 1, PLAT_INFINITE); }
-static void mq_tryjam(Ctx *c) { RET(mq_put(obj(A0), A1, 1, 0)); }
-static void mq_receive(Ctx *c) { mq_get(obj(A1), A0, PLAT_INFINITE); }
-static void mq_tryreceive(Ctx *c) { RET(mq_get(obj(A1), A0, 0)); }
-static void mq_timedreceive(Ctx *c) { RET(mq_get(obj(A1), A0, ns_to_ms((int64_t)A2))); }
+static void mq_send(Ctx *c) { t_wm_lr = c->x[30]; t_wm_fp = c->x[29]; mq_put(obj(A0), A1, 0, PLAT_INFINITE); }
+static void mq_trysend(Ctx *c) { t_wm_lr = c->x[30]; t_wm_fp = c->x[29]; RET(mq_put(obj(A0), A1, 0, 0)); }
+static void mq_jam(Ctx *c) { t_wm_lr = c->x[30]; t_wm_fp = c->x[29]; mq_put(obj(A0), A1, 1, PLAT_INFINITE); }
+static void mq_tryjam(Ctx *c) { t_wm_lr = c->x[30]; t_wm_fp = c->x[29]; RET(mq_put(obj(A0), A1, 1, 0)); }
+static void mq_receive(Ctx *c) { t_wm_lr = c->x[30]; t_wm_fp = c->x[29]; mq_get(obj(A1), A0, PLAT_INFINITE); }
+static void mq_tryreceive(Ctx *c) { t_wm_lr = c->x[30]; t_wm_fp = c->x[29]; RET(mq_get(obj(A1), A0, 0)); }
+static void mq_timedreceive(Ctx *c) { t_wm_lr = c->x[30]; t_wm_fp = c->x[29]; RET(mq_get(obj(A1), A0, ns_to_ms((int64_t)A2))); }
 /* SMO port: PeekMessageQueue / TryPeekMessageQueue (out, queue): the oldest message without taking it (sead::MessageQueue::peek). */
 static int mq_peek(Obj *o, uint64_t out, uint32_t ms) {
     int ok = 1;
@@ -881,7 +952,7 @@ static uint64_t mw_poll(Obj *m) {
     }
     return 0;
 }
-static void mw_waitany(Ctx *c) { Obj *m = obj(A0); uint64_t r; WM_BEGIN; while (!(r = mw_poll(m))) plat_sleep_ms(1); WM_END(7, m); RET(r); }
+static void mw_waitany(Ctx *c) { t_wm_lr = c->x[30]; t_wm_fp = c->x[29]; Obj *m = obj(A0); uint64_t r; WM_BEGIN; while (!(r = mw_poll(m))) plat_sleep_ms(1); WM_END(7, m); RET(r); }
 static void mw_trywaitany(Ctx *c) { RET(mw_poll(obj(A0))); }
 
 /* ---------------------------------------------------------------- fibers */

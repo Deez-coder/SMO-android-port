@@ -284,6 +284,10 @@ void hitch_wait_render(int on); void hitch_frame(long long frame, double ms, int
 #define HS_IN(name, arg) const char *hs_p_ = (const char *)g_hitch_rt; uint64_t hs_a_ = g_hitch_rt_arg; g_hitch_rt_arg = (uint64_t)(arg); g_hitch_rt = (name)
 #define HS_OUT() (g_hitch_rt = hs_p_, g_hitch_rt_arg = hs_a_)
 
+extern _Thread_local int smo_t_in_calc;           /* smo_framerate.c (0.3.2): waits inside a logic step are counted apart */
+void smo_calc_wait_add(int64_t ns);
+void smo_calc_wait_add_k(int kind, int64_t ns);      /* 0.3.13: by kind (smo_framerate.c) */
+static int64_t calc_now_ns(void) { return (int64_t)((double)plat_qpc() * 1e9 / (double)plat_qpf()); }
 static void gl_run(void (*fn)(void *), void *arg) {
     if (plat_tid() == g_render_tid) { fn(arg); return; }
     if (!t_done) t_done = plat_event_create(0, 0);
@@ -297,7 +301,7 @@ static void gl_run(void (*fn)(void *), void *arg) {
     plat_mutex_unlock(&g_job_lock);
     plat_event_set(g_job_event);
     hitch_wait_render(1);
-    plat_event_wait(j.done, PLAT_INFINITE);
+    { int64_t w0 = smo_t_in_calc ? calc_now_ns() : 0; plat_event_wait(j.done, PLAT_INFINITE); if (w0) smo_calc_wait_add_k(1, calc_now_ns() - w0); }
     hitch_wait_render(0);
     if (g_tl_on) nvn_tl(TL_RUN_RET, tl_kind(fn));
     pf_add(fn == pf_job_submit ? PF_WAIT_SUBMIT_ : fn == pf_job_present ? PF_WAIT_PRESENT_ : PF_WAIT_OTHER_, pf0);
@@ -3955,7 +3959,7 @@ static uint32_t  render_thread(void * arg) {
         uint64_t m = e && e[0] ? strtoull(e, NULL, 16) : os_render_cpu_mask();
         if (m) { plat_thread_set_affinity(NULL, m); printf("nvn: render thread on processors %llx (%s)\n", (unsigned long long)m, e && e[0] ? "SMO_RENDER_CPUS" : "the fastest, kept for it"); }
     }
-    plat_spin_mark_hot();                               /* plat.h: the render thread sets the frame rate */
+    plat_spin_mark_hot_role(1);                         /* plat.h: the render thread sets the frame rate */
     if (g_vk) {                                 /* V1 step S0: no OpenGL context, no shader workers; the jobs go to nvn_vk.c (vk_route) */
 #ifdef __ANDROID__
         { void android_perf_add_thread(void); android_perf_add_thread(); }     /* android_perf.c: performance hints */
@@ -4901,8 +4905,10 @@ static plat_event *g_present_ev;
 static int g_present_out, g_present_sync = -1;
 static void job_present_signal(void *arg) { g_rb->present(arg); plat_event_set(g_present_ev); }
 static void queue_present(Ctx *c) {                     /* (queue, window, textureIndex) */
-    plat_spin_mark_hot();                               /* plat.h: the presenting thread sets the frame rate */
+    plat_spin_mark_hot_role(2);                         /* plat.h: the presenting thread sets the frame rate */
     PresentJob j = {hobj(A1, K_WIN), (int)A2};
+    {   int smo_camera_get(float view[12], float proj[16], int *steps, float pl[3], int *pl_ok);      /* 0.3.9, smo_camera.c: this frame's camera, for the motion vectors (0.3.11: its logic steps, Mario's position) */
+        j.cam_ok = smo_camera_get(j.cam_view, j.cam_proj, &j.cam_steps, j.pl, &j.pl_ok); }
     if (j.win && j.win->native && j.win->native == album_movie_native_window()) { gl_run(g_rb->present_movie, &j); return; }
     if (g_tl_on) nvn_tl(TL_PRESENT_CALL, 0);
     g_pf_main_tid = plat_tid();
@@ -4914,7 +4920,7 @@ static void queue_present(Ctx *c) {                     /* (queue, window, textu
         if (g_present_out) {                            /* the previous frame has been shown before this one is queued */
             int64_t pf0 = pf_now();
             hitch_wait_render(1);
-            plat_event_wait(g_present_ev, PLAT_INFINITE);
+            { int64_t w0 = smo_t_in_calc ? calc_now_ns() : 0; plat_event_wait(g_present_ev, PLAT_INFINITE); if (w0) smo_calc_wait_add_k(2, calc_now_ns() - w0); }
             hitch_wait_render(0);
             pf_add(PF_WAIT_PRESENT_, pf0);
         }
@@ -5046,9 +5052,21 @@ static void job_sync_wait(void *arg) {
 static void sync_wait(Ctx *c) {                         /* (sync, timeoutNs) -> NVNsyncWaitResult */
     SyncObj *o = hobj(A0, K_SYNC);
     SyncJob j = {o, 0, A1, 3};
-    if (o && o == g_window_sync) plat_spin_mark_hot();   /* plat.h: the game's main thread waits here each frame and sets the frame rate */
+    if (o && o == g_window_sync) plat_spin_mark_hot_role(4);   /* plat.h: the game's main thread waits here each frame and sets the frame rate */
     if (g_tl_on) nvn_tl(TL_SYNC_CALL, o == g_window_sync);
+    int64_t sw0 = plat_qpc();
     if (o) gl_run(g_rb->sync_wait, &j);
+    if (o && o != g_window_sync && j.t_start) {        /* 0.3.8: how long SyncWait sat in the render thread's queue, and whether its fence had finished by then */
+        static int64_t n, queued, total, done_n, done_queued;
+        int64_t now = plat_qpc(), q = j.t_start > sw0 ? j.t_start - sw0 : 0;
+        n++; queued += q; total += now - sw0;
+        if (j.was_done) { done_n++; done_queued += q; }
+        if (n % 1200 == 0) {
+            double k = 1000.0 / (double)plat_qpf();
+            printf("nvn: SyncWait (game fences): %lld calls, average %.2f ms each, %.2f ms of it in the render thread's queue; %lld (%.0f%%) had finished before their job ran (%.2f ms queued each)\n",
+                   (long long)n, total * k / n, queued * k / n, (long long)done_n, 100.0 * done_n / n, done_n ? done_queued * k / done_n : 0.0);
+        }
+    }
     if (o && o == g_window_sync && A1 && j.result == 3) {      /* P3 round 3: the window texture's sync (never fenced by us): it is free at the refresh that shows the queued frame (display.c) */
         if (display_wait_refresh()) j.result = 1;             /* NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED; otherwise as before */
     }
@@ -5766,6 +5784,47 @@ static void vk_shutdown_at_exit(void) {
 
 /* nvnBufferFlushMappedRange / nvnMemoryPoolFlushMappedRange (nvn_stub.c): the CPU wrote this memory. Textures stored there are read again. */
 Tex *nvn_front_tex_first(void) { return g_all_tex; }
+/* 0.3.7, smo_linread.c: the game is about to read a texel of the texture at (pool, offset) on the CPU (Cap Kingdom's fog
+ * height). What the GPU drew there is asked for, once per frame per texture: on Vulkan a copy recorded without a wait
+ * (vk_linread, written into the pool memory at a later read), on OpenGL the InvalidateTexels job (waits). Only for a
+ * texture the GPU wrote; others already hold their bytes. SMO_FOG_READBACK=0: off. */
+uint64_t nvn_stub_pool_memory(uint64_t pool);      /* nvn_stub.c */
+void vk_linread(Tex *t);                            /* nvn_vk_draw.c */
+static void job_linread(void *arg) { vk_linread(*(Tex **)arg); }
+void nvn_front_linear_readback(uint64_t pool, uint32_t offset) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("SMO_FOG_READBACK"); on = !(e && !atoi(e)); printf("nvn: CPU reads of GPU-drawn textures (Cap Kingdom's fog): %s\n", on ? "read back from the GPU (SMO_FOG_READBACK=0: off)" : "OFF (SMO_FOG_READBACK=0)"); }
+    if (!on || !g_rb) return;
+    /* The game reads many texels a frame (thousands in Cap Kingdom): a read of a texture already asked for in this frame
+     * returns at once from this small table, before any lookup. Without it each read looked the pool up and walked every
+     * texture record ever made: the S24's game logic went from 4 to 30-34 ms a frame. */
+    static struct { uint64_t pool; uint32_t offset; Tex *t; long long frame; } seen[16];
+    static int nseen, nsaid, next_slot;
+    static volatile int lock;
+    static int64_t n_reads, n_lookups;
+    long long frame = nvn_front_frame_next();
+    while (__atomic_exchange_n(&lock, 1, __ATOMIC_ACQUIRE)) {}
+    int k;
+    for (k = 0; k < nseen && !(seen[k].pool == pool && seen[k].offset == offset); k++) {}
+    if (k < nseen && seen[k].frame == frame) { __atomic_store_n(&lock, 0, __ATOMIC_RELEASE); return; }
+    Tex *t = k < nseen ? seen[k].t : NULL;
+    if (k == nseen || !t || t->dead) {                             /* looked up at most once a frame per (pool, offset) */
+        uint64_t base = nvn_stub_pool_memory(pool);
+        uint8_t *at = base ? (uint8_t *)(uintptr_t)(base + offset) : NULL;
+        t = at ? g_all_tex : NULL;
+        while (t && (t->dead || t->mem != at)) t = t->all_next;  /* the newest live texture there */
+        n_lookups++;
+        if (k == nseen) { if (nseen < 16) nseen++; else { k = next_slot; next_slot = (next_slot + 1) % 16; } }
+        seen[k].pool = pool; seen[k].offset = offset; seen[k].t = t;
+    }
+    seen[k].frame = frame;
+    __atomic_store_n(&lock, 0, __ATOMIC_RELEASE);
+    if (!t || !t->gpu_written) return;
+    if (g_rb == &rb_vk) gl_post(job_linread, &t, sizeof t);      /* Vulkan: no wait (vk_linread: written at a later read) */
+    else { ReadJob j; memset(&j, 0, sizeof j); j.tex = t; j.to_pool = 1; gl_run(g_rb->read_texels, &j); }
+    n_reads++;
+    if (nsaid < 4) { nsaid++; printf("nvn: frame %lld: the game reads texture %dx%d format 0x%x (flags 0x%x) on the CPU\n", frame, t->b.width, t->b.height, t->b.format, t->b.flags); }
+}
 void nvn_gl_memory_written(uint64_t addr, uint64_t size) {
     if (!size) return;
     plat_rw_rdlock(&g_tp_lock);
