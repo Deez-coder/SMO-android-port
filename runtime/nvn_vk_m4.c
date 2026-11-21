@@ -249,7 +249,13 @@ static int stage_rec_read(int s, uint64_t vh, StageRec *r) {
  * vertex stage drawn alone). So the module is destroyed when no thread uses it, and made again from the SPIR-V file of the
  * stage cache when it is needed: the same words, so the same pipelines. SMO_VK_MODREL=0 keeps every module (as before). */
 static int64_t g_mod_released, g_mod_again, g_mod_destroy_tk;
-static int modrel_on(void) { static int on = -1; if (on < 0) on = getenv("SMO_VK_MODREL") ? atoi(getenv("SMO_VK_MODREL")) : 1; return on; }      /* 2 (measurement): released as soon as the stage is made */
+/* 0.4.2: 2 BY DEFAULT (released as soon as the stage is made). Mode 1 only released a module once its library was made, and
+ * phones without pipeline libraries (the S24's Qualcomm driver, Turnip, most others: "pipeline libraries in use: no") kept
+ * every module: 16,082 on the S24 in Cascade, 24,853 on a tester's 7.5 GB Xiaomi. Measured on the S24 (Cascade, one run each):
+ * total PSS 5.90 -> 4.64 GB (native heap 1.65 GB + 259 MB swapped -> 0.76 GB, graphics 1.80 -> 1.61 GB), 14,357 modules
+ * released, 52 made again from their SPIR-V files, fps 59.9-60 both, hitches 5 -> 2, the pipelines made ahead at start
+ * 3.0 -> 2.2 s. SMO_VK_MODREL=1: as before. */
+static int modrel_on(void) { static int on = -1; if (on < 0) on = getenv("SMO_VK_MODREL") ? atoi(getenv("SMO_VK_MODREL")) : 2; return on; }      /* 2 (measurement): released as soon as the stage is made */
 static VkShaderModule module_from_spv(uint64_t h);
 static VkShaderModule stage_mod_get(VStage *v) {   /* any thread, no lock held; stage_mod_put when the module is no longer used */
     plat_mutex_lock(&g_sh_lock);
@@ -1363,6 +1369,29 @@ static void spawn_stage_fo(const SSrc *src, const uint32_t *key) {      /* as sp
  * On by default with pipeline libraries (SMO_VK_BARRIER=0 / =1 forces it). Time-out 20 s, logged loudly. */
 static int64_t g_bar_n, g_bar_tk, g_bar_max, g_bar_timeout;
 static void wd_dump(double stall_s, int64_t tries_since);     /* nvn_vk_wd.c */
+/* 0.4.1, THE PIPELINE CACHE SAVED IN LOADING SCREENS ON EVERY PHONE: during play the live cache was only read out by m4_barrier's
+ * held loading screen, which runs on the stage-library path only (most phones: "pipeline libraries in use: no"), and when the
+ * game is left or goes to the background (GameActivity). A tester's Xiaomi (Turnip) played 16 minutes after a reinstall, the
+ * system ended the app right after "the window went away", and every pipeline of the session was lost (the next start read
+ * 0 KB). Now the render thread writes it in a loading screen: 30 frames in a row with at most 60 draws (m4_barrier's rule for
+ * a loading screen), no fight in the last 600 frames, frame 300 on, at least 50 pipelines made since the last save and at
+ * least 60 s since this point last wrote. Never during play. SMO_VK_QUIET_SAVE=0: as before. */
+static int64_t g_pcsave_pipes = -1, g_qs_last_tk;
+static int g_qs_run;
+static void m4_quiet_save(int64_t frame, int64_t draws) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("SMO_VK_QUIET_SAVE"); on = !(e && !atoi(e)); }
+    if (!on || !g_pcache) return;
+    if (g_pcsave_pipes < 0) g_pcsave_pipes = (int64_t)R.pipelines;      /* what the start already had (made ahead from the list) */
+    if (draws > 60 || frame < 300 || fight_recent()) { g_qs_run = 0; return; }
+    if (++g_qs_run < 30 || (int64_t)R.pipelines - g_pcsave_pipes < 50) return;
+    plat_li fq; fq.QuadPart = plat_qpf();
+    if (g_qs_last_tk && tk() - g_qs_last_tk < fq.QuadPart * 60) return;
+    g_qs_last_tk = tk(); g_qs_run = 0;
+    printf("nvn_vk: pipeline cache: %lld pipelines made since the last save, written in this loading screen (frame %lld)\n", (long long)((int64_t)R.pipelines - g_pcsave_pipes), (long long)frame);
+    g_pcsave_pipes = (int64_t)R.pipelines;
+    pcache_save_at(1, plat_atomic_xchg(&g_pcsave_want, 0));      /* the first-start marker only when the preparation has finished */
+}
 static void m4_barrier(int64_t frame, int64_t draws) {
     static int on = -1;
     int want_dump = 0;
@@ -1803,14 +1832,22 @@ static void first_prep_init(void) {
 }
 /* GameActivity's progress bar: 1 while it runs, with the programs seen and their number. It also notices the end: all handed over and translated
  * (the marker is written); or, for a game whose count differs, nothing new for 15 s with the workers idle (no marker: the next start shows the bar again). */
+/* 0.4.2, THE CONTAINER SCAN BEHIND THE BAR (SMO_VK_FIRST_PREP_SCAN=1, a test): the bar also waits until the scan has made every
+ * variation of the game's shader containers (the background queue g_bq: 10,475 on an Exynos tester's first start, 29,781 on a
+ * Xiaomi's), which otherwise ran below the game for minutes and left first starts at 5-24 fps. Two halves of the bar:
+ * the programs, then the scan. Only this one time: later starts and loading screens are not held (SMO_VK_HOLD_SCAN is). */
+static int fp_scan_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("SMO_VK_FIRST_PREP_SCAN"); on = e ? atoi(e) != 0 : 1; } return on; }      /* 0.4.2: on by default (S24, empty cache: bar 129 s instead of 151, first minutes 10.7 s of hitches instead of 13.1); SMO_VK_FIRST_PREP_SCAN=0 off */
+/* the second half holds the game too: its present call waits here (nvn_gl.c queue_present) while the bar shows the scan */
+int nvn_vk_fp_scan_hold(void) { return g_fp_state == 1 && fp_scan_on() && g_fp_serial >= FIRST_PREP_PROGRAMS && g_jq_queued <= g_jq_done && g_bq_queued > g_bq_done; }
 int nvn_vk_first_prep(long long *done, long long *total) {
-    static int last; static int64_t last_t;
+    static int last; static int64_t last_t, last_bq;
     if (g_fp_state != 1) return 0;
     int s = g_fp_serial;
     int idle = g_jq_queued <= g_jq_done;
+    int scan_left = fp_scan_on() && g_bq_queued > g_bq_done;
     int64_t now = tk();
-    if (s != last || !last_t || !idle) { last = s; last_t = now; }
-    int whole = s >= FIRST_PREP_PROGRAMS && idle;
+    if (s != last || !last_t || !idle || (scan_left && (int64_t)g_bq_done != last_bq)) { last = s; last_t = now; last_bq = (int64_t)g_bq_done; }
+    int whole = s >= FIRST_PREP_PROGRAMS && idle && !scan_left;
     if (whole || (s > 1000 && now - last_t > 15 * plat_qpf())) {
         g_fp_state = 2;
         printf("nvn_vk: first-start preparation %s after %.0f s: program %d, the game held %.0f s\n", whole ? "finished" : "ended, nothing new for 15 s,", (double)(now - g_fp_t0) / (double)plat_qpf(), s, (double)g_set_held_tk / (double)plat_qpf());
@@ -1819,6 +1856,13 @@ int nvn_vk_first_prep(long long *done, long long *total) {
         return 0;
     }
     *done = s < FIRST_PREP_PROGRAMS ? s : FIRST_PREP_PROGRAMS; *total = FIRST_PREP_PROGRAMS;
+    if (fp_scan_on()) {                           /* the second half: the scan's share done */
+        long long q = (long long)g_bq_queued, dn = (long long)g_bq_done;
+        *total = 2LL * FIRST_PREP_PROGRAMS;
+        if (s >= FIRST_PREP_PROGRAMS && idle) *done += q > 0 ? (long long)FIRST_PREP_PROGRAMS * (dn < q ? dn : q) / q : 0;
+        static int64_t said_at;
+        if (now - said_at > 10 * plat_qpf()) { said_at = now; printf("nvn_vk: first-start preparation: programs %d of %d, container scan %lld of %lld variations made\n", s, FIRST_PREP_PROGRAMS, dn, q); fflush(stdout); }
+    }
     return 1;
 }
 void nvn_vk_first_prep_skip(void) {

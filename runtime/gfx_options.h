@@ -32,6 +32,7 @@ typedef struct {
     int output;              /* output_size = auto (0) | full (1) | game (2): the size of the picture handed to the screen (nvn_vk_draw.c present_pass, 0.3.1) */
     int boost;               /* boost = auto (default, 1) | on (2, always) | off (0): the frame's threads keep their CPUs' clocks up while frames are late (Android, android_perf.c) */
     int framegen;            /* frame_generation = off (default, 0) | on (1) | auto (2): a frame made after each real frame (nvn_vk_motion.c; 0.3.12; auto 0.3.22: fg_auto_tick); live; env SMO_VK_FRAMEGEN wins */
+    int free_cores;          /* cpu_cores = fixed (default, 0) | free (1): the console core model off, Android places the game's threads (os_threads.c; 0.4.1); at start */
     int fg_fast;             /* frame_generation_quality = high (default, 0) | fast (1): made frames moved along the camera only (no moving objects, no forward pass; 0.3.22); live */
 } GfxOptions;
 const GfxOptions *gfx_options(void);      /* any thread; read once (the file is written with defaults when it does not exist) */

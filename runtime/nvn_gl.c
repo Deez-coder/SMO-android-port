@@ -341,6 +341,7 @@ static void gl_post(void (*fn)(void *), const void *arg, size_t size) {       /*
     plat_event_set(g_job_event);
 }
 static void gl_barrier(void) { if (g_async_pending) gl_run(job_nop, NULL); }   /* everything queued so far has run when this returns */
+void nvn_render_drain(void) { gl_barrier(); }      /* 0.4.2: smo_framerate.c, before an extra logic step of a frame */
 
 /* ---------------------------------------------------------------- statistics and diagnostics */
 static struct {
@@ -4906,6 +4907,9 @@ static int g_present_out, g_present_sync = -1;
 static void job_present_signal(void *arg) { g_rb->present(arg); plat_event_set(g_present_ev); }
 static void queue_present(Ctx *c) {                     /* (queue, window, textureIndex) */
     plat_spin_mark_hot_role(2);                         /* plat.h: the presenting thread sets the frame rate */
+    {   int nvn_vk_fp_scan_hold(void);                  /* 0.4.2 test (SMO_VK_FIRST_PREP_SCAN=1): the game waits behind the first-start bar until the container scan is done */
+        if (nvn_vk_fp_scan_hold()) { int64_t t0 = plat_ms64(); while (nvn_vk_fp_scan_hold()) plat_sleep_ms(20); printf("nvn_vk: the game waited %.1f s behind the first-start bar for the container scan\n", (plat_ms64() - t0) / 1000.0); fflush(stdout); }
+    }
     PresentJob j = {hobj(A1, K_WIN), (int)A2};
     {   int smo_camera_get(float view[12], float proj[16], int *steps, float pl[3], int *pl_ok);      /* 0.3.9, smo_camera.c: this frame's camera, for the motion vectors (0.3.11: its logic steps, Mario's position) */
         j.cam_ok = smo_camera_get(j.cam_view, j.cam_proj, &j.cam_steps, j.pl, &j.pl_ok); }
@@ -5728,8 +5732,14 @@ void nvn_front_ccmp_landed(void) {
     }
     g_ccmp_npend = 0;
 }
+/* 0.4.2: how long only a loading screen has been drawn (24 draws a frame or fewer, as the spinning hat's ~10), for the
+ * watchdog (nvn_vk_wd.c): issues 31 and 34 were loading screens that never ended while frames kept reaching the window,
+ * so the freeze report (no frame for 5 s) never ran. 0 when the last frame drew more. */
+static volatile int64_t g_low_draw_since;
+double nvn_front_loading_screen_s(void) { int64_t t = g_low_draw_since; return t ? (double)(plat_qpc() - t) / (double)plat_qpf() : 0.0; }
 long long nvn_front_frame_end(long long draws, long long skipped, long long clears) {
     int64_t frame = g_st.frames + 1;
+    if (draws > 24) g_low_draw_since = 0; else if (!g_low_draw_since) g_low_draw_since = plat_qpc();
     pf_frame_mark(frame);
     g_joblog_cur = frame;
     g_st.frames = frame;

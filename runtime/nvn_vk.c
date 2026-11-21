@@ -428,7 +428,31 @@ int nvn_vk_init(void *hwnd) {
                family < 0 ? " - cannot present to the window with a graphics + compute queue" : p.apiVersion < VK_API_VERSION_1_3 ? " - below Vulkan 1.3" : "");
         if (forced >= 0 ? (int)i == forced && usable : score > best_score) { best = (int)i; best_score = score; best_family = (uint32_t)family; }
     }
-    if (best < 0) { printf("nvn_vk: no usable Vulkan 1.3 device%s\n", forced >= 0 ? " (SMO_VK_DEVICE names one that is not usable)" : ""); fflush(stdout); plat_exit((int)5); }
+    if (best < 0) {
+        printf("nvn_vk: no usable Vulkan 1.3 device%s\n", forced >= 0 ? " (SMO_VK_DEVICE names one that is not usable)" : "");
+        /* 0.4.3: what an older driver offers instead (a Retroid Pocket 4 Pro, Mali-G77, has Vulkan 1.1.177): the parts of 1.2 and
+         * 1.3 this renderer relies on can come as extensions, so the list tells whether such a device could be served. */
+        for (uint32_t i = 0; i < ngpu; i++) {
+            static VkExtensionProperties ue[1024];
+            uint32_t nue = 1024;
+            VkResult er = vkEnumerateDeviceExtensionProperties(gpus[i], NULL, &nue, ue);
+            if (er != VK_SUCCESS && er != VK_INCOMPLETE) { printf("nvn_vk: device %u: extensions not listed (%d)\n", (unsigned)i, (int)er); continue; }
+            static const char *const k_needed[] = {"VK_KHR_dynamic_rendering", "VK_KHR_synchronization2", "VK_EXT_extended_dynamic_state", "VK_EXT_extended_dynamic_state2",
+                "VK_KHR_maintenance4", "VK_KHR_timeline_semaphore", "VK_EXT_descriptor_indexing", "VK_KHR_buffer_device_address", "VK_KHR_shader_float16_int8",
+                "VK_KHR_8bit_storage", "VK_KHR_create_renderpass2", "VK_KHR_depth_stencil_resolve", "VK_EXT_scalar_block_layout", "VK_KHR_format_feature_flags2",
+                "VK_EXT_pipeline_creation_cache_control", "VK_EXT_subgroup_size_control", "VK_KHR_copy_commands2", "VK_EXT_4444_formats"};
+            printf("nvn_vk: device %u: the 1.2 / 1.3 parts as extensions:", (unsigned)i);
+            for (unsigned w = 0; w < sizeof k_needed / sizeof *k_needed; w++) {
+                int have = 0;
+                for (uint32_t e = 0; e < nue && !have; e++) have = !strcmp(ue[e].extensionName, k_needed[w]);
+                printf(" %s=%s", k_needed[w] + 3, have ? "yes" : "NO");
+            }
+            printf("\nnvn_vk: device %u: all %u extensions%s:", (unsigned)i, (unsigned)nue, er == VK_INCOMPLETE ? " (list cut at 1024)" : "");
+            for (uint32_t e = 0; e < nue; e++) printf(" %s", ue[e].extensionName);
+            printf("\n");
+        }
+        fflush(stdout); plat_exit((int)5);
+    }
     V.gpu = gpus[best]; V.family = best_family;
     vkGetPhysicalDeviceProperties(V.gpu, &V.props);
 

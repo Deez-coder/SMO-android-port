@@ -10,7 +10,7 @@ There's no game code, no game assets, no keys and no firmware in this repo. You 
 
 Made with AI. Most of the code was written by Claude, Anthropic's AI assistant (through Claude Code), with the project's creator directing it, reviewing it and testing it on a real phone. Expect some rough edges, and if something breaks, please send logs (see below).
 
-## Status: beta 0.4
+## Status: beta 0.5
 
 The game boots, plays and saves. Here's how it runs on the dev's phone, on the phone's own driver.
 
@@ -18,9 +18,9 @@ Galaxy S24 Ultra (Snapdragon 8 Gen 3 / Adreno 750): about 58 to 60 fps in Cascad
 
 More device benchmarks will be added here as more logs come in.
 
-Your results will likely be different. Speed depends a lot on the phone's chip, its GPU driver, how warm it gets and your settings, so we'd love to hear how yours does. Custom drivers are optional. The first start builds the graphics for your phone, which takes a few minutes and can be slow at first, but only once (and again after an update that changes the shaders).
+Your results will likely be different. Speed depends a lot on the phone's chip, its GPU driver, how warm it gets and your settings, so we'd love to hear how yours does. Custom drivers are optional. The first start builds the graphics for your phone behind a progress bar, which takes a few minutes, but only once (and again after an update that changes the shaders). When you update, install the new APK over the old one. Uninstalling deletes those built graphics and your game files, and the next start has to build everything again.
 
-New in 0.4: frame generation, about 570 MB less graphics memory, speed improvements mostly for Mali GPUs, and more informative logs. The full list is in [CHANGELOG.md](CHANGELOG.md).
+New in 0.5: fixes for loading screens that never ended, the crash in Shiveria Town, the freeze after the first frog capture, and the intro cutscene's lighting with frame generation, plus about 1.3 GB less memory and fewer stutters on a first start. The full list is in [CHANGELOG.md](CHANGELOG.md).
 
 ## What you get
 
@@ -40,7 +40,7 @@ When something goes wrong. Advanced, then Export logs, makes a .zip with the gam
 
 Android 11 or newer on 64-bit ARM. Phones with an ARMv8.2 processor or newer use the main APK, and older ARMv8.0 or 8.1 phones (like Snapdragon 680 / 665 / 662) use the `-armv8.0` APK. The app tells you if you need it.
 
-Vulkan 1.3, about 8 GB of free space for the game files, and your own *Super Mario Odyssey* 1.0.0 dump and `prod.keys` from your own console.
+Vulkan 1.3 (the app warns you if your phone's driver is older), about 8 GB of free space for the game files, and your own *Super Mario Odyssey* 1.0.0 dump and `prod.keys` from your own console.
 
 ## Getting started
 

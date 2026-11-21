@@ -124,6 +124,33 @@ void dump_guest_threads(FILE *out);      /* os_threads.c */
 void icall_dump(FILE *out, uint64_t main_ctx);   /* hostrt.c, SMO_ICALLS */
 uint64_t icall_first_x0(uint64_t target);
 static Ctx *g_main_ctx;
+int g_guest_main_tid;                              /* 0.4.2: the main thread's host id, for the watchdog's stack peek */
+/* 0.4.2: for the watchdog's report (nvn_vk_wd.c): what the game's main thread is doing, by sampling the last guest function it
+ * entered and its link register 400 times over about a second; the 12 most frequent pairs. A loading screen that never ends
+ * (GitHub issues 31, 34; seen once on the S24 after Start on a new game) had every other thread idle and the main thread busy
+ * polling. Diagnostics only: reads another thread's context without a lock. */
+int boot_main_sample(char *out, size_t n) {
+    if (!g_main_ctx || !n) return 0;
+    struct { uint64_t fn, lr; int k; } h[64]; int nh = 0, total = 0;
+    for (int s = 0; s < 400; s++) {
+        uint64_t fn = g_main_ctx->fn, lr = g_main_ctx->x[30];
+        int i = 0;
+        for (; i < nh && (h[i].fn != fn || h[i].lr != lr); i++) {}
+        if (i < nh) h[i].k++; else if (nh < 64) { h[nh].fn = fn; h[nh].lr = lr; h[nh].k = 1; nh++; }
+        total++;
+        plat_sleep_ms(2);
+    }
+    int w = snprintf(out, n, "  main thread, %d samples (last guest function entered, link register: share):", total);
+    for (int k = 0; k < 12 && w < (int)n - 80; k++) {
+        int b = -1;
+        for (int i = 0; i < nh; i++) if (h[i].k && (b < 0 || h[i].k > h[b].k)) b = i;
+        if (b < 0) break;
+        w += snprintf(out + w, n - w, "\n    f_%llx  lr=%llx  %d%%", (unsigned long long)h[b].fn, (unsigned long long)h[b].lr, h[b].k * 100 / total);
+        h[b].k = 0;
+    }
+    if (w < (int)n - 2) { out[w++] = '\n'; out[w] = 0; }
+    return w;
+}
 
 static const char *g_elf;
 const char *boot_elf_path(void) { return g_elf; }
@@ -234,6 +261,7 @@ void main_stack_report(void) {
 }
 
 static void guest_main(void *arg) {
+    g_guest_main_tid = plat_tid();
     (void)arg;
 #ifdef __ANDROID__
     { void android_perf_add_thread(void); android_perf_add_thread(); }     /* android_perf.c: performance hints */

@@ -3,6 +3,7 @@
  * Guest synchronisation objects (MutexType, EventType, ...) are opaque here:
  * each one is identified by its guest address and backed by a host object
  * kept in a side table, so the guest layout never has to be known. */
+#include "gfx_options.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -220,7 +221,25 @@ static int console_cores(void) {
     if (g_cc < 0) {
         int n = 0, on = 0;
         const char *cc = getenv("SMO_OS_CONSOLE_CORES"), *cpus = getenv("SMO_OS_HOST_CPUS");
-        if (!cc || atoi(cc) != 0) {
+        /* 0.4.1 had graphics.ini cpu_cores = free (the launcher's CPU cores: Free) to turn the model off. 0.4.2: IGNORED. The
+         * Xiaomi tester's first session with it crashed in al::ExecutorActorCalcView::execute -> al::calcViewModelSystem on a null
+         * actor (the view update helpers), the failure this model exists to prevent (see above: free scheduling broke the game
+         * on the loading path and in the draw buffer update). His slow helper wake-ups grew with heat and memory pressure under
+         * Free as well (200 us at 900 MB free and no heat, 11 ms at "severe"), so the pinning was not their main cause. A file
+         * that still says free runs fixed and says so; SMO_OS_CONSOLE_CORES=0 remains for tests. */
+        int free_cores = 0;
+#ifdef __ANDROID__
+        {   const GfxOptions *go = gfx_options(); if (!cc && go->free_cores) printf("nn::os: graphics.ini cpu_cores = free is no longer used (it let the game crash): the console core model stays on\n"); }
+#endif
+        {   /* 0.4.1: the processors the system lets this process use (a tester's Xiaomi ran pinned threads elsewhere) */
+#ifndef _WIN32
+            cpu_set_t set; CPU_ZERO(&set); uint64_t m = 0;
+            if (sched_getaffinity(0, sizeof set, &set) == 0) for (int i = 0; i < 64; i++) if (CPU_ISSET(i, &set)) m |= 1ull << i;
+            printf("nn::os: the system lets the game use processors %llx (%d of them)%s\n", (unsigned long long)m, __builtin_popcountll(m), free_cores ? "; CPU cores = free: Android places the game's threads (graphics.ini cpu_cores)" : "");
+#endif
+        }
+        if (free_cores) printf("nn::os: console core model OFF (cpu_cores = free)\n");
+        else if (!cc || atoi(cc) != 0) {
             uintptr_t proc = 0, sys = 0;
 #ifdef _WIN32
             GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys);
@@ -307,8 +326,11 @@ static Ctx *new_ctx(uint64_t stack_top) {
 }
 
 /* Every guest thread's context, so a report can say where each one is. */
-static struct { Obj *o; Ctx *c; } g_threads[256];
+/* wt0, wlr, wfp (0.4.2): the blocking nn::os wait the thread is in now (its start, the guest return address and frame
+ * pointer), 0 when none, for the watchdog's report of a loading screen that never ends (issues 31, 34). */
+static struct { Obj *o; Ctx *c; volatile int64_t wt0; volatile uint64_t wlr, wfp; } g_threads[256];
 static volatile int32_t g_threads_n;
+static _Thread_local int t_slot = -1;              /* this thread's index in g_threads, -1 for the main thread and host threads */
 
 void dump_guest_threads(FILE *out) {
     fprintf(out, "\nguest threads (last function entered, link register):\n");
@@ -318,9 +340,31 @@ void dump_guest_threads(FILE *out) {
         fprintf(out, "  %-20s %s  f_%llx  lr=%llx  %s%s (from %llx)\n", o->name ? (const char *)(uintptr_t)o->name : "?",
                 o->finished ? "finished" : "running ", (unsigned long long)c->fn, (unsigned long long)c->x[30],
                 c->in_import ? "in " : "", c->in_import ? c->in_import : "guest code", (unsigned long long)c->import_from);
+        int64_t w0 = g_threads[i].wt0;                /* 0.4.2: the wait it is in now and the game's callers above it */
+        if (w0 && !o->finished) {
+            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+            int64_t nowns = (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+            uint64_t lr = g_threads[i].wlr, fp = g_threads[i].wfp;
+            fprintf(out, "      waiting on an nn::os object for %.1f s, called from main+0x%llx", (double)(nowns - w0) / 1e9, (unsigned long long)(lr >= 0x4000000000ull ? lr - 0x4000000000ull : lr));
+            for (int k = 0; k < 8 && fp > 0x10000 && fp < 0x8000000000ull && !(fp & 7); k++) {
+                uint64_t ra = *(const uint64_t *)(uintptr_t)(fp + 8), up = *(const uint64_t *)(uintptr_t)fp;
+                fprintf(out, " < 0x%llx", (unsigned long long)(ra >= 0x4000000000ull ? ra - 0x4000000000ull : ra));
+                if (up <= fp) break;
+                fp = up;
+            }
+            fprintf(out, "\n");
+        }
     }
 }
 
+/* 0.4.2: the host id of the running guest thread with that name, 0 = none (the watchdog's stack peek) */
+int guest_thread_tid_named(const char *name) {
+    for (int i = 0; i < g_threads_n && i < 256; i++) {
+        Obj *o = g_threads[i].o;
+        if (o && !o->finished && o->thread && o->name && !strcmp((const char *)(uintptr_t)o->name, name)) return (int)plat_thread_id(o->thread);
+    }
+    return 0;
+}
 /* hitch.c (SMO_HITCH): guest thread i -> context, name, host handle; 0 past the end. */
 int guest_thread_info(int i, Ctx **c, const char **name, plat_thread **h) {
     if (i < 0 || i >= g_threads_n || i >= 256 || !g_threads[i].o || !g_threads[i].c) return 0;
@@ -348,7 +392,7 @@ static void thread_main(void *arg) {
     Ctx *c = new_ctx(o->stack + o->stack_size);
     wr64(c->tpidr + 0x1f8, o->key);                   /* Horizon thread-local region: the ThreadType pointer lives at +0x1f8 */
     int32_t slot = plat_atomic_inc(&g_threads_n) - 1;
-    if (slot < 256) { g_threads[slot].o = o; g_threads[slot].c = c; }
+    if (slot < 256) { g_threads[slot].o = o; g_threads[slot].c = c; t_slot = slot; }
     c->x[0] = o->arg;
     trace_printf("--- thread %llx started (entry %llx, name %s)\n", (unsigned long long)o->key, (unsigned long long)o->fn,
                  o->name ? (const char *)(uintptr_t)o->name : "?");
@@ -620,7 +664,11 @@ static void wm_threads(double sec) {
         for (int i = 0; i < n; i++) if (top[i].pct >= 2.0 && (best < 0 || top[i].pct > top[best].pct)) best = i;
         if (best < 0) break;
         const char *gn = guest_thread_name_of((uint32_t)top[best].tid);
-        w += snprintf(line + w, sizeof line - w, " | %s %.0f%% cpu%d", gn ? gn : top[best].comm, top[best].pct, top[best].cpu);
+        {   /* 0.4.1: and the processors it may run on now (does the system keep the pinning?) */
+            cpu_set_t as; CPU_ZERO(&as); uint64_t am = 0;
+            if (sched_getaffinity(top[best].tid, sizeof as, &as) == 0) for (int b = 0; b < 64; b++) if (CPU_ISSET(b, &as)) am |= 1ull << b;
+            w += snprintf(line + w, sizeof line - w, " | %s %.0f%% cpu%d (may run on %llx)", gn ? gn : top[best].comm, top[best].pct, top[best].cpu, (unsigned long long)am);
+        }
         top[best].pct = 0;
         if (w > (int)sizeof line - 80) break;
     }
@@ -684,8 +732,15 @@ static void wm_note(int kind, Obj *o, int64_t t0) {
 extern _Thread_local int smo_t_in_calc;           /* smo_framerate.c (0.3.2): this thread is inside a logic step; its blocking waits are counted */
 void smo_calc_wait_add(int64_t ns);
 void smo_calc_wait_add_k(int kind, int64_t ns);      /* smo_framerate.c, 0.3.13: by kind */
-#define WM_BEGIN int64_t wm_t0_ = wm_on() || smo_t_in_calc ? wm_now() : 0
-#define WM_END(kind, o) do { if (wm_t0_) { if (smo_t_in_calc) smo_calc_wait_add_k(0, wm_now() - wm_t0_); if (g_wm > 0) wm_note(kind, o, wm_t0_); } } while (0)
+/* 0.4.2: wm_mark / wm_unmark keep the wait a game thread is in now (g_threads[].wt0), for the watchdog's report */
+static int64_t wm_mark(int64_t t0) {
+    if (t_slot >= 0 && t_slot < 256) { g_threads[t_slot].wlr = t_wm_lr; g_threads[t_slot].wfp = t_wm_fp; g_threads[t_slot].wt0 = t0 ? t0 : wm_now(); }
+    return t0;
+}
+static void wm_unmark(void) { if (t_slot >= 0 && t_slot < 256) g_threads[t_slot].wt0 = 0; }
+#define WM_BEGIN int64_t wm_t0_ = wm_mark(wm_on() || smo_t_in_calc ? wm_now() : 0)
+#define WM_END(kind, o) do { wm_unmark(); if (wm_t0_) { if (smo_t_in_calc) smo_calc_wait_add_k(0, wm_now() - wm_t0_); if (g_wm > 0) wm_note(kind, o, wm_t0_); } } while (0)
+#define WM_END_IF(cond, kind, o) do { if (cond) WM_END(kind, o); else wm_unmark(); } while (0)
 
 /* ---------------------------------------------------------------- mutexes */
 static void mtx_init(Ctx *c) { (void)obj(A0); }
@@ -739,7 +794,7 @@ static int ev_wait_ms(Obj *o, uint32_t ms) {
     while (!o->signaled) {
         if (!plat_cond_wait(&o->cv, &o->cs, ms)) { ok = o->signaled; break; }
     }
-    if (ms) WM_END(0, o);
+    WM_END_IF(ms, 0, o);
     if (ok && o->autoclear) o->signaled = 0;
     plat_mutex_unlock(&o->cs);
     return ok;
@@ -774,7 +829,7 @@ static int sev_wait(uint64_t key, uint32_t ms) {
     while (!o->signaled) {
         if (!plat_cond_wait(&o->cv, &o->cs, ms)) { ok = o->signaled; break; }
     }
-    if (ms) WM_END(1, o);
+    WM_END_IF(ms, 1, o);
     if (ok && raw->autoclear) o->signaled = 0;
     plat_mutex_unlock(&o->cs);
     return ok;
@@ -880,7 +935,7 @@ static int mq_put(Obj *o, uint64_t v, int front, uint32_t ms) {
     while (o->len == o->cap) {
         if (!plat_cond_wait(&o->cv, &o->cs, ms)) { ok = o->len < o->cap; break; }
     }
-    if (ms) WM_END(5, o);
+    WM_END_IF(ms, 5, o);
     wm_signal(o);
     if (ok) {
         if (front) { o->head = (o->head + o->cap - 1) % o->cap; o->buf[o->head] = v; }
@@ -898,7 +953,7 @@ static int mq_get(Obj *o, uint64_t out, uint32_t ms) {
     while (o->len == 0) {
         if (!plat_cond_wait(&o->cv, &o->cs, ms)) { ok = o->len > 0; break; }
     }
-    if (ms) WM_END(4, o);
+    WM_END_IF(ms, 4, o);
     wm_signal(o);
     if (ok) {
         wr64(out, o->buf[o->head]);

@@ -185,7 +185,7 @@ public class LauncherActivity extends Activity {
         Button play = button(have ? "▶  Play" : "Import game files first", have ? ACCENT : CARD2);
         play.setTextSize(18);
         play.setEnabled(have);
-        play.setOnClickListener(v -> { if (archOk()) startActivity(new Intent(this, GameActivity.class)); });
+        play.setOnClickListener(v -> { if (archOk()) vulkanOk(() -> startActivity(new Intent(this, GameActivity.class))); });
         card.addView(play, new LinearLayout.LayoutParams(-1, dp(56)));
         content.addView(card);
 
@@ -294,7 +294,7 @@ public class LauncherActivity extends Activity {
         c.addView(choice(g, "shader_wait", "New shaders", new String[]{"hold", "skip"}, new String[]{"Wait", "Skip until ready"}, "hold",
                 "Skip avoids a stutter the first time an effect appears; the effect is missing for a moment instead."));
         c.addView(choice(g, "diagnostics", "Diagnostics", new String[]{"off", "on"}, new String[]{"Off", "On"}, "off",
-                "On: on Mali GPUs, about once a minute one frame is measured and small pictures of it go into the exported logs (a short hitch). Other GPUs: nothing."));
+                "On: on Mali and PowerVR GPUs, about once a minute one frame is measured and small pictures of it go into the exported logs (a short hitch). Other GPUs: nothing."));
         content.addView(c);
 
         /* everything that decides the picture's size, together: the mode the game is told, then the scale of what it draws */
@@ -719,7 +719,8 @@ public class LauncherActivity extends Activity {
             final String fe = err;
             runOnUiThread(() -> {
                 getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-                d.dismiss();
+                dismissSafely(d);
+                if (isFinishing() || isDestroyed()) return;   /* the launcher was rebuilt meanwhile (rotation): its new screen shows the result */
                 if (fe != null) new AlertDialog.Builder(this).setTitle("Import failed").setMessage(fe).setPositiveButton("OK", null).show();
                 else toast("Game imported");
                 show(0);
@@ -962,12 +963,33 @@ public class LauncherActivity extends Activity {
             .setPositiveButton("OK", null).show();
         return false;
     }
+    /* 0.4.3: the renderer needs Vulkan 1.3. A Retroid Pocket 4 Pro (Mali-G77, Vulkan 1.1.177) closed at once with only
+     * "no usable Vulkan 1.3 device" in its log, which the player saw as a crash. With a custom driver installed and in use the
+     * phone's own version says nothing, so the check is for the phone's own driver only; "Start anyway" in case the phone
+     * declares less than its driver has. */
+    void vulkanOk(Runnable start) {
+        boolean custom = !"phone's own".equals(driverStatus());
+        boolean v13 = getPackageManager().hasSystemFeature(android.content.pm.PackageManager.FEATURE_VULKAN_HARDWARE_VERSION, 0x403000);
+        if (custom || v13) { start.run(); return; }
+        String have = "an older Vulkan version";
+        android.content.pm.FeatureInfo[] fs = getPackageManager().getSystemAvailableFeatures();
+        if (fs != null) for (android.content.pm.FeatureInfo f : fs)
+            if (android.content.pm.PackageManager.FEATURE_VULKAN_HARDWARE_VERSION.equals(f.name)) have = "Vulkan " + (f.version >> 22) + "." + ((f.version >> 12) & 0x3ff);
+        new AlertDialog.Builder(this).setTitle("This phone's graphics driver is too old")
+            .setMessage("The game needs Vulkan 1.3, and this phone's own graphics driver offers " + have + ". The game will most likely close right after it starts.\n\n"
+                + "A newer system update from the phone's maker may bring a newer driver. Snapdragon phones can also use a custom driver (Advanced, Graphics driver).\n\n"
+                + "If you start it anyway and it closes, please send the logs (Advanced, Export logs): they list what the driver offers.")
+            .setPositiveButton("Start anyway", (d, w) -> start.run()).setNegativeButton("Cancel", null).show();
+    }
     String versionName() { try { return getPackageManager().getPackageInfo(getPackageName(), 0).versionName; } catch (Exception e) { return ""; } }
     void confirm(String q, Runnable yes) { confirm(q, "Reset", yes); }
     void confirm(String q, String verb, Runnable yes) {
         new AlertDialog.Builder(this).setMessage(q).setPositiveButton(verb, (d, w) -> yes.run()).setNegativeButton("Cancel", null).show();
     }
 
+    /* 0.4.3: a dialog whose launcher screen was rebuilt (rotation, the system ending it) is no longer attached to a window, and
+     * dismiss() then throws ("not attached to window manager"): a Retroid Pocket 4 Pro's launcher closed so after an import. */
+    static void dismissSafely(AlertDialog d) { try { if (d.isShowing()) d.dismiss(); } catch (IllegalArgumentException ignored) { } }
     interface Work { void run() throws Exception; }
     void background(String what, Work w, Runnable done) {
         AlertDialog d = new AlertDialog.Builder(this).setMessage(what).setCancelable(false).show();
@@ -975,7 +997,7 @@ public class LauncherActivity extends Activity {
             String err = null;
             try { w.run(); } catch (Exception e) { err = e.getMessage(); }
             final String fe = err;
-            runOnUiThread(() -> { d.dismiss(); if (fe != null) toast("Failed: " + fe); done.run(); });
+            runOnUiThread(() -> { dismissSafely(d); if (isFinishing() || isDestroyed()) return; if (fe != null) toast("Failed: " + fe); done.run(); });
         }).start();
     }
 

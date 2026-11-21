@@ -112,7 +112,7 @@ def main():
     print('libadrenotools: %s' % ('linked (a custom Vulkan driver can be used)' if have_adrenotools(abi) else 'not built: the system Vulkan driver only'))
     cmd = [A.llvm_bin('clang++')] + A.target_flags(abi) + ['-shared', '-o', out, '@' + rsp] + sclibs + \
         ['-static-libstdc++', '-landroid', '-lnativewindow', '-llog', '-laaudio', '-lmediandk', '-lm', '-ldl',
-         '-Wl,-z,max-page-size=16384', '-Wl,-Bsymbolic', '-Wl,--wrap=f_400072e61c', '-Wl,--wrap=f_4000731fdc', '-Wl,--wrap=f_4000a58394', '-Wl,--wrap=f_4000a2b794', '-Wl,--wrap=f_4000a2b81c', '-Wl,--wrap=f_4000a2b8e0', '-Wl,--wrap=f_40004ccaf8', '-Wl,--wrap=f_400041dd34', '-Wl,--gc-sections', '-Wl,--no-undefined', '-Wl,-soname,libsmo.so',
+         '-Wl,-z,max-page-size=16384', '-Wl,-Bsymbolic', '-Wl,--wrap=f_400072e61c', '-Wl,--wrap=f_4000731fdc', '-Wl,--wrap=f_4000a58394', '-Wl,--wrap=f_4000a2bc4c', '-Wl,--wrap=f_400094ecc0', '-Wl,--wrap=f_40008bcc3c', '-Wl,--wrap=f_4000a57f58', '-Wl,--wrap=f_4000a02adc', '-Wl,--wrap=f_4000a80000', '-Wl,--wrap=f_4000793860', '-Wl,--wrap=f_40009d35b8', '-Wl,--wrap=f_4000a2b794', '-Wl,--wrap=f_4000a2b81c', '-Wl,--wrap=f_4000a2b8e0', '-Wl,--wrap=f_40004ccaf8', '-Wl,--wrap=f_400041dd34', '-Wl,--gc-sections', '-Wl,--no-undefined', '-Wl,-soname,libsmo.so',
          '-u', 'ANativeActivity_onCreate', '-Wl,--Map=' + out + '.map']
     t1 = time.time()
     r = subprocess.run(cmd, capture_output=True, text=True)

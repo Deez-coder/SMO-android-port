@@ -342,6 +342,7 @@ static void dump_guest_registers(void) {
     for (int i = 0; i < 31; i++)
         printf("  x%-2d %016llx%s", i, (unsigned long long)c->x[i], i % 3 == 2 ? "\n" : "");
     printf("  sp  %016llx\n", (unsigned long long)c->x[31]);
+    { void nnfs_last_note(void); nnfs_last_note(); }     /* 0.4.2: the last file this thread opened and read (nnfs.c) */
 }
 
 /* ---------------------------------------------------------------- imports */
@@ -666,6 +667,57 @@ static void host_stack_print(void) {
     }
 }
 static void host_trap_report(void) { dump_guest_registers(); host_stack_print(); }
+/* 0.4.2: another thread's host call stack, for the watchdog's report (nvn_vk_wd.c): a real-time signal makes the thread
+ * unwind its own stack in a handler; debuggerd -b needs root on a release phone. The freeze after the first frog capture
+ * (S24) had the game's Presentation Thread stuck inside nvnQueuePresentTexture and the render thread somewhere unknown.
+ * Diagnostics only; a futex wait the signal interrupts goes on (SA_RESTART; condition waits allow spurious wake-ups). */
+#include <signal.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+static HostStack g_peek;
+static volatile int g_peek_done, g_peek_sig;
+static void peek_handler(int sig, siginfo_t *si, void *uc) {
+    (void)sig; (void)si; (void)uc;
+    g_peek.n = 0;
+    _Unwind_Backtrace(host_stack_step, &g_peek);
+    __atomic_store_n(&g_peek_done, 1, __ATOMIC_RELEASE);
+}
+int host_stack_of_thread(int tid, char *out, size_t n) {
+    static int lock;
+    if (!tid || !n) return 0;
+    while (__atomic_exchange_n(&lock, 1, __ATOMIC_ACQUIRE)) plat_sleep_ms(1);
+    if (!g_peek_sig) {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_sigaction = peek_handler; sa.sa_flags = SA_SIGINFO | SA_RESTART; sigemptyset(&sa.sa_mask);
+        g_peek_sig = SIGRTMAX - 3;
+        sigaction(g_peek_sig, &sa, NULL);
+    }
+    __atomic_store_n(&g_peek_done, 0, __ATOMIC_RELEASE);
+    int w = 0;
+    if (syscall(SYS_tgkill, getpid(), tid, g_peek_sig) != 0) w = snprintf(out, n, "    (the signal was refused)\n");
+    else {
+        for (int i = 0; i < 100 && !__atomic_load_n(&g_peek_done, __ATOMIC_ACQUIRE); i++) plat_sleep_ms(5);
+        if (!__atomic_load_n(&g_peek_done, __ATOMIC_ACQUIRE)) w = snprintf(out, n, "    (no answer in 500 ms)\n");
+        else {
+            uint64_t last = 0;
+            for (int i = 0; i < g_peek.n && w < (int)n - 200; i++) {
+                Dl_info di;
+                const char *mod = "?", *sym = NULL;
+                uintptr_t base = 0;
+                if (dladdr((void *)g_peek.pc[i], &di)) { mod = di.dli_fname ? di.dli_fname : "?"; base = (uintptr_t)di.dli_fbase; sym = di.dli_sname; }
+                const char *bn = strrchr(mod, '/');
+                uint64_t g = guest_function_of(g_peek.pc[i]);
+                w += snprintf(out + w, n - w, "    %s+0x%llx%s%s", bn ? bn + 1 : mod, (unsigned long long)(g_peek.pc[i] - base), sym ? " " : "", sym ? sym : "");
+                if (g && g != last) w += snprintf(out + w, n - w, "   [guest f_%llx]", (unsigned long long)g);
+                w += snprintf(out + w, n - w, "\n");
+                if (g) last = g;
+            }
+        }
+    }
+    __atomic_store_n(&lock, 0, __ATOMIC_RELEASE);
+    return w;
+}
 static void posix_crash(const char *what, uintptr_t fault, uintptr_t pc) {
     Dl_info di;
     printf("\nHOST EXCEPTION %s at host address %p, fault address 0x%llx\n", what, (void *)pc, (unsigned long long)fault);

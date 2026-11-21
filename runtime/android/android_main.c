@@ -537,7 +537,7 @@ void android_main(struct android_app *app) {
     display_modes_log();
     {   /* <files>/config/env.txt: KEY=VALUE lines (# comments) set before the game starts, the Android stand-in for the
          * environment variables of the Windows build (SMO_SHOT, SMO_VK_DEBUG, ...: see the runtime's sources) */
-        char p[PLAT_MAX_PATH], line[512];
+        char p[PLAT_MAX_PATH]; static char line[16384];      /* 0.4.2: 512 before cut a long SMO_SEQ (tests/cap_kingdom.seq is 2 KB) */
         snprintf(p, sizeof p, "%s/config/env.txt", g_root);
         FILE *f = fopen(p, "r");
         while (f && fgets(line, sizeof line, f)) {

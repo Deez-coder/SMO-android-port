@@ -680,6 +680,11 @@ static void fs_QueryMountRomCacheSize(Ctx *c) {          /* (size_t *out) */
     RET(0);
 }
 
+/* 0.4.2: the last file this thread opened and read (nnfs_last_note, below) */
+static _Thread_local char t_fs_last[200];
+static _Thread_local uint64_t t_fs_roff, t_fs_rsize, t_fs_rgot;
+static _Thread_local unsigned char t_fs_head[16];
+static _Thread_local int t_fs_have_read;
 static void fs_OpenFile(Ctx *c) {                     /* (FileHandle *out, const char *path, int mode) */
     char rel[PLAT_MAX_PATH], path[PLAT_MAX_PATH];
     Mount *m = NULL;
@@ -708,9 +713,22 @@ static void fs_OpenFile(Ctx *c) {                     /* (FileHandle *out, const
     {   static int on = -1; if (on < 0) on = getenv("SMO_FSLOG") != NULL;       /* D2 debug: every open on stdout */
         if (on) printf("fslog: open \"%s\" mode %d -> %s\n", STR(1), (int)A2, r ? "NOT FOUND" : "ok"); }
     if (r) { wr64(A0, 0); RET(r); return; }
+    snprintf(t_fs_last, sizeof t_fs_last, "%s", STR(1)); t_fs_have_read = 0;
     open_remember(h, (int)(A2 & 7), m);
     wr64(A0, fsh_guest(h));
     RET(0);
+}
+/* 0.4.2: the last file this thread opened and its last read (offset, size asked, bytes got, the first 16 bytes), for a crash
+ * or abort report (hostrt.c): issue 33 aborted in the game's heap while unpacking an archive whose header gave a 3.2 GB
+ * size, and the log could not say which file it was or what it held. Two stores per open or read, nothing printed. */
+void nnfs_last_note(void) {
+    if (!t_fs_last[0]) return;
+    printf("last game file this thread opened: %s\n", t_fs_last);
+    if (t_fs_have_read) {
+        printf("  its last read: offset 0x%llx, 0x%llx bytes asked, 0x%llx got, first bytes:", (unsigned long long)t_fs_roff, (unsigned long long)t_fs_rsize, (unsigned long long)t_fs_rgot);
+        for (int i = 0; i < 16 && (uint64_t)i < t_fs_rgot; i++) printf(" %02x", t_fs_head[i]);
+        printf("\n");
+    }
 }
 static void fs_CloseFile(Ctx *c) { if (A0) { open_mode(fsh_host(A0), 1); fsh_close(fsh_host(A0)); } }
 extern int g_hitch_ms; void hitch_note(const char *s);      /* hitch.c: SMO_HITCH */
@@ -723,6 +741,8 @@ static uint64_t read_at(FsH h, int64_t offset, void *buf, uint64_t size) {
 static volatile int32_t g_read_log;
 static void fs_ReadFile(Ctx *c) {                     /* (handle, offset, buffer, size) */
     uint64_t got = read_at(fsh_host(A0), (int64_t)A1, (void *)(uintptr_t)A2, A3);
+    t_fs_roff = A1; t_fs_rsize = A3; t_fs_rgot = got; t_fs_have_read = 1;
+    if (got) memcpy(t_fs_head, (const void *)(uintptr_t)A2, got < 16 ? (size_t)got : 16);
     if (plat_atomic_inc(&g_read_log) <= 60)
         trace_printf("     fs read offset %llx size %llx -> %llx bytes  from=%llx\n", (unsigned long long)A1,
                      (unsigned long long)A3, (unsigned long long)got, (unsigned long long)c->x[30] - 4);
@@ -731,6 +751,8 @@ static void fs_ReadFile(Ctx *c) {                     /* (handle, offset, buffer
 }
 static void fs_ReadFileCount(Ctx *c) {                /* (size_t *outRead, handle, offset, buffer, size) */
     uint64_t got = read_at(fsh_host(A1), (int64_t)A2, (void *)(uintptr_t)A3, A4);
+    t_fs_roff = A2; t_fs_rsize = A4; t_fs_rgot = got; t_fs_have_read = 1;
+    if (got) memcpy(t_fs_head, (const void *)(uintptr_t)A3, got < 16 ? (size_t)got : 16);
     wr64(A0, got);
     if (got != A4 && getenv("SMO_FSLOG")) printf("fslog: ReadFile(count) SHORT handle %llx offset %llx size %llx got %llx from=%llx\n", (unsigned long long)A1, (unsigned long long)A2, (unsigned long long)A4, (unsigned long long)got, (unsigned long long)c->x[30] - 4);   /* D2 debug */
     RET(0);

@@ -29,6 +29,7 @@
 void input_mark(const char *what);                       /* nnhid.c: anchor for scripted input */
 
 #include "nnmovie_common.inc"
+#include "mp4_faststart.inc"
 
 /* A decoded sample (Media Foundation's IMFSample on Windows): packed NV12 at the track's size, or 16-bit PCM */
 typedef struct MSample { uint8_t *data; size_t size; } MSample;
@@ -213,6 +214,12 @@ static int ext_open_bytes(Ext *e, unsigned char *data, size_t size) {
         else printf("  [%d] %s", i, tr->mime);
     }
     printf("\n");
+    if (e->ntracks == 0) {                            /* 0.4.2: the game's player crashed on an opened file with no tracks (issue 32): an error instead */
+        printf("movie: %s: the extractor found no tracks: reported to the game as a file that cannot be opened\n", e->path);
+        AMediaExtractor_delete(e->rd);
+        e->rd = NULL;
+        return 0;
+    }
     return 1;
 }
 
@@ -484,6 +491,9 @@ static void ext_deleting_dtor(Ctx *c) { ext_dtor_common(c, 1); }
 static int ext_set_source_bytes(Ext *e, unsigned char *data, size_t size) {
     const char *save = getenv("SMO_MOVIE_SAVE");
     if (save) { FILE *f = fopen(save, "wb"); if (f) { fwrite(data, 1, size, f); fclose(f); printf("movie: saved %zu bytes to %s\n", size, save); } }
+    int moved = 0;
+    data = mp4_faststart(data, &size, &moved);        /* 0.4.2: index first (the Snow Kingdom videos have it last; issue 32) */
+    if (moved) printf("movie: %s: its index (moov) was after the picture data: moved in front, %d offset tables shifted\n", e->path, moved);
     int ok = ext_open_bytes(e, data, size);           /* Android: the data source reads from data: freed with the extractor */
     if (!ok && e->bytes != data) free(data);
     return ok ? ST_OK : ST_FAILED;
@@ -1268,6 +1278,7 @@ static void movie_selftest_main(void *arg) {
     Ext *e = calloc(1, sizeof *e);
     plat_mutex_init(&e->cs); plat_cond_init(&e->cv);
     snprintf(e->path, sizeof e->path, "%s", path);
+    { size_t n = (size_t)sz; int moved = 0; data = mp4_faststart(data, &n, &moved); sz = (long)n; if (moved) printf("movie selftest: index moved in front (%d offset tables)\n", moved); }
     if (!ext_open_bytes(e, data, (size_t)sz)) { printf("movie selftest: not opened\n"); return; }
     ext_lock(e);
     for (int i = 0; i < e->ntracks; i++) if (e->tr[i].kind == 0) ext_select(e, i, 1);

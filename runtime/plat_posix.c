@@ -333,7 +333,11 @@ void plat_thread_set_affinity(plat_thread *t, uint64_t cpu_mask) {
     cpu_set_t s;
     CPU_ZERO(&s);
     for (int i = 0; i < 64 && i < CPU_SETSIZE; i++) if (cpu_mask >> i & 1) CPU_SET(i, &s);
-    sched_setaffinity((pid_t)(t ? t->tid : plat_tid()), sizeof s, &s);
+    if (sched_setaffinity((pid_t)(t ? t->tid : plat_tid()), sizeof s, &s) != 0) {      /* 0.4.1: a refused pinning goes into the log (the first 8) */
+        static int said;
+        int er = errno;
+        if (said++ < 8) printf("plat: pinning thread %d to processors %llx was refused (%s)\n", (int)(t ? t->tid : plat_tid()), (unsigned long long)cpu_mask, strerror(er));
+    }
 }
 
 void plat_thread_set_name(const char *name) {

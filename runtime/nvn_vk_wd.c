@@ -19,6 +19,7 @@ const char *guest_thread_name_of(uint32_t tid);       /* os_threads.c */
 int display_menu_held(void);                       /* display.c */
 /* fn_table / fn_table_count (runtime.h; -Dfn_table=(*game_fn_table_p)): the lifted game's functions, by guest address */
 static volatile int32_t g_wd_quit;
+static double g_wd_loading;                         /* 0.4.2: > 0 while the report is for a loading screen that does not end */
 static plat_thread *g_wd_thread;
 static FILE *g_wd_fp;
 static uint32_t g_wd_main_tid;
@@ -219,7 +220,7 @@ static void wd_dump(double stall_s, int64_t tries_since) {
     localtime_r(&now, &lt);
     snprintf(path, sizeof path, "%s/freeze.txt", plat_data_root());
     g_wd_fp = fopen(path, "ab");
-    wdp("\nnvn_vk_watchdog: ======== NO FRAME PRESENTED FOR %.1f s ======== %04d-%02d-%02d %02d:%02d:%02d, process %lu, game frame %lld\n", stall_s, lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday, lt.tm_hour, lt.tm_min, lt.tm_sec, (unsigned long)plat_pid(), (long long)nvn_front_frame_next());
+    wdp("\nnvn_vk_watchdog: ======== %s %.1f s ======== %04d-%02d-%02d %02d:%02d:%02d, process %lu, game frame %lld\n", g_wd_loading > 0 ? "ONLY A LOADING SCREEN (24 draws a frame or fewer) FOR" : "NO FRAME PRESENTED FOR", stall_s, lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday, lt.tm_hour, lt.tm_min, lt.tm_sec, (unsigned long)plat_pid(), (long long)nvn_front_frame_next());
     wdp("  presents: %lld frames reached the window so far; present attempts since the last one that did: %lld; frames not presented %lld, failed Vulkan calls %lld, swapchain made again %lld times; window %s\n",
         (long long)g_vk_frames, (long long)tries_since, (long long)g_vk_skipped, (long long)g_vk_errors, (long long)g_vk_recreated, plat_window_minimized(nvn_front_hwnd()) ? "NOT VISIBLE" : "visible");
     wdp("  render thread %lu, place in its present: %d (1 loading barrier, 2 acquire, 3 blit and submit, 4 present, 0 none)\n", (unsigned long)g_render_tid, g_wd_where);
@@ -233,6 +234,18 @@ static void wd_dump(double stall_s, int64_t tries_since) {
         wdp("  wait of ours: thread %lu (%s) in %s, line %d, for %.1f s\n", (unsigned long)w.tid, wd_tname((uint32_t)w.tid, tb, sizeof tb), w.fn ? w.fn : "?", w.line, (double)(tk() - w.since) / (double)fq.QuadPart);
     }
     { void dump_guest_threads(FILE *out); dump_guest_threads(stdout); if (g_wd_fp) dump_guest_threads(g_wd_fp); }
+    {   static char ms[2048]; int boot_main_sample(char *out, size_t n);      /* 0.4.2: the main thread's busy loop (boot.c) */
+        if (boot_main_sample(ms, sizeof ms)) wdp("%s", ms); }
+    {   /* 0.4.2: host call stacks of the threads that decide whether frames come (hostrt.c host_stack_of_thread) */
+        int host_stack_of_thread(int tid, char *out, size_t n); int guest_thread_tid_named(const char *name); extern int g_guest_main_tid;
+        static char hs[8192];
+        struct { const char *what; int tid; } th[3] = {{"render thread", (int)g_render_tid}, {"Presentation Thread", guest_thread_tid_named("Presentation Thread")}, {"main thread", g_guest_main_tid}};
+        for (int k = 0; k < 3; k++) {
+            if (!th[k].tid) continue;
+            host_stack_of_thread(th[k].tid, hs, sizeof hs);
+            wdp("  host call stack of the %s (%d), innermost first:\n%s", th[k].what, th[k].tid, hs);
+        }
+    }
     wdp("nvn_vk_watchdog: ======== end of the report; also appended to %s ========\n\n", path);
     fflush(stdout);
     if (g_wd_fp) { fclose(g_wd_fp); g_wd_fp = NULL; }
@@ -247,6 +260,19 @@ static uint32_t  wd_main(void *arg) {
         plat_sleep_ms(500);
         int64_t b = g_wd_beat;
         if (!b || !V.alive || g_wd_quit) continue;  /* armed by the first frame that reaches the window */
+        {   /* 0.4.2: a loading screen that does not end while frames still reach the window (issues 31, 34): the same report
+             * after 60 s of only a loading screen, again after 3 and 9 times as long. Not during the first-start bar
+             * (g_fp_state 1) or a menu that holds the game on purpose. */
+            double nvn_front_loading_screen_s(void);
+            static int ldumps; static double lnext = 60;
+            double ls = nvn_front_loading_screen_s();
+            if (ls < 1) lnext = 60;
+            else if (ls >= lnext && ldumps < 3 && g_fp_state != 1 && !display_menu_held()) {
+                ldumps++; g_wd_loading = ls;
+                wd_dump(ls, 0);
+                g_wd_loading = 0; lnext = ls * 3;
+            }
+        }
         if (b != seen) {
             if (reported > 0) { printf("nvn_vk_watchdog: frames reach the window again (the stall lasted between %.1f and %.1f s)\n", reported, reported + (double)(b - seen) / (double)fq.QuadPart); fflush(stdout); }
             seen = b; try0 = g_wd_try; next = limit; reported = 0;

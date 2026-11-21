@@ -18,11 +18,14 @@
  * SMO_STEADY = 0/1 overrides graphics.ini. */
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "plat.h"
 #include "runtime.h"
 #include "gfx_options.h"
 
 #define STEADY_MAX 3
+static int cube_changed_take(void);
+static void g_cube_cuts_add(void);
 
 void __real_f_4000731fdc(Ctx *c);
 static int g_twice = -1, g_steady_env = -2;
@@ -93,7 +96,22 @@ void __wrap_f_4000731fdc(Ctx *c) {
     g_last = now.QuadPart;
     smo_frame_steps = n;
     int64_t c0 = g_calc_ticks;
-    for (int i = 0; i < n; i++) calc_once(c, self, ret, i == 0);
+    {   /* TEST, SMO_CALC_DRAIN=1: before the second (third) logic step of a frame, the render thread finishes the commands it has
+         * (the frame before, whose data it copies out of game memory as it replays them). With two steps a frame each frame writes
+         * both halves of the game's double-buffered GPU data, the half still being copied too: the intro cutscene lost its lighting
+         * and Bowser flashed black at two steps a frame (frame generation or steady speed at 30), not at one. */
+        static int drain = -1; void nvn_render_drain(void);
+        if (drain < 0) { const char *e = getenv("SMO_CALC_DRAIN"); drain = e && atoi(e) != 0; if (drain) printf("smo_framerate: TEST: an extra logic step waits for the render thread (SMO_CALC_DRAIN)\n"); }
+        int ran = 0;
+        for (int i = 0; i < n; i++) {
+            if (i > 0 && drain) nvn_render_drain();
+            calc_once(c, self, ret, i == 0); ran++;
+            if (i + 1 < n && cube_changed_take()) { g_acc += n - ran; g_cube_cuts_add(); break; }      /* 0.4.2: a new cube map: drawn before the next step (below) */
+        }
+        if (ran < n) { n = ran; smo_frame_steps = n; }
+        else (void)cube_changed_take();
+
+    }
     int64_t cd = g_calc_ticks - c0;
     g_frames++; g_steps += n; g_multi[n]++; g_calcs += n;
     {   /* 0.2.15, SMO_SPIN_AB=<frames> (test only): the spin's yield (plat.h plat_spin_yield_on) off and on by turns every that many
@@ -133,3 +151,49 @@ void smo_framerate_totals(double *logic_ms, int64_t *steps) {
     *logic_ms = (double)g_calc_total * 1000.0 / (double)fq;
     *steps = g_calcs;
 }
+
+/* 0.4.2, THE CUBE MAP REQUEST AND STEADY SPEED. Each logic step (al::LiveActorKit::update) clears the graphics requests, lets the
+ * actors and demos ask for a cube map (al::ShaderCubeMapKeeper::requestCubeMap: +752 its priority, -1 none; +760, +768 its two
+ * names) and then al::ShaderCubeMapKeeper::update [main 0xa02adc] acts on it; the draw after that step renders the new ambient
+ * light cube maps (10 of 128x128, 60 faces, in one frame). With two steps before one draw (frame generation, steady speed under
+ * 60 fps) the step after the request has none, and the draw never renders them: the intro cutscene of a new game played
+ * without its ambient light (dark shadow sides, no soft light; the user saw it as missing shading and bloom), measured on the
+ * S24: the 60 cube passes in the intro's first frame at one step a frame, none until 48 s later at two. So when a step changes
+ * the requested cube map, the frame draws after that step; the steps it did not run are owed to the next frame (g_acc).
+ * libsmo.so is linked with -Wl,--wrap=f_4000a02adc (its one caller is in another object). */
+void __real_f_4000a02adc(Ctx *c);
+static volatile int g_cube_changed;
+static int64_t g_cube_changes, g_cube_cuts;
+void __wrap_f_4000a02adc(Ctx *c) {
+    uint64_t self = c->x[0];
+    int prio = (int)rd32(self + 752);
+    static uint64_t last_self;
+    static char last[160];
+    static int64_t requests, updates;
+    updates++;
+    if (self != last_self) { last_self = self; last[0] = 0; }
+    if (prio != -1) requests++;
+    __real_f_4000a02adc(c);
+    /* What update decides, read after it: +176 the cube map info in use (another one after a request for another cube map,
+     * and new ones when a stage's resources are made: Top-Hat Tower asks for "Default" as Cap Kingdom did, so the name alone
+     * did not show it), +808 the info's capture setting it last applied (it sets the capture point when that differs). */
+    static uint64_t last_info; static int last_cap = -1;
+    uint64_t info = rd64(self + 176); int cap = (int)rd8(self + 808);
+    if (info != last_info || cap != last_cap) {
+        if (info) {
+            g_cube_changed = 1; g_cube_changes++;
+            if (g_cube_changes <= 40) {
+                uint64_t a = rd64(self + 760), b = rd64(self + 768);
+                printf("smo_framerate: the cube maps change (info %llx -> %llx, capture %d -> %d, request %s|%s priority %d): the frame is drawn after this logic step (%lld requests in %lld steps so far)\n",
+                       (unsigned long long)last_info, (unsigned long long)info, last_cap, cap, prio != -1 && a ? (const char *)(uintptr_t)a : "", prio != -1 && b ? (const char *)(uintptr_t)b : "", prio, (long long)requests, (long long)updates);
+                fflush(stdout);
+            }
+        }
+        last_info = info; last_cap = cap;
+    }
+    (void)last;
+}
+static int cube_changed_take(void) { int v = g_cube_changed; g_cube_changed = 0; return v; }
+/* The same for a screen capture (smo_capture.c): the step that asks for one is followed by the draw that copies it. */
+void smo_frame_draw_after_step(void) { g_cube_changed = 1; }
+static void g_cube_cuts_add(void) { g_cube_cuts++; }

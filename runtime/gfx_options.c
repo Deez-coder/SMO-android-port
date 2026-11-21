@@ -100,6 +100,11 @@ static const char *const k_default_ini =
 ";   while it is on); it stops by itself when the frames are on time again. on: always, also where it gains nothing.\r\n"
 "boost = " DEF_BOOST "\r\n"
 "\r\n"
+"; cpu_cores = fixed | free      (Android) fixed: each of the game's threads stays on the processor the console would give it, and\r\n"
+";   the render thread on the fastest one. free: Android places them. Free can help where the system moves the game's threads\r\n"
+";   itself (some Xiaomi phones). Read at the start.\r\n"
+"cpu_cores = fixed\r\n"
+"\r\n"
 "; anti_aliasing = off | fxaa      (Vulkan) fxaa: edges smoothed on the final picture; a little softer, cheap\r\n"
 "anti_aliasing = " DEF_AA "\r\n"
 "\r\n"
@@ -216,6 +221,7 @@ static int opt_key(GfxOptions *o, const char *key, const char *val) {
     else if (!plat_stricmp(key, "steady_speed")) o->steady = !plat_stricmp(val, "on") || !strcmp(val, "1");
     else if (!plat_stricmp(key, "frame_generation")) o->framegen = !plat_stricmp(val, "on") || !strcmp(val, "1") ? 1 : !plat_stricmp(val, "auto") ? 2 : 0;
     else if (!plat_stricmp(key, "frame_generation_quality")) o->fg_fast = !plat_stricmp(val, "fast");
+    else if (!plat_stricmp(key, "cpu_cores")) o->free_cores = !plat_stricmp(val, "free");
     else if (!plat_stricmp(key, "fps_cap")) { int v = (int)(atof(val) + 0.5); o->fps_cap = v >= 10 && v < 60 ? v : 0; }
     else if (!plat_stricmp(key, "sharpening")) { float v = (float)atof(val); o->sharpen = v < 0 ? 0 : v > 100 ? 1.0f : v / 100.0f; }
     else if (!plat_stricmp(key, "dynamic_resolution")) o->dynres = plat_stricmp(val, "off") != 0;
@@ -275,7 +281,8 @@ static void opt_load(void) {
            written ? "written with the defaults" : f ? "read" : "NOT readable, defaults used", o->renderer ? "opengl" : "vulkan", k_win[o->window_mode], o->width, o->height, k_vs[o->present],
            o->gpu[0] ? o->gpu : "auto", o->handheld ? "handheld" : "docked", o->scale, o->aniso, o->overlay ? "on" : "off", unknown ? " (lines with an unknown key were ignored)" : "");
     if (o->scale != 1.0f && o->renderer) printf("graphics options: resolution_scale=%.2f is ignored by the OpenGL renderer (Vulkan only)\n", o->scale);
-    if (o->scale != 1.0f && (o->scale < 0.25f || o->scale > 1.0f)) printf("graphics options: resolution_scale=%.2f is outside 0.25 .. 1.0: the nearest of the two is used\n", o->scale);
+    if (o->scale <= 0.0f) printf("graphics options: resolution_scale = auto (handheld 1.0, docked 1.2 of the game's size)\n");      /* 0.5: auto is 0 here; it was reported as out of range */
+    else if (o->scale < 0.25f || o->scale > 2.0f) printf("graphics options: resolution_scale=%.2f is outside 0.25 .. 2.0: the nearest of the two is used\n", o->scale);
     fflush(stdout);
 }
 /* Android port, 0.2.3: the in-game menu (GameActivity) writes graphics.ini and calls this. The keys the present pass reads
