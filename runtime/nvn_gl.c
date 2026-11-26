@@ -5610,6 +5610,102 @@ int nvn_front_tex_changed(Tex *t) {
     g_st.tex_uploads++;
     return 1;
 }
+/* 0.5.7, Android: the ETC2 / EAC re-encoding of BC textures (tex_etc.c, GPUs without BC: Mali, PowerVR) kept on disk.
+ * A tester's Helio G99 (Mali-G57 MC2) log spent up to 45 ms a frame of the render thread on "textures" while an area loaded,
+ * every visit and every run: the encoder works on the CPU when a texture is first read, and the result depends only on the
+ * texture's bytes. So the re-encoded levels of a texture go into <cache>/etc/v1_<hash>_<format>_<w>x<h>x<layers>_<levels>.etc
+ * (written by a thread of its own, after the texture is uploaded), and the next time the file is read instead (a hit costs
+ * a file read of the texture's size: ~1 GB/s of flash against the encoder's tens of MB/s). The hash covers every input byte
+ * the levels are read from. The folder stops growing at ETCC_CAP_MB (no eviction: the set of game textures is fixed, and the
+ * ones seen first are the ones seen at every start). SMO_ETC_CACHE=0: off. A "tex_etc:" line every 10 s while it works. */
+#define ETCC_CAP_MB 1024
+#define ETCC_MIN_BYTES 4096                        /* smaller ones are re-encoded each time (0.5.7 test: with 32 KB, 28 MB of small textures were still re-encoded in 2.7 s of a Cap Kingdom start) */
+static int g_etcc_on = -1;
+static char g_etcc_dir[256];
+static int64_t g_etcc_disk, g_etcc_hits, g_etcc_miss, g_etcc_written, g_etcc_dropped, g_etcc_rd_bytes, g_etcc_rd_ns, g_etc_bytes, g_etc_ns, g_etc_levels, g_etcc_said;
+#if defined(__ANDROID__)
+#include <dirent.h>
+#include <pthread.h>
+#include <sys/stat.h>
+typedef struct EtccJob { struct EtccJob *next; char path[300]; uint8_t *data; size_t size; } EtccJob;
+static pthread_mutex_t g_etcc_mx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_etcc_cv = PTHREAD_COND_INITIALIZER;
+static EtccJob *g_etcc_head, *g_etcc_tail;
+static int64_t g_etcc_queued;                      /* bytes waiting to be written (new writes are dropped above 64 MB) */
+static void *etcc_writer(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&g_etcc_mx);
+        while (!g_etcc_head) pthread_cond_wait(&g_etcc_cv, &g_etcc_mx);
+        EtccJob *j = g_etcc_head; g_etcc_head = j->next; if (!g_etcc_head) g_etcc_tail = NULL;
+        pthread_mutex_unlock(&g_etcc_mx);
+        char tmp[320]; snprintf(tmp, sizeof tmp, "%s.part", j->path);
+        FILE *f = fopen(tmp, "wb");
+        int ok = f && fwrite(j->data, 1, j->size, f) == j->size;
+        if (f) ok = fclose(f) == 0 && ok;
+        if (ok) ok = rename(tmp, j->path) == 0;
+        if (!ok) remove(tmp);
+        pthread_mutex_lock(&g_etcc_mx);
+        g_etcc_queued -= (int64_t)j->size;
+        if (ok) { g_etcc_written++; g_etcc_disk += (int64_t)j->size; }
+        pthread_mutex_unlock(&g_etcc_mx);
+        free(j->data); free(j);
+    }
+    return NULL;
+}
+static int etcc_on(void) {
+    if (g_etcc_on >= 0) return g_etcc_on;
+    const char *e = getenv("SMO_ETC_CACHE");
+    g_etcc_on = !(e && !atoi(e));
+    if (g_etcc_on) {
+        snprintf(g_etcc_dir, sizeof g_etcc_dir, "../cache/etc");
+        plat_mkdirs(g_etcc_dir);
+        DIR *d = opendir(g_etcc_dir); int64_t n = 0, files = 0;
+        if (d) {
+            struct dirent *de; char p[600]; struct stat st;
+            while ((de = readdir(d)) != NULL) {
+                if (de->d_name[0] == '.') continue;
+                snprintf(p, sizeof p, "%s/%s", g_etcc_dir, de->d_name);
+                size_t ln = strlen(de->d_name);
+                if (ln > 5 && !strcmp(de->d_name + ln - 5, ".part")) { remove(p); continue; }      /* a write the last run did not finish */
+                if (stat(p, &st) == 0) { n += (int64_t)st.st_size; files++; }
+            }
+            closedir(d);
+        }
+        g_etcc_disk = n;
+        pthread_t th;
+        if (pthread_create(&th, NULL, etcc_writer, NULL) == 0) pthread_detach(th); else g_etcc_on = 0;
+        printf("tex_etc: re-encoded textures kept in %s: %lld files, %lld MB (cap %d MB)%s\n", g_etcc_dir, (long long)files, (long long)(n >> 20), ETCC_CAP_MB, g_etcc_on ? "" : "; the writer did not start: off");
+    } else printf("tex_etc: the cache of re-encoded textures is off (SMO_ETC_CACHE=0)\n");
+    return g_etcc_on;
+}
+static void etcc_put(const char *path, uint8_t *data, size_t size) {      /* takes data */
+    pthread_mutex_lock(&g_etcc_mx);
+    if (g_etcc_queued + (int64_t)size > (64 << 20) || g_etcc_disk + g_etcc_queued + (int64_t)size > ((int64_t)ETCC_CAP_MB << 20)) { pthread_mutex_unlock(&g_etcc_mx); g_etcc_dropped++; free(data); return; }
+    EtccJob *j = calloc(1, sizeof *j);
+    if (!j) { pthread_mutex_unlock(&g_etcc_mx); free(data); return; }
+    snprintf(j->path, sizeof j->path, "%s", path); j->data = data; j->size = size;
+    if (g_etcc_tail) g_etcc_tail->next = j; else g_etcc_head = j;
+    g_etcc_tail = j; g_etcc_queued += (int64_t)size;
+    pthread_cond_signal(&g_etcc_cv);
+    pthread_mutex_unlock(&g_etcc_mx);
+}
+#else
+static int etcc_on(void) { return 0; }
+static void etcc_put(const char *path, uint8_t *data, size_t size) { (void)path; (void)size; free(data); }
+#endif
+static void etc_report(void) {
+    static int64_t last;
+    int64_t now = plat_qpc();
+    if (now - last < 10 * plat_qpf() || g_etcc_said == g_etc_levels + g_etcc_hits) return;
+    last = now; g_etcc_said = g_etc_levels + g_etcc_hits;
+    printf("tex_etc: re-encoded %lld levels, %.1f MB in %.0f ms (%.1f ms a MB) | cache: %lld textures read (%.1f MB in %.0f ms), %lld re-encoded, %lld written, %lld not kept (full), %lld MB on disk\n",
+           (long long)g_etc_levels, (double)g_etc_bytes / 1048576.0, (double)g_etc_ns / 1e6, g_etc_bytes ? (double)g_etc_ns / 1e6 / ((double)g_etc_bytes / 1048576.0) : 0.0,
+           (long long)g_etcc_hits, (double)g_etcc_rd_bytes / 1048576.0, (double)g_etcc_rd_ns / 1e6, (long long)g_etcc_miss, (long long)g_etcc_written, (long long)g_etcc_dropped, (long long)(g_etcc_disk >> 20));
+    fflush(stdout);
+}
+static int64_t tick_ns(int64_t t0) { return (plat_qpc() - t0) * 1000000000 / plat_qpf(); }
+
 /* tex_upload_memory with the texels handed to the caller instead of glTexSubImage. */
 int nvn_front_tex_read(Tex *t, int decode, nvn_front_put_fn *put) {
     static uint8_t *tmp;
@@ -5628,6 +5724,46 @@ int nvn_front_tex_read(Tex *t, int decode, nvn_front_put_fn *put) {
     TexLayout L;
     tex_lay(b, &L);
     int levels = nvn_front_tex_levels(t);
+    /* 0.5.7: the re-encoded levels from the disk cache, or kept for it (etcc_on above) */
+    uint8_t *keep = NULL; size_t keep_size = 0, keep_at = 0; char keep_path[300]; keep_path[0] = 0;
+    if (decode == TEX_DEC_ETC && etcc_on()) {
+        size_t tot = 0; uint64_t key = 0xcbf29ce484222325ULL ^ (uint64_t)b->format;
+        int ok = 1;
+        for (int layer = 0; layer < L.layers && ok; layer++)
+            for (int l = 0; l < levels && l < L.levels; l++) {
+                const uint8_t *p = tex_level_ptr(&L, src, l, layer);
+                if (!b->packaged && t->limit && p + L.lvl_size[l] > t->limit) { ok = 0; break; }
+                key = (key ^ mem_hash(p, L.lvl_size[l], 1)) * 0x100000001B3ULL;
+                tot += L.lvl_linear_size[l];
+            }
+        if (ok && tot >= ETCC_MIN_BYTES) {
+            snprintf(keep_path, sizeof keep_path, "%s/v1_%016llx_%x_%dx%dx%d_%d.etc", g_etcc_dir, (unsigned long long)key, (unsigned)b->format, b->width, b->height, L.layers, levels < L.levels ? levels : L.levels);
+            int64_t t0 = plat_qpc();
+            FILE *f = fopen(keep_path, "rb");
+            uint8_t *data = NULL;
+            if (f) {
+                fseek(f, 0, SEEK_END);
+                if (ftell(f) == (long)tot && (data = malloc(tot)) != NULL) { fseek(f, 0, SEEK_SET); if (fread(data, 1, tot, f) != tot) { free(data); data = NULL; } }
+                fclose(f);
+            }
+            if (data) {                                /* a hit: the levels as they were re-encoded before */
+                size_t at = 0;
+                for (int layer = 0; layer < L.layers; layer++)
+                    for (int l = 0; l < levels && l < L.levels; l++) {
+                        size_t lin = L.lvl_linear_size[l];
+                        put(t, l, layer, L.lvl_w[l], L.lvl_h[l], L.lvl_d[l] > 0 ? L.lvl_d[l] : 1, data + at, lin, 0, 0);
+                        at += lin;
+                        g_st.tex_bytes += (int64_t)lin;
+                    }
+                free(data);
+                g_etcc_hits++; g_etcc_rd_bytes += (int64_t)tot; g_etcc_rd_ns += tick_ns(t0);
+                etc_report();
+                return 1;
+            }
+            keep = malloc(tot); keep_size = tot;       /* a miss: keep what is re-encoded below */
+            g_etcc_miss++;
+        }
+    }
     for (int layer = 0; layer < L.layers; layer++) {
         for (int l = 0; l < levels && l < L.levels; l++) {
             const uint8_t *p = tex_level_ptr(&L, src, l, layer);
@@ -5636,12 +5772,15 @@ int nvn_front_tex_read(Tex *t, int decode, nvn_front_put_fn *put) {
             size_t lin = L.lvl_linear_size[l], slice_in = lin / (size_t)(L.lvl_d[l] > 0 ? L.lvl_d[l] : 1);
             size_t slice_out = decode == TEX_DEC_ETC ? slice_in : decode ? (size_t)L.lvl_w[l] * L.lvl_h[l] * (size_t)tex_decode_bytes_per_texel(decode) : 0;
             size_t need = lin + slice_out * (size_t)(L.lvl_d[l] > 0 ? L.lvl_d[l] : 1);
-            if (!b->packaged && t->limit && p + L.lvl_size[l] > t->limit) return 0;
+            if (!b->packaged && t->limit && p + L.lvl_size[l] > t->limit) { free(keep); return 0; }
             if (need > tmp_cap) { tmp_cap = need * 2; tmp = realloc(tmp, tmp_cap); }
             tex_deswizzle_level(&L, l, p, tmp);
             if (decode == TEX_DEC_ETC) {               /* Android port: BC re-encoded as ETC2 / EAC, block for block (tex_etc.c) */
                 int dd = L.lvl_d[l] > 0 ? L.lvl_d[l] : 1;
+                int64_t t0 = plat_qpc();
                 for (int z = 0; z < dd; z++) tex_transcode_etc(b->format, tmp + slice_in * (size_t)z, L.lvl_w[l], L.lvl_h[l], tmp + lin + slice_in * (size_t)z);
+                g_etc_ns += tick_ns(t0); g_etc_bytes += (int64_t)lin; g_etc_levels++;
+                if (keep && keep_at + lin <= keep_size) { memcpy(keep + keep_at, tmp + lin, lin); keep_at += lin; }
                 put(t, l, layer, L.lvl_w[l], L.lvl_h[l], dd, tmp + lin, lin, 0, 0);
             } else if (decode) {
                 int dd = L.lvl_d[l] > 0 ? L.lvl_d[l] : 1;
@@ -5651,6 +5790,8 @@ int nvn_front_tex_read(Tex *t, int decode, nvn_front_put_fn *put) {
             g_st.tex_bytes += (int64_t)lin;
         }
     }
+    if (keep) { if (keep_at == keep_size) etcc_put(keep_path, keep, keep_size); else free(keep); }      /* the writer frees it */
+    if (decode == TEX_DEC_ETC) etc_report();
     return 1;
 }
 int nvn_front_handle(TexPool *tp, SamplerPool *sp, uint64_t nh, Tex **t, View *v, SamplerParams *p) {

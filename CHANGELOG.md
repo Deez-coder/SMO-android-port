@@ -3,6 +3,58 @@
 Every build handed out gets its own number (`android:versionName` in `android/AndroidManifest.xml`, shown on the
 launcher and written into exported logs). The APK is named after it: `odyssey-<version>.apk`.
 
+## Beta 0.6
+
+The public release of the test builds 0.5.1 to 0.5.8 below (everything in their sections).
+
+## Beta 0.5.8 (test build)
+
+**Two players: touch as player 2 (GitHub issue 48).** A new choice in the launcher's Controls page and the in-game menu, "Touch controls are": Player 1 (as before) or Player 2. With Player 2 and a controller connected, the controller is player 1 (Mario) and the touch controls are player 2, for the game's two-player mode: choose Resume 2P on the title screen, or Two Players in the pause menu, and player 2 plays Cappy. The touch controls then stay on screen while the controller is used. Without a controller, touch stays player 1, so the game always has one. Two controllers work as before: the first one is player 1 (together with touch), the second one player 2. Checked on a Galaxy S24 Ultra with a controller made by adb: Resume 2P started two-player mode, and the touch stick flew Cappy while the controller kept Mario.
+
+## Beta 0.5.7 (test build)
+
+**Shorter loading stutters on Mali and PowerVR phones, from the second visit on.** These GPUs cannot read the game's compressed textures, so each one is converted on the CPU the first time it is drawn, which stalls the picture while an area loads. The converted textures are now kept in the app's cache folder and read back the next time. Measured on a Galaxy S24 Ultra made to take the same path, the start of Cap Kingdom: 24.4 s of conversion and 24 stutters (the longest 1.5 s) on the first start; 1.9 s of reading back and 12 stutters (the longest 0.25 s) on the second. A slower phone saves more. The folder grows to at most 1 GB. Adreno phones read these textures themselves and do not use it.
+
+**Pixel 10 (PowerVR) and Samsung Exynos (Xclipse) phones: most textures need no conversion at all.** Their GPUs read five of the game's seven compressed texture kinds and lack two, and until now the app converted all seven on the CPU when two were missing. Now each kind the GPU offers is read as it is, so only the two missing kinds are converted. On the S24 made to lack the same two, the start of Cap Kingdom converted 8 small texture levels instead of 258 MB, with the same picture.
+
+**Checked on the S24 for 0.5.6's fixes:** normal play unchanged; the Mali format change does not apply to Adreno. The PowerVR white fog (GitHub issue 39) comes from the lighting pass, where a logarithm of zero has no defined answer on that driver; 0.5.6's math checks for PowerVR give it the console's answer (waiting for the tester to confirm).
+
+## Beta 0.5.6 (test build)
+
+**Damaged game dumps are named at import.** Importing an NSP or XCI now checks every block of the game files against the checksums stored in the dump, from the same bytes the import already reads (the whole game in 32 s on the development PC, files identical to before). A damaged dump stops the import with the name of the first damaged file and a request to make the dump again, and the half-copied files are removed so Play stays off. Before, such a dump imported without a word and the game crashed later while unpacking the damaged file (GitHub issue 33).
+
+**Black 3D picture on some Mali phones.** A Galaxy M54 (Mali-G68) showed the HUD over a black picture. Its graphics driver cannot smooth (filter) one of the formats the game draws into and reads back with smoothing. The game's target of that format is now made in a format the GPU can smooth, with the same values. This is on for every GPU that lacks that ability; the two other format changes of the old Mali option stay off, since they made a Mali-G615 picture worse.
+
+**PowerVR (Pixel 10):** the math checks that Mali has used since 0.1.8 (defined answers for divisions by zero, logarithms of zero and similar) are now on for PowerVR too. The first start after this update builds the shaders again on those phones. The white fog in GitHub issue 39 starts in the main 3D pass while the game draws at a lower resolution (640 wide on that phone), and it is still being looked into.
+
+**Log:** with `SMO_VK_GLSLDUMP` (a test setting), each dumped shader's file name carries its code hash, the one the diagnostics' draw lines print.
+
+## Beta 0.5.5 (test build)
+
+**Widescreen (on by default; the launcher's Resolution card and the in-game menu, applied at the next start).** On a phone wider than 16:9 the 3D view now fills the screen in play and cutscenes instead of black bars at the sides: the cameras see more at the sides with the same view up and down, and the picture is stretched over the whole screen. The HUD, menus and messages keep their shape in the middle 16:9 of the screen (moving the HUD to the screen's edges was tried and left out). The title screen keeps its bars, since its 3D backdrop does not reach the sides. The picture keeps its pixel count, so it is a little softer (on a 19.5:9 screen by 22%); a higher resolution scale makes up for it. A little more is drawn at the sides; not measured yet. The benchmark always runs with widescreen off, so results from different phones stay comparable.
+
+**A faster first start:** the shader preparation now lists the cache folder once instead of trying to open every file it might have. S24, first start from an empty cache: 170 s instead of 193 s (the game held for shaders 90 s instead of 116 s).
+
+## Beta 0.5.4 (test build)
+
+**The performance overlay's throttle dot and frame graph** (asked for by a tester, as in Peanuts Native). The heat line is now a dot that turns green, yellow or red: the worse of Android's heat state (light: yellow, moderate and up: red) and its 10-second forecast (0.85: yellow, 1.0: red). Peanuts also counts the CPU clock cap, but the S24 lowers that cap at the title screen while it is cool, which turned the dot red for nothing, so the cap keeps its own line. The frame graph (its own switch) shows the last 48 frames as bars under the lines, updated every frame: grey when a frame was on time, yellow when it was late (over 1.15 times the target), red when it took twice as long; the target is 33.3 ms with frame generation or a 30 fps limit, else the FPS limit's.
+
+## Beta 0.5.3 (test build)
+
+**A benchmark in the launcher (Advanced, Run benchmark), so phones can be compared.** It plays the same spot in Cascade Kingdom with the same settings on every phone (100% scale, frame generation off, 60 fps limit), waits until that spot's shaders are built (no new one for 10 s), then measures 60 seconds: fps, 1% low, the worst frame, and per frame the GPU's time, the render thread's and the game logic's own work, and whether it was a clean run (no shader built while measuring). The player's save and graphics.ini are copied away before and put back after, also after a crash or a restart of the phone (the launcher finishes it at its next start). The result shows in a dialog, and Export result saves it as a text file of its own with the phone's facts (app version, Android, phone, chip, driver); it is also in Export logs. S24: 58.6 fps, 1% low 40.5, then 57.8 / 39.3, clean runs; the save and settings came back identical.
+
+**More items for the performance overlay** (the launcher's Graphics page and the in-game menu, each on its own switch, off by default): GPU time a frame, the CPU clock cap (how far the system lets the main cores clock, in percent), the chip temperature (the hottest CPU or GPU sensor), battery temperature and charge (+ while charging), the game's memory and the phone's used and total memory, the heat state (OK, WARM, HOT, from Android) and the graphics driver. The overlay can now show up to 12 lines and the whole alphabet. Items a phone does not let apps read show a dash.
+
+**Log:** whether the driver offers VK_EXT_map_memory_placed (memory the GPU could read without copying), and whether userfaultfd write-protection is available (the S24: no).
+
+## Beta 0.5.2 (test build)
+
+The same code as 0.5.1 (the number was taken by a test build that was not kept).
+
+## Beta 0.5.1 (test build)
+
+**Fix: a black screen at start when the shader cache lacks the game's shaders (GitHub issue 42, an Infinix X6720B with a Mali-G57 MC2).** The first-start preparation had finished once, so its progress bar did not show, but the cache no longer had the shaders the game needed. The game then waited for each of its programs behind a black screen with the touch buttons, and the player gave up after a minute. Now, when the game has waited 5 s for shaders before it has handed over all its programs, the start becomes a first-start preparation after all: the progress bar comes back over the game, without a time limit, and the next start is quick again. S24, an empty test cache with the marker of a finished preparation: the bar came back after 5 s (at program 1,096) and filled as on a first start.
+
 ## Beta 0.5
 
 The public release of the test builds 0.4.1, 0.4.2 and 0.4.3 below (everything in their sections), and:

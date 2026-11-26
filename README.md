@@ -10,7 +10,9 @@ There's no game code, no game assets, no keys and no firmware in this repo. You 
 
 Made with AI. Most of the code was written by Claude, Anthropic's AI assistant (through Claude Code), with the project's creator directing it, reviewing it and testing it on a real phone. Expect some rough edges, and if something breaks, please send logs (see below).
 
-## Status: beta 0.5
+Community: join the [Discord server](https://discord.gg/b9GN2Ypktw) to talk about the port, get help and share how it runs on your phone.
+
+## Status: beta 0.6
 
 The game boots, plays and saves. Here's how it runs on the dev's phone, on the phone's own driver.
 
@@ -20,19 +22,19 @@ More device benchmarks will be added here as more logs come in.
 
 Your results will likely be different. Speed depends a lot on the phone's chip, its GPU driver, how warm it gets and your settings, so we'd love to hear how yours does. Custom drivers are optional. The first start builds the graphics for your phone behind a progress bar, which takes a few minutes, but only once (and again after an update that changes the shaders). When you update, install the new APK over the old one. Uninstalling deletes those built graphics and your game files, and the next start has to build everything again.
 
-New in 0.5: fixes for loading screens that never ended, the crash in Shiveria Town, the freeze after the first frog capture, and the intro cutscene's lighting with frame generation, plus about 1.3 GB less memory and fewer stutters on a first start. The full list is in [CHANGELOG.md](CHANGELOG.md).
+New in 0.6: two players (the touch controls as player 2 beside a controller), widescreen on by default, fewer loading stutters on Mali and PowerVR phones, fixes for a black picture on some Mali phones and a black screen at start, and a check for damaged game dumps at import. The full list is in [CHANGELOG.md](CHANGELOG.md).
 
 ## What you get
 
 Game. Import your own game right in the app: your `prod.keys`, then your NSP or XCI of 1.0.0 (base game, no update). The keys stay in the app's private storage until you remove them. Steady game speed keeps the game at its normal speed even below 60 fps, and the FPS limit goes from 20 to 60. Saves can be exported and imported as a .zip (your current save is kept as a backup). RomFS mods can be turned on and off in the app.
 
-Graphics. A Vulkan 1.3 renderer with docked (1080p) or handheld (720p) resolution, scale presets or your own resolution scale, upscalers (bilinear, bicubic and more) for any scale under 100%, FXAA, sharpening and anisotropic filtering, plus an FPS counter and a performance overlay (average fps, 1% low, frame time). It uses your phone's own Vulkan driver by default. On Snapdragon you can also load custom AdrenoTools driver packages (like Mesa Turnip).
+Graphics. A Vulkan 1.3 renderer with docked (1080p) or handheld (720p) resolution, scale presets or your own resolution scale, upscalers (bilinear, bicubic and more) for any scale under 100%, FXAA, sharpening and anisotropic filtering, plus an FPS counter and a performance overlay (average fps, 1% low, frame time). On phones wider than 16:9 the game fills the screen (widescreen, on by default). It uses your phone's own Vulkan driver by default. On Snapdragon you can also load custom AdrenoTools driver packages (like Mesa Turnip).
 
 Frame generation (beta). One extra frame is made after each real one, so the game shows 60 frames a second while running at 30. It looks smoother, and the controls react like at 30 fps. Set it to Off, On or Auto in the app or the in-game menu. Auto turns it on only while your phone can't hold 60 but can keep up with frame generation. Quality High gives Mario, enemies and other moving objects their own motion, and Fast follows only the camera for slower GPUs.
 
 CPU boost. Keeps the phone's CPU clocks up so heavy scenes hold the frame rate, set to Auto, Always or Off. It does what you set, and the app shows a note about its heat and battery cost while it is on.
 
-Controls. On-screen touch controls with Switch-style button icons, and a layout editor to move and resize every button and stick. Any controller Android sees as a gamepad works, with button rebinding in the app. The house button on the touch controls (or the controller's Home button, rebindable) opens the in-game menu, where you can change settings while the game is paused, restart, or exit. Exit waits for any save in progress, then takes you back to the app's menu. Motion controls use your phone's sensors, and the sensors stay off while motion controls are off.
+Controls. On-screen touch controls with Switch-style button icons, and a layout editor to move and resize every button and stick. Any controller Android sees as a gamepad works, with button rebinding in the app. The house button on the touch controls (or the controller's Home button, rebindable) opens the in-game menu, where you can change settings while the game is paused, restart, or exit. Exit waits for any save in progress, then takes you back to the app's menu. Motion controls use your phone's sensors, and the sensors stay off while motion controls are off. For the game's two-player mode, the touch controls can be player 2 (Cappy) while a controller is player 1 (Mario), or two controllers can play.
 
 When something goes wrong. Advanced, then Export logs, makes a .zip with the game's logs, a crash log, your settings and your phone model. Every 10 seconds the log notes the fps, 1% low, CPU clocks, heat, frame generation's state, and where each frame's time went (GPU, game logic, shader building), and it also notes your phone's RAM and memory use, so a slowdown or a stutter on your phone can be tracked down. No saves, keys or game files in there.
 
@@ -57,6 +59,16 @@ The lifted code is made from your own copy of the game, so an APK built this way
 ## Found a problem?
 
 Please report it here on GitHub: open an [issue](https://github.com/Deez-coder/SMO-android-port/issues) with your phone model, what happened, and the .zip from Advanced, Export logs. Reports from phones other than the S24 Ultra help the most, especially Mali and Exynos ones.
+
+You can also ask for help on the [Discord server](https://discord.gg/b9GN2Ypktw).
+
+## Notice
+
+SMO Android Port is made by holdup.lethimcook (quandaile on Reddit), with code written by Claude (Anthropic's AI assistant) under their direction. It builds on the static recompilation from [smo-recomp](https://github.com/Coz-0/smo-recomp) by Coz-0.
+
+The source is licensed under GPL-3.0-or-later. If you copy, fork or redistribute this project or a modified version of it, you must keep this notice and the license, say that your version is based on SMO Android Port (with a link to this repository), and mark what you changed.
+
+The official source is https://github.com/Deez-coder/SMO-android-port. Builds from anywhere else are not made by us.
 
 ## Legal
 

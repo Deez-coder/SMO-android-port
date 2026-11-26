@@ -5,7 +5,7 @@
  *   graphics.ini: upscaling, its sharpness (sharpening / fsr_sharpness / gsr_sharpness), anti_aliasing, fps_counter.
  *     Written here, then GameActivity.nativeReloadOptions (gfx_options_reload_live) reads them again; the game runs for a
  *     moment (PREVIEW_MS) so the held picture is drawn again with the change.
- *   controls.ini: touch, touch_opacity, touch_scale, camera_speed. The game reads the file again within a second
+ *   controls.ini: touch, touch_opacity, touch_scale, camera_speed, touch_player (0.5.8). The game reads the file again within a second
  *     (nnpad_android.c nnpad_poll).
  * Some settings only take effect on a new start (resolution_scale, console_mode, anisotropic_filtering): they
  * stand with the others and are written as the app's Graphics tab writes them; once one differs from what this game was
@@ -54,7 +54,7 @@ class InGameMenu {
     LinearLayout content;
     boolean leaving;
     private Runnable rehold;
-    static final String[][] RESTART_KEYS = {{"resolution_scale", "1.00"}, {"console_mode", "docked"}, {"anisotropic_filtering", "game"}};
+    static final String[][] RESTART_KEYS = {{"resolution_scale", "1.00"}, {"console_mode", "docked"}, {"anisotropic_filtering", "game"}, {"widescreen", "on"}};
     private final String[] started = new String[RESTART_KEYS.length];      /* their values when this game started (the menu is made on its first opening) */
     private LinearLayout restartNote;
     private Button exitBtn, restartBtn, resumeBtn;
@@ -204,7 +204,8 @@ class InGameMenu {
         int bw = hh ? 1280 : 1600, bh = hh ? 720 : 900;
         String rv = gfx.get("resolution_scale", "1.00");
         float curScale = "auto".equalsIgnoreCase(rv) ? (hh ? 1f : 1.2f) : LauncherActivity.parse(rv, 1f);
-        g.addView(choice(gfx, "console_mode", "Console mode", new String[]{"docked", "handheld"}, new String[]{"Docked", "Handheld"}, "docked", false));      /* restart */
+        g.addView(choice(gfx, "console_mode", "Console mode", new String[]{"docked", "handheld"}, new String[]{"Docked", "Handheld"}, "docked", false));
+        g.addView(toggle(gfx, "widescreen", "Widescreen", "on", "off", "on", false));      /* 0.5.5: restart */      /* restart */
         g.addView(choice(gfx, "resolution_scale", "Resolution", new String[]{"auto", "1.50", "2.00"},                     /* restart */
                 new String[]{"Native\n" + (hh ? "1280x720" : "1920x1080"), "1.5x\n" + LauncherActivity.size(bw, bh, 1.5f), "2x\n" + LauncherActivity.size(bw, bh, 2f)}, "1.00", false));
         g.addView(resSlider(bw, bh, Math.round(curScale * 100)));                                   /* restart */
@@ -237,6 +238,14 @@ class InGameMenu {
         f.addView(toggle(gfx, "fps_average", "Average FPS", "on", "off", "off", true));
         f.addView(toggle(gfx, "fps_low", "1% low", "on", "off", "off", true));
         f.addView(toggle(gfx, "frame_time", "Frame time", "on", "off", "off", true));
+        f.addView(toggle(gfx, "overlay_gpu", "GPU time", "on", "off", "off", true));
+        f.addView(toggle(gfx, "overlay_cpu", "CPU clock cap", "on", "off", "off", true));
+        f.addView(toggle(gfx, "overlay_soc", "Chip temperature", "on", "off", "off", true));
+        f.addView(toggle(gfx, "overlay_battery", "Battery", "on", "off", "off", true));
+        f.addView(toggle(gfx, "overlay_ram", "Memory", "on", "off", "off", true));
+        f.addView(toggle(gfx, "overlay_thermal", "Throttle dot", "on", "off", "off", true));
+        f.addView(toggle(gfx, "overlay_graph", "Frame graph", "on", "off", "off", true));
+        f.addView(toggle(gfx, "overlay_driver", "Graphics driver", "on", "off", "off", true));
         f.addView(slider(gfx, "fps_size", "Overlay size", 50, 200, 10, 100, "%", 1f, true));
         f.addView(small("Average and 1% low are of the last 10 seconds or so."));
         content.addView(f);
@@ -247,6 +256,8 @@ class InGameMenu {
         t.addView(slider(ctl, "touch_opacity", "Opacity", 10, 100, 5, 45, "%", 0.01f, false));
         t.addView(slider(ctl, "touch_scale", "Size", 60, 160, 5, 100, "%", 0.01f, false));
         t.addView(slider(ctl, "camera_speed", "Camera speed", 20, 400, 10, 100, "%", 0.01f, false));
+        t.addView(choice(ctl, "touch_player", "Touch is", new String[]{"1", "2"}, new String[]{"Player 1", "Player 2"}, "1", false,
+                "Player 2 beside a controller: then choose Two Players in the game's pause menu."));
         content.addView(t);
 
         content.addView(small("Everything else is in the app's Graphics and Controls tabs."));

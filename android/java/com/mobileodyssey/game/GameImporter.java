@@ -6,7 +6,8 @@
  *   <out>/romfs/...                the Program NCA's RomFS
  *   <out>/manual/...               the Manual NCAs' RomFS (the game's Help and legal pages)
  * Only version 1.0.0 is accepted (the code in the app is recompiled from it): the ExeFS `main` must have the 1.0.0
- * hash. Formats: NSP (PFS0) with its ticket, XCI (the secure HFS0 partition). The keys are read, used and dropped;
+ * hash, and every block of each RomFS must match its hash tree (0.5.6). Formats: NSP (PFS0) with its ticket, XCI (the
+ * secure HFS0 partition). The keys are read, used and dropped;
  * nothing is kept or sent anywhere. No Android classes, so it can be run and checked on a PC (main()).
  * Android port (2026-11-02). */
 package com.mobileodyssey.game;
@@ -316,34 +317,126 @@ public class GameImporter {
         return out;
     }
 
+    /* ------------------------------------------------------------ the hash tree (IVFC), as switchfs.ivfc_verify
+     * 0.5.6 (GitHub issue 33): a dump with damaged blocks imported without a word, and the game crashed later in its
+     * decompressor (his ObjectData/KoopaTexture.szs began with random bytes instead of "Yaz0"). The RomFS section carries a
+     * SHA-256 tree: a master hash in the section header for the first level, and each level a list of the hashes of the
+     * next level's blocks, the RomFS itself last. The upper levels are small (about 11 MB for the game) and checked first;
+     * the RomFS's blocks are checked while they are written out, from the same decrypted bytes, so nothing is read twice.
+     * A short last block is hashed padded with zeros to the block size, or as it is (either is accepted, as on the PC). */
+    static long[][] ivfcLevels(byte[] fs) {
+        ByteBuffer f = le(fs);
+        int count = f.getInt(0x8 + 0xC);                                            /* the master hash counts as a level */
+        long[][] l = new long[count - 1][];
+        for (int i = 0; i < count - 1; i++)
+            l[i] = new long[]{f.getLong(0x8 + 0x10 + i * 0x18), f.getLong(0x8 + 0x18 + i * 0x18), 1L << f.getInt(0x8 + 0x20 + i * 0x18)};
+        return l;
+    }
+
+    static MessageDigest sha() throws IOException {
+        try { return MessageDigest.getInstance("SHA-256"); } catch (Exception e) { throw new IOException("SHA-256: " + e); }
+    }
+
+    /* block j of a level (d[at, at + len), len <= bs) against entry j of the hash list `want` */
+    static boolean blockOk(MessageDigest md, byte[] d, int at, int len, int bs, byte[] want, long j) {
+        if (j < 0 || (j + 1) * 32 > want.length) return false;
+        int w = (int) (j * 32);
+        md.reset();
+        md.update(d, at, len);
+        if (len < bs) {
+            if (same(md.digest(new byte[bs - len]), want, w)) return true;      /* padded with zeros */
+            md.reset();
+            md.update(d, at, len);                                                  /* or as it is */
+        }
+        return same(md.digest(), want, w);
+    }
+
+    static boolean same(byte[] h, byte[] want, int w) {
+        for (int i = 0; i < 32; i++) if (h[i] != want[w + i]) return false;
+        return true;
+    }
+
+    static IOException damaged(String path) {
+        return new IOException("the game dump is damaged" + (path != null ? ": " + path.substring(1) + " does not match its checksum" : "")
+                + ". Make the dump again from your Switch (base game 1.0.0, no update, no mods) and import it again.");
+    }
+
+    /* the hash list of the RomFS's blocks, once every upper level matched */
+    byte[] checkUpperLevels(Nca nca, Nca.Section s, long[][] lv) throws IOException {
+        byte[] want = new byte[32];
+        System.arraycopy(s.fs, 0x8 + 0xC0, want, 0, 32);                           /* master hash */
+        MessageDigest md = sha();
+        for (int n = 0; n < lv.length - 1; n++) {
+            byte[] d = nca.read(s, lv[n][0], (int) lv[n][1]);
+            int bs = (int) lv[n][2];
+            for (int b = 0, j = 0; b < d.length; b += bs, j++)
+                if (!blockOk(md, d, b, Math.min(bs, d.length - b), bs, want, j)) throw damaged(null);
+            want = d;
+        }
+        return want;
+    }
+
     void extractRomfs(Nca nca, File dest, String what) throws IOException {
         Nca.Section s = nca.first(0);
-        List<Object[]> files = romfsFiles(nca, s, nca.romfsBase(s));
+        long base = nca.romfsBase(s);
+        long[][] lv = ivfcLevels(s.fs);
+        long[] data = lv[lv.length - 1];                                            /* the RomFS: data[0] == base */
+        List<Object[]> files = romfsFiles(nca, s, base);
+        files.sort((x, y) -> Long.compare((Long) x[1], (Long) y[1]));               /* written in the order they are stored */
         long total = 0, done = 0;
         for (Object[] f : files) total += (Long) f[2];
         String canon = dest.getCanonicalPath() + File.separator;
-        int i = 0;
+        progress.say(what + ": checking the dump…");
+        byte[] want = checkUpperLevels(nca, s, lv);
+        MessageDigest md = sha();
+        int bs = (int) data[2], step = (int) Math.max(bs, (8L << 20) / bs * bs);
+        int fi = 0;
         long lastSay = 0;
-        for (Object[] f : files) {
-            File out = new File(dest, ((String) f[0]).substring(1));
-            if (!out.getCanonicalPath().startsWith(canon)) throw new IOException("a file outside the folder: " + f[0]);
-            out.getParentFile().mkdirs();
-            long off = (Long) f[1], size = (Long) f[2];
-            try (OutputStream os = new FileOutputStream(out)) {
-                for (long p = 0; p < size; ) {
-                    int n = (int) Math.min(8 << 20, size - p);
-                    os.write(nca.read(s, off + p, n));
-                    p += n;
-                    done += n;
+        OutputStream os = null;
+        try {
+            for (long pos = 0; pos < data[1]; pos += step) {
+                int n = (int) Math.min(step, data[1] - pos);
+                byte[] d = nca.read(s, base + pos, n);
+                for (int b = 0; b < n; b += bs)
+                    if (!blockOk(md, d, b, Math.min(bs, n - b), bs, want, (pos + b) / bs)) throw damaged(fileAt(files, base + pos + b, bs));
+                long cs = base + pos, ce = cs + n;
+                while (fi < files.size()) {                                         /* the parts of the files in this chunk */
+                    Object[] f = files.get(fi);
+                    long fo = (Long) f[1], fe = fo + (Long) f[2];
+                    if (fo >= ce && fe > fo) break;                                 /* begins in a later chunk */
+                    if (os == null) {
+                        File out = new File(dest, ((String) f[0]).substring(1));
+                        if (!out.getCanonicalPath().startsWith(canon)) throw new IOException("a file outside the folder: " + f[0]);
+                        out.getParentFile().mkdirs();
+                        os = new FileOutputStream(out);
+                    }
+                    long a = Math.max(fo, cs), e = Math.min(fe, ce);
+                    if (e > a) { os.write(d, (int) (a - cs), (int) (e - a)); done += e - a; }
+                    if (fe > ce) break;                                             /* goes on in the next chunk */
+                    os.close();
+                    os = null;
+                    fi++;
+                }
+                long now = System.currentTimeMillis();
+                if (now - lastSay > 300) {
+                    lastSay = now;
+                    progress.say(String.format("%s: %d of %d files, %.1f of %.1f GB", what, fi, files.size(), done / 1e9, total / 1e9));
                 }
             }
-            i++;
-            long now = System.currentTimeMillis();
-            if (now - lastSay > 300 || i == files.size()) {
-                lastSay = now;
-                progress.say(String.format("%s: %d of %d files, %.1f of %.1f GB", what, i, files.size(), done / 1e9, total / 1e9));
-            }
+        } finally {
+            if (os != null) os.close();
         }
+        if (fi < files.size()) throw new IOException(files.get(fi)[0] + " lies outside the game data (a broken dump?)");
+        progress.say(String.format("%s: %d of %d files, %.1f of %.1f GB, checked", what, fi, files.size(), done / 1e9, total / 1e9));
+    }
+
+    /* the file that holds the block at [at, at + bs), for the message */
+    static String fileAt(List<Object[]> files, long at, int bs) {
+        for (Object[] f : files) {
+            long fo = (Long) f[1], fe = fo + (Long) f[2];
+            if (fo < at + bs && fe > at) return (String) f[0];
+        }
+        return null;
     }
 
     /* ------------------------------------------------------------ the whole import */
@@ -379,10 +472,16 @@ public class GameImporter {
         }
         File romfs = new File(out, "romfs");
         deleteTree(romfs);
-        extractRomfs(program, romfs, "Game files");
         File manual = new File(out, "manual");
         deleteTree(manual);
-        for (Nca m : manuals) extractRomfs(m, manual, "Help pages");
+        try {
+            extractRomfs(program, romfs, "Game files");
+            for (Nca m : manuals) extractRomfs(m, manual, "Help pages");
+        } catch (IOException e) {                                                   /* a damaged or cut-off dump: no half copy left for Play */
+            deleteTree(romfs);
+            deleteTree(manual);
+            throw e;
+        }
         progress.say("Done");
     }
 

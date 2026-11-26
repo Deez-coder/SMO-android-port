@@ -100,6 +100,16 @@ void android_exit_request(void) {                    /* the looper thread (input
     if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);      /* started as plain NativeActivity (no askExit) */
     (*env)->DeleteLocalRef(env, c);
 }
+/* 0.5.3: the benchmark is done (smo_bench.c, render thread): GameActivity.benchDone leaves the game the normal way */
+void android_bench_done(void) {
+    JNIEnv *env = jni_env();
+    jobject act = g_app->activity->clazz;
+    jclass c = (*env)->GetObjectClass(env, act);
+    jmethodID m = (*env)->GetMethodID(env, c, "benchDone", "()V");
+    if (m) (*env)->CallVoidMethod(env, act, m);
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    (*env)->DeleteLocalRef(env, c);
+}
 void display_menu_hold(int on);                       /* display.c */
 void fs_quiesce(void);                                /* nnfs.c */
 void nvn_vk_pcache_save(const char *why);             /* nvn_vk_m4.c */
@@ -144,14 +154,17 @@ static void JNICALL native_menu_info(JNIEnv *env, jobject self, jintArray out) {
     nvn_vk_present_info(v);
     (*env)->SetIntArrayRegion(env, out, 0, 5, v);
 }
+/* 0.5.3: the battery for the performance overlay (android_ovstats.c), from GameActivity every 2 s */
+void android_ovstats_battery(int temp10, int level, int charging);
+static void JNICALL native_battery(JNIEnv *env, jobject self, jint temp10, jint level, jboolean charging) { (void)env; (void)self; android_ovstats_battery(temp10, level, charging ? 1 : 0); }
 static void register_natives(void) {
     JNIEnv *env = jni_env();
     jclass c = (*env)->GetObjectClass(env, g_app->activity->clazz);
-    JNINativeMethod m[8] = {{"nativeHold", "(Z)V", (void *)native_hold}, {"nativeQuiesce", "()V", (void *)native_quiesce}, {"nativeSaveCache", "(Z)V", (void *)native_save_cache},
+    JNINativeMethod m[9] = {{"nativeHold", "(Z)V", (void *)native_hold}, {"nativeQuiesce", "()V", (void *)native_quiesce}, {"nativeSaveCache", "(Z)V", (void *)native_save_cache},
                             {"nativeLoadState", "([J)V", (void *)native_load_state}, {"nativeSkipPrep", "()V", (void *)native_skip_prep},
                             {"nativeReloadOptions", "()V", (void *)native_reload_options}, {"nativeMenuInfo", "([I)V", (void *)native_menu_info},
-                            {"nativeMenuOpen", "(Z)V", (void *)native_menu_open}};
-    if ((*env)->RegisterNatives(env, c, m, 8) != 0) { (*env)->ExceptionClear(env); printf("smo: no GameActivity: no Exit button%c", 10); }
+                            {"nativeMenuOpen", "(Z)V", (void *)native_menu_open}, {"nativeBattery", "(IIZ)V", (void *)native_battery}};
+    if ((*env)->RegisterNatives(env, c, m, 9) != 0) { (*env)->ExceptionClear(env); printf("smo: no GameActivity: no Exit button%c", 10); }
     (*env)->DeleteLocalRef(env, c);
 }
 static int display_rotation(void) {                  /* Surface.ROTATION_0 .. 270 as 0..3 */
@@ -535,6 +548,7 @@ void android_main(struct android_app *app) {
     set_language(app);
     register_natives();
     display_modes_log();
+    { void android_uffd_probe(void); android_uffd_probe(); }      /* 0.5.2 test: userfaultfd write-protect available? (android_uffd_probe.c) */
     {   /* <files>/config/env.txt: KEY=VALUE lines (# comments) set before the game starts, the Android stand-in for the
          * environment variables of the Windows build (SMO_SHOT, SMO_VK_DEBUG, ...: see the runtime's sources) */
         char p[PLAT_MAX_PATH]; static char line[16384];      /* 0.4.2: 512 before cut a long SMO_SEQ (tests/cap_kingdom.seq is 2 KB) */

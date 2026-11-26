@@ -239,6 +239,15 @@ static int opt_key(GfxOptions *o, const char *key, const char *val) {
     else if (!plat_stricmp(key, "fps_average")) o->fps_avg = !plat_stricmp(val, "on");
     else if (!plat_stricmp(key, "fps_low")) o->fps_low = !plat_stricmp(val, "on");
     else if (!plat_stricmp(key, "frame_time")) o->frame_time = !plat_stricmp(val, "on");
+    else if (!plat_stricmp(key, "overlay_gpu")) o->ov_gpu = !plat_stricmp(val, "on");
+    else if (!plat_stricmp(key, "overlay_cpu")) o->ov_cpu = !plat_stricmp(val, "on");
+    else if (!plat_stricmp(key, "overlay_battery")) o->ov_bat = !plat_stricmp(val, "on");
+    else if (!plat_stricmp(key, "overlay_soc")) o->ov_soc = !plat_stricmp(val, "on");
+    else if (!plat_stricmp(key, "overlay_ram")) o->ov_ram = !plat_stricmp(val, "on");
+    else if (!plat_stricmp(key, "overlay_driver")) o->ov_drv = !plat_stricmp(val, "on");
+    else if (!plat_stricmp(key, "overlay_thermal")) o->ov_thr = !plat_stricmp(val, "on");
+    else if (!plat_stricmp(key, "overlay_graph")) o->ov_graph = !plat_stricmp(val, "on");
+    else if (!plat_stricmp(key, "widescreen")) o->widescreen = !plat_stricmp(val, "on");
     else if (!plat_stricmp(key, "fps_size")) { float v = (float)atof(val); o->fps_size = v < 50 ? 0.5f : v > 200 ? 2.0f : v / 100.0f; }
     else return 0;
     return 1;
@@ -247,6 +256,7 @@ static void opt_load(void) {
     GfxOptions *o = &g_opt;
     int written = 0, unknown = 0;
     memset(o, 0, sizeof *o);
+    o->widescreen = 1;      /* 0.5.5: on by default (smo_widescreen.c); graphics.ini widescreen = off turns it off */
     o->width = 1280; o->height = 720; o->scale = 0.0f; o->window_mode = 3; o->fps_counter = 1; o->dynres = 1; o->boost = 1; o->diag_off = 1; o->fsr_sharp = 0.9f; o->gsr_sharp = 0.5f; o->fps_size = 1.0f;
 #ifdef __ANDROID__
     o->present = 3; o->scale = 1.0f; o->boost = 2; o->fxaa = 1; o->sharpen = 0.75f;      /* as DEF_* above: a file without these keys */
@@ -306,7 +316,7 @@ void gfx_options_reload_live(void) {
     fclose(f);
     if (t.fps30) { if (!t.fps_cap) t.fps_cap = 30; t.fps30 = 0; }
     g_opt.fps_cap = t.fps_cap;                     /* 0.2.8: the FPS limit is in the in-game menu (display.c reads it every frame) */
-    g_opt.upscaler = t.upscaler; g_opt.fsr_sharp = t.fsr_sharp; g_opt.gsr_sharp = t.gsr_sharp; g_opt.sharpen = t.sharpen; g_opt.fxaa = t.fxaa; g_opt.fps_counter = t.fps_counter; g_opt.fps_avg = t.fps_avg; g_opt.fps_low = t.fps_low; g_opt.frame_time = t.frame_time; g_opt.fps_size = t.fps_size; g_opt.steady = t.steady;
+    g_opt.upscaler = t.upscaler; g_opt.fsr_sharp = t.fsr_sharp; g_opt.gsr_sharp = t.gsr_sharp; g_opt.sharpen = t.sharpen; g_opt.fxaa = t.fxaa; g_opt.fps_counter = t.fps_counter; g_opt.fps_avg = t.fps_avg; g_opt.fps_low = t.fps_low; g_opt.frame_time = t.frame_time; g_opt.ov_gpu = t.ov_gpu; g_opt.ov_cpu = t.ov_cpu; g_opt.ov_bat = t.ov_bat; g_opt.ov_soc = t.ov_soc; g_opt.ov_ram = t.ov_ram; g_opt.ov_drv = t.ov_drv; g_opt.ov_thr = t.ov_thr; g_opt.ov_graph = t.ov_graph; g_opt.fps_size = t.fps_size; g_opt.steady = t.steady;
     g_opt.framegen = t.framegen;                   /* 0.3.12: nvn_vk_motion.c fg_update switches it at the next real frame */
     g_opt.fg_fast = t.fg_fast;
     static const char *k_up[] = {"bilinear", "gsr", "fsr", "bicubic"};

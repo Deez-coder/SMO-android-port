@@ -450,6 +450,7 @@ static void boost_frame(int64_t now, int64_t dt) {
 
 /* After a present, on the render thread: the time since the present before. */
 void android_perf_frame(void) {
+    { void smo_bench_frame(void); smo_bench_frame(); }      /* 0.5.3: the launcher's benchmark (smo_bench.c) */
     spin_test_poll();
     static int64_t last_ns;
     static int spun, frames;

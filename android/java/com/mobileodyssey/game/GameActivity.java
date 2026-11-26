@@ -29,6 +29,7 @@ import android.widget.TextView;
 
 public class GameActivity extends NativeActivity {
     native void nativeHold(boolean on);                    /* android_main.c: the game stands still (as in the menus) */
+    native void nativeBattery(int temp10, int level, boolean charging);      /* 0.5.3: the performance overlay's battery item (android_ovstats.c) */
     native void nativeQuiesce();                           /* android_main.c: waits for a save in progress, then no more file writes */
     native void nativeSaveCache(boolean leaving);          /* nvn_vk_m4.c: writes the pipeline cache if it has something new */
     native void nativeLoadState(long[] out);               /* android_main.c: frames shown, pipelines made ahead, of how many, all made, first-start preparation running, done, of how many */
@@ -47,6 +48,26 @@ public class GameActivity extends NativeActivity {
         if (android.os.Build.VERSION.SDK_INT >= 35) getWindow().setFrameRateBoostOnTouchEnabled(false);
         fullScreen(this);
         showLoading();
+        pollBattery();
+    }
+    /* 0.5.3: the battery's temperature, level and charging for the performance overlay, every 2 s (the sticky broadcast: no
+     * receiver kept, and it works where the battery's sysfs file is refused to apps) */
+    private void pollBattery() {
+        ui.postDelayed(new Runnable() {
+            @Override public void run() {
+                if (isFinishing()) return;
+                try {
+                    android.content.Intent bi = registerReceiver(null, new android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED));
+                    if (bi != null) {
+                        int t10 = bi.getIntExtra(android.os.BatteryManager.EXTRA_TEMPERATURE, -1000);
+                        int lv = bi.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1), sc = bi.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, 100);
+                        int st = bi.getIntExtra(android.os.BatteryManager.EXTRA_STATUS, 0);
+                        nativeBattery(t10, lv >= 0 && sc > 0 ? lv * 100 / sc : -1, st == android.os.BatteryManager.BATTERY_STATUS_CHARGING || st == android.os.BatteryManager.BATTERY_STATUS_FULL);
+                    }
+                } catch (Throwable ignored) { }                /* before the game's thread registered the native method */
+                ui.postDelayed(this, 2000);
+            }
+        }, 1000);
     }
 
     /* The loading screen: a window of its own over the game's, drawn at once (the game's stays empty until its renderer
@@ -134,7 +155,7 @@ public class GameActivity extends NativeActivity {
                     ui.postDelayed(this, 200);
                     return;
                 }
-                if (shownAt >= 0 && now - shownAt > 600) { hideLoading(); return; }     /* the game's own frames for a moment */
+                if (shownAt >= 0 && now - shownAt > 600) { hideLoading(); watchPrep(); return; }     /* the game's own frames for a moment */
                 if (st[2] > 0 && st[3] == 0) {                 /* the pipelines made ahead: from the cache in seconds, from nothing on a first start */
                     bar.setIndeterminate(false);
                     bar.setMax((int)st[2]);
@@ -150,6 +171,21 @@ public class GameActivity extends NativeActivity {
             }
         };
         ui.post(poll);
+    }
+    /* 0.5.1 (GitHub issue 42): the game can turn a start into the first-start preparation after its own frames have
+     * begun (its shaders turned out to be missing from the cache: nvn_vk_m4.c set_over_budget). For the first three
+     * minutes this checks twice a second and brings the progress bar back over the black screen. */
+    private void watchPrep() {
+        long until = android.os.SystemClock.uptimeMillis() + 180000;
+        long[] st = new long[7];
+        ui.postDelayed(new Runnable() {
+            @Override public void run() {
+                if (isFinishing() || leaving || loading != null || android.os.SystemClock.uptimeMillis() > until) return;
+                try { nativeLoadState(st); } catch (UnsatisfiedLinkError e) { return; }
+                if (st[4] != 0) { showLoading(); return; }
+                ui.postDelayed(this, 500);
+            }
+        }, 500);
     }
     private void hideLoading() {
         Dialog d = loading;
@@ -170,6 +206,11 @@ public class GameActivity extends NativeActivity {
     }
 
     /* Called by the game's input thread: the in-game menu (InGameMenu.java). Outside it or the back gesture keeps playing. */
+    /* 0.5.3: called by the game's render thread when the benchmark has its result (smo_bench.c): the normal way out, back to the
+     * launcher, which puts the save back and shows the result (LauncherActivity.benchFinish) */
+    public void benchDone() {
+        runOnUiThread(() -> { if (!isFinishing() && !leaving) leave(false); });
+    }
     public void askExit() {
         runOnUiThread(() -> {
             if (isFinishing() || leaving) return;

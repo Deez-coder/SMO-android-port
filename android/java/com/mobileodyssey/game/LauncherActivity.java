@@ -50,7 +50,7 @@ import java.util.zip.ZipInputStream;
 public class LauncherActivity extends Activity {
     static final int BG = 0xFF101318, CARD = 0xFF1B2029, CARD2 = 0xFF242A35, TEXT = 0xFFECEFF4, DIM = 0xFF9AA3B2,
                      ACCENT = 0xFFE5393B, ACCENT2 = 0xFF3B82F6, OK = 0xFF34C77B, WARN = 0xFFF5A524;
-    static final int REQ_GAME = 1, REQ_DRIVER = 2, REQ_MOD = 3, REQ_KEYS = 4, REQ_PACKAGE = 5, REQ_SAVE_OUT = 6, REQ_SAVE_IN = 7, REQ_LOGS = 8;
+    static final int REQ_GAME = 1, REQ_DRIVER = 2, REQ_MOD = 3, REQ_KEYS = 4, REQ_PACKAGE = 5, REQ_SAVE_OUT = 6, REQ_SAVE_IN = 7, REQ_LOGS = 8, REQ_BENCH = 9;
     java.util.Map<String, byte[]> keys;                  /* the parsed prod.keys while an NSP / XCI import runs (the file stays in keysFile()) */
     static final String[] TABS = {"Game", "Graphics", "Controls", "Advanced", "Mods"};
 
@@ -144,7 +144,7 @@ public class LauncherActivity extends Activity {
     }
 
     @Override protected void onSaveInstanceState(Bundle out) { super.onSaveInstanceState(out); out.putInt("tab", tab); }
-    @Override protected void onResume() { super.onResume(); if (content != null) show(tab); }
+    @Override protected void onResume() { super.onResume(); benchFinish(); if (content != null) show(tab); }
 
     void show(int t) {
         final int keep = t == tab && scroll != null ? scroll.getScrollY() : 0;      /* a setting changed: stay where the user was */
@@ -304,6 +304,8 @@ public class LauncherActivity extends Activity {
         r.addView(header("Resolution"));
         r.addView(choice(g, "console_mode", "Console mode", new String[]{"docked", "handheld"}, new String[]{"Docked", "Handheld"}, "docked",
                 "What the game is told it runs as; it picks its own picture size for each: docked " + "1600x900, handheld 1280x720."));
+        r.addView(toggle(g, "widescreen", "Widescreen", "on", "off", "on", "The 3D view fills a wide phone screen in play and cutscenes instead of black bars at the sides. "
+                + "The HUD and menus stay 16:9 in the middle, and the title screen keeps its bars. The picture is stretched from the game's size, so it is a little softer: a higher resolution makes up for it."));
         r.addView(choice(g, "resolution_scale", "Resolution", new String[]{"auto", "1.50", "2.00"},
                 new String[]{"Native\n" + (hh ? "1280x720" : "1920x1080"), "1.5x\n" + size(bw, bh, 1.5f), "2x\n" + size(bw, bh, 2f)}, "1.00",
                 "Native: as the console shows the game (docked 1080p, handheld 720p). 1.5x and 2x multiply the game's own size, "
@@ -354,6 +356,14 @@ public class LauncherActivity extends Activity {
         d.addView(toggle(g, "fps_average", "Average FPS", "on", "off", "off", null));
         d.addView(toggle(g, "fps_low", "1% low", "on", "off", "off", "The frame rate of the slowest 1% of frames: how bad the stutters get."));
         d.addView(toggle(g, "frame_time", "Frame time", "on", "off", "off", "Milliseconds between frames. Average, 1% low and frame time are of the last 10 seconds or so."));
+        d.addView(toggle(g, "overlay_gpu", "GPU time", "on", "off", "off", "How long the GPU works on each frame."));
+        d.addView(toggle(g, "overlay_cpu", "CPU clock cap", "on", "off", "off", "How far the system lets the main CPU cores clock, in percent of their top speed. It drops when the phone limits itself for heat."));
+        d.addView(toggle(g, "overlay_soc", "Chip temperature", "on", "off", "off", "The hottest CPU or GPU sensor, where the phone lets apps read it."));
+        d.addView(toggle(g, "overlay_battery", "Battery", "on", "off", "off", "Battery temperature and charge, + while charging."));
+        d.addView(toggle(g, "overlay_ram", "Memory", "on", "off", "off", "The game's memory and the phone's used and total memory."));
+        d.addView(toggle(g, "overlay_thermal", "Throttle dot", "on", "off", "off", "Green, yellow or red: how much the phone is limiting itself for heat, from Android's heat state and its forecast."));
+        d.addView(toggle(g, "overlay_graph", "Frame graph", "on", "off", "off", "The last 48 frames as bars: yellow when a frame was late, red when it took twice as long."));
+        d.addView(toggle(g, "overlay_driver", "Graphics driver", "on", "off", "off", null));
         d.addView(slider(g, "fps_size", "Overlay size", 50, 200, 10, 100, "%", 1f, null));
         content.addView(d);
         content.addView(note("Changes apply the next time the game starts."));
@@ -370,6 +380,8 @@ public class LauncherActivity extends Activity {
         t.addView(choice(c, "camera_touch", "Camera", new String[]{"stick", "drag"}, new String[]{"Right stick", "Drag"}, "stick",
                 "Right stick: a second stick that turns the camera. Drag: the camera follows your finger."));
         t.addView(slider(c, "camera_speed", "Camera speed", 20, 400, 10, 100, "%", 0.01f, null));
+        t.addView(choice(c, "touch_player", "Touch controls are", new String[]{"1", "2"}, new String[]{"Player 1", "Player 2"}, "1",
+                "Player 2: with a controller connected, the controller is player 1 (Mario) and touch is player 2, for the game's two-player mode (pause menu, Two Players: player 2 plays Cappy). Without a controller, touch stays player 1. Two controllers work either way: the second one is player 2."));
         t.addView(space(8));
         int placed = 0;
         for (String k : LayoutEditorActivity.KEYS) if (c.get("pos_" + k, null) != null) placed++;
@@ -521,6 +533,31 @@ public class LauncherActivity extends Activity {
         lg.addView(el, new LinearLayout.LayoutParams(-1, dp(48)));
         content.addView(lg);
 
+        LinearLayout bc = card();                         /* 0.5.3: the benchmark (smo_bench.c) */
+        bc.addView(header("Benchmark"));
+        File br = new File(root, "bench_result.txt");
+        bc.addView(statusLine("Last result", br.exists() ? new java.text.SimpleDateFormat("d MMM yyyy, HH:mm", java.util.Locale.getDefault())
+                .format(new java.util.Date(br.lastModified())) : "none yet", DIM));
+        bc.addView(text("Plays the same spot in Cascade Kingdom with the same settings on every phone (100% scale, frame generation off, "
+                + "60 fps limit), so results from different phones can be compared. It first waits until the spot's graphics are built, "
+                + "then measures for 60 seconds. It takes about 2 to 4 minutes. Your save and settings are put back afterwards. "
+                + "Let the phone cool down first. The result goes into Export logs.", 12, DIM, false));
+        bc.addView(space(8));
+        Button rb = button("Run benchmark", CARD2);
+        rb.setOnClickListener(v -> { if (archOk()) vulkanOk(this::benchStart); });
+        bc.addView(rb, new LinearLayout.LayoutParams(-1, dp(48)));
+        if (br.exists()) {
+            bc.addView(space(6));
+            Button sb = button("Show last result", CARD2);
+            sb.setOnClickListener(v -> benchShow());
+            bc.addView(sb, new LinearLayout.LayoutParams(-1, dp(48)));
+            bc.addView(space(6));
+            Button eb = button("Export result…", CARD2);
+            eb.setOnClickListener(v -> benchExportAsk());
+            bc.addView(eb, new LinearLayout.LayoutParams(-1, dp(48)));
+        }
+        content.addView(bc);
+
         LinearLayout r = card();
         r.addView(header("Reset"));
         Button rg = button("Graphics settings to defaults", CARD2);
@@ -582,6 +619,7 @@ public class LauncherActivity extends Activity {
         else if (req == REQ_MOD) background("Installing the mod…", () -> unzip(u, new File(new File(root, "mods"), modName(u)), true), () -> show(4));
         else if (req == REQ_SAVE_OUT) background("Exporting the save…", () -> exportSave(u), () -> toast("Save exported"));
         else if (req == REQ_LOGS) background("Exporting the logs…", () -> exportLogs(u), () -> toast("Logs exported"));
+        else if (req == REQ_BENCH) background("Exporting the benchmark result…", () -> exportBench(u), () -> toast("Benchmark result exported"));
         else if (req == REQ_SAVE_IN) confirmImportSave(u);
     }
 
@@ -643,7 +681,7 @@ public class LauncherActivity extends Activity {
             z.write(info.toString().getBytes(StandardCharsets.UTF_8));
             z.closeEntry();
             String[][] files = {{"log.txt", "log.txt"}, {"log.prev.txt", "log.prev.txt"}, {"config/graphics.ini", "graphics.ini"},
-                                {"config/controls.ini", "controls.ini"}, {"config/mods.ini", "mods.ini"}, {"config/env.txt", "env.txt"}};
+                                {"config/controls.ini", "controls.ini"}, {"config/mods.ini", "mods.ini"}, {"config/env.txt", "env.txt"}, {"bench_result.txt", "bench_result.txt"}};
             for (String[] f : files) {
                 File src = new File(root, f[0]);
                 if (!src.isFile()) continue;
@@ -980,6 +1018,97 @@ public class LauncherActivity extends Activity {
                 + "A newer system update from the phone's maker may bring a newer driver. Snapdragon phones can also use a custom driver (Advanced, Graphics driver).\n\n"
                 + "If you start it anyway and it closes, please send the logs (Advanced, Export logs): they list what the driver offers.")
             .setPositiveButton("Start anyway", (d, w) -> start.run()).setNegativeButton("Cancel", null).show();
+    }
+    /* 0.5.3, THE BENCHMARK (Advanced > Run benchmark; the game's side is runtime/android/smo_bench.c). Before: the save folder is
+     * copied to bench_backup/save, an env.txt of the player's (rare) is kept as env.txt.bench, the benchmark's settings file is written
+     * (a copy of graphics.ini with the fixed values added at the end: the last line of a key wins) and env.txt starts the game in
+     * Cascade Kingdom with the scripted view. After (benchFinish, at every return to this screen while the marker is there and the
+     * game's process is gone, so a crash or a reboot is covered too): the save folder is put back exactly, env.txt and the
+     * benchmark's files are removed. */
+    static final String BENCH_SEQ = "@draws:110-130/20 @until:0-100/30:Z/45 @draws:1000-1400/20";
+    File benchMarker() { return new File(root, "bench_running"); }
+    void benchStart() {
+        new AlertDialog.Builder(this).setTitle("Run the benchmark?")
+            .setMessage("The game starts in Cascade Kingdom and plays by itself for about 2 to 4 minutes, then returns here and shows the result. "
+                + "Your save and settings are put back afterwards. Please don't touch the screen while it runs.")
+            .setPositiveButton("Start", (d, w) -> {
+                try {
+                    File save = new File(root, "userdata/save"), bak = new File(root, "bench_backup/save");
+                    deleteTree(new File(root, "bench_backup"));
+                    bak.mkdirs();
+                    File[] fs = save.listFiles();
+                    if (fs != null) for (File f : fs) if (f.isFile()) copyFile(f, new File(bak, f.getName()));
+                    File env = new File(config, "env.txt"), envKeep = new File(config, "env.txt.bench");
+                    if (env.exists() && !envKeep.exists()) env.renameTo(envKeep);
+                    File gi = new File(config, "graphics.ini"), bi = new File(config, "bench_graphics.ini");
+                    String base = gi.exists() ? new String(readAll(new FileInputStream(gi)), StandardCharsets.UTF_8) : "";
+                    try (FileOutputStream o = new FileOutputStream(bi)) {
+                        o.write((base + "\n\n; the benchmark's fixed values (LauncherActivity.benchStart)\nresolution_scale = 1.00\nframe_generation = off\nfps_cap = 60\n"
+                            + "steady_speed = off\nwidescreen = off\n").getBytes(StandardCharsets.UTF_8));
+                    }
+                    new File(root, "bench_result.txt").delete();
+                    try (FileOutputStream o = new FileOutputStream(env)) {
+                        o.write(("SMO_BENCH=1\nSMO_START_STAGE=WaterfallWorldHomeStage\nSMO_GRAPHICS_CONFIG=../config/bench_graphics.ini\nSMO_SEQ=" + BENCH_SEQ + "\n")
+                            .getBytes(StandardCharsets.UTF_8));
+                    }
+                    try (FileOutputStream o = new FileOutputStream(benchMarker())) { o.write("1\n".getBytes(StandardCharsets.UTF_8)); }
+                    startActivity(new Intent(this, GameActivity.class));
+                } catch (Exception e) { toast("The benchmark could not start: " + e.getMessage()); benchFinishNow(); }
+            }).setNegativeButton("Cancel", null).show();
+    }
+    private int benchTries;
+    void benchFinish() {
+        if (root == null || !benchMarker().exists()) return;
+        if (gameProcessAlive()) {                         /* back here while the game's process is still ending: look again shortly */
+            if (benchTries++ < 30) new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(this::benchFinish, 1000);
+            return;
+        }
+        benchTries = 0;
+        benchFinishNow();
+        if (new File(root, "bench_result.txt").exists()) benchShow();
+        else toast("The benchmark ended without a result. Your save and settings are back.");
+    }
+    void benchFinishNow() {
+        try {
+            File save = new File(root, "userdata/save"), bak = new File(root, "bench_backup/save");
+            if (bak.isDirectory()) {
+                File[] cur = save.listFiles();
+                if (cur != null) for (File f : cur) if (f.isFile()) f.delete();
+                save.mkdirs();
+                File[] fs = bak.listFiles();
+                if (fs != null) for (File f : fs) copyFile(f, new File(save, f.getName()));
+            }
+            File env = new File(config, "env.txt"), envKeep = new File(config, "env.txt.bench");
+            env.delete();
+            if (envKeep.exists()) envKeep.renameTo(env);
+            new File(config, "bench_graphics.ini").delete();
+            deleteTree(new File(root, "bench_backup"));
+        } catch (Exception e) { toast("Putting the save back failed: " + e.getMessage()); return; }
+        benchMarker().delete();
+    }
+    void benchShow() {
+        String s;
+        try { s = new String(readAll(new FileInputStream(new File(root, "bench_result.txt"))), StandardCharsets.UTF_8); } catch (Exception e) { s = "No result."; }
+        new AlertDialog.Builder(this).setTitle("Benchmark result").setMessage(s).setPositiveButton("OK", null)
+            .setNeutralButton("Export…", (d, w) -> benchExportAsk()).show();
+    }
+    /* 0.5.3: the result as a file of its own to send (the user: easier than a screenshot of the dialog), with the phone's facts */
+    void benchExportAsk() {
+        Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.setType("text/plain");
+        i.putExtra(Intent.EXTRA_TITLE, "odyssey-benchmark-" + new java.text.SimpleDateFormat("yyyyMMdd-HHmm", java.util.Locale.ROOT).format(new java.util.Date(new File(root, "bench_result.txt").lastModified())) + ".txt");
+        startActivityForResult(i, REQ_BENCH);
+    }
+    void exportBench(Uri out) throws Exception {
+        String r = new String(readAll(new FileInputStream(new File(root, "bench_result.txt"))), StandardCharsets.UTF_8);
+        String info = "app " + appVersion() + "\nandroid " + android.os.Build.VERSION.RELEASE + " (api " + android.os.Build.VERSION.SDK_INT + ")\nphone "
+            + android.os.Build.MANUFACTURER + " " + android.os.Build.MODEL + "\nchip " + android.os.Build.SOC_MANUFACTURER + " " + android.os.Build.SOC_MODEL
+            + "\ngraphics driver " + driverStatus() + "\nrun " + new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.ROOT).format(new java.util.Date(new File(root, "bench_result.txt").lastModified())) + "\n\n";
+        try (OutputStream o = getContentResolver().openOutputStream(out)) { o.write((info + r).getBytes(StandardCharsets.UTF_8)); }
+    }
+    static void copyFile(File a, File b) throws java.io.IOException {
+        try (InputStream in = new FileInputStream(a); OutputStream out = new FileOutputStream(b)) { pipe(in, out); }
     }
     String versionName() { try { return getPackageManager().getPackageInfo(getPackageName(), 0).versionName; } catch (Exception e) { return ""; } }
     void confirm(String q, Runnable yes) { confirm(q, "Reset", yes); }

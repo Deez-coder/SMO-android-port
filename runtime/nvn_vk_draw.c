@@ -100,6 +100,7 @@ static void vkd_fail(const char *fmt, ...) {
 static int vk_gpl_mode(void) { static int m = -1; if (m < 0) { const char *e = getenv("SMO_VK_GPL"); m = e && e[0] ? atoi(e) : VK_GPL_DEFAULT; } return m; }
 
 /* ---------------------------------------------------------------- device features */
+static char g_drv_name[64];                       /* 0.5.3: VkPhysicalDeviceDriverProperties.driverName, for the overlay */
 static void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties *dext, uint32_t ndext) {
     void **tail;
     vkGetPhysicalDeviceFeatures2 = vk_sym("vkGetPhysicalDeviceFeatures2"); vkGetPhysicalDeviceProperties2 = vk_sym("vkGetPhysicalDeviceProperties2");
@@ -138,6 +139,7 @@ static void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties 
         {   const char *cr = getenv("SMO_VK_CB_RELEASE");      /* 0.2.5 (g_cb_release, nvn_vk.c): Arm's own driver; SMO_VK_CB_RELEASE = 0/1 chooses */
             g_cb_release = cr ? atoi(cr) != 0 : dp.driverID == VK_DRIVER_ID_ARM_PROPRIETARY;
             printf("nvn_vk: command buffers release their memory at each reset: %s\n", g_cb_release ? (cr ? "on (SMO_VK_CB_RELEASE)" : "on (Arm's driver)") : "off"); }
+        snprintf(g_drv_name, sizeof g_drv_name, "%s", dp.driverName);      /* 0.5.3: the overlay's driver line */
         printf("nvn_vk: driver %s %s; clip distances: feature %d, up to %u; 32-bit floats: keeps NaN/inf/-0 %d, keeps denormals %d, flushes denormals %d; 16-bit floats: keeps NaN/inf/-0 %d\n",
                dp.driverName, dp.driverInfo, (int)D.f2.features.shaderClipDistance, (unsigned)V.props.limits.maxClipDistances,
                (int)fc.shaderSignedZeroInfNanPreserveFloat32, (int)fc.shaderDenormPreserveFloat32, (int)fc.shaderDenormFlushToZeroFloat32, (int)fc.shaderSignedZeroInfNanPreserveFloat16);
@@ -157,8 +159,14 @@ static void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties 
          * held a first start on the Joy-Con screen for minutes. SMO_VK_GUARD, SMO_VK_PRECISE, SMO_VK_OPT_FS, SMO_VK_SPLIT_BARRIER = 0/1 choose. */
         const char *eg = getenv("SMO_VK_GUARD"), *ep = getenv("SMO_VK_PRECISE"), *eo = getenv("SMO_VK_OPT_FS"), *es = getenv("SMO_VK_SPLIT_BARRIER");
         int arm = V.props.vendorID == 0x13B5;
-        mx_guard = eg ? atoi(eg) != 0 : arm;
-        mx_precise = ep ? atoi(ep) != 0 : arm;
+        /* 0.5.6, GitHub issue 39 (Pixel 10 Pro XL, PowerVR D-Series DXT-48-1536, driver 25.3): the white fog. Its Diagnostics round
+         * holds a few texels at 3.6e4..3.8e4 in the G-buffer pass's R11G11B10 colour 0 (healthy frames: up to about 2100),
+         * the same after each pass as at the frame's end (so not ordering), spread by the bloom: the Mali picture of
+         * 2026-11-04 before the guard. Its driver promises neither keeping nor flushing denormals and runs with the
+         * guard off; the guard and the strict vertex math go on for PowerVR as for Arm (SMO_VK_GUARD / SMO_VK_PRECISE = 0/1). */
+        int pvr = V.props.vendorID == 0x1010;
+        mx_guard = eg ? atoi(eg) != 0 : arm || pvr;
+        mx_precise = ep ? atoi(ep) != 0 : arm || pvr;
         mx_opt_fs = eo && atoi(eo) != 0;
         /* 0.3.4: light (split) barriers on Arm by default. The Mali tester's per-pass GPU times (0.3.3, Mali-G615, frame 9000): 15.2 ms in
          * 53 passes and 11.6 ms between them, a gap of 0.14-0.3 ms before almost every pass, the GPU emptied by the ALL_COMMANDS barrier.
@@ -397,6 +405,9 @@ static int g_pe_on = -1;
  * pipe (everything before it finished) before each pass begins and after it ends: a pass's time is its own work, a
  * gap is what ran between two passes (barriers, copies, compute). Printed after the frame ("nvn_vk_passtime:"). */
 #define PT_MAX 400
+int smo_widescreen_active(void);                  /* smo_widescreen.c: the current scene is widened */
+static volatile float g_win_aspect;               /* 0.5.5: the window's width / height as the app sees it (present_pass), for smo_widescreen.c */
+static volatile int64_t g_last_frame_draws;      /* 0.5.3: set at the end of each frame (where the frame ends), read by smo_bench.c */
 static int g_pt_frame = -2, g_pt_on, g_pt_n;
 /* 0.3.3: on Android without SMO_VK_PASSTIME, one frame in every PT_AUTO_EVERY is measured this way (the Mali tester's GPU spent a
  * fixed 14-15 ms a frame whatever the draw count: which passes?). The measured frame waits for the GPU once (a short hitch).
@@ -917,7 +928,7 @@ static VkFormatFeatureFlags fmt_feats(VkFormat f) {
         for (const char *e = getenv("SMO_VK_SIM_FMT"); e && *e; ) {
             int n = atoi(e); const char *c = strchr(e, ':');
             if (!c) break;
-            for (c++; *c && *c != ','; c++) if (n > 0 && n < 256) sim[n] |= *c == 'b' ? 1 : *c == 'l' ? 2 : *c == 'c' ? 4 : *c == 's' ? 8 : 0;
+            for (c++; *c && *c != ','; c++) if (n > 0 && n < 256) sim[n] |= *c == 'b' ? 1 : *c == 'l' ? 2 : *c == 'c' ? 4 : *c == 's' ? 8 : *c == 'x' ? 16 : 0;      /* x (0.5.7): not sampled at all */
             e = *c ? c + 1 : c;
         }
     }
@@ -929,6 +940,7 @@ static VkFormatFeatureFlags fmt_feats(VkFormat f) {
         if (sim[f] & 2) r &= ~(VkFormatFeatureFlags)VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
         if (sim[f] & 4) r &= ~(VkFormatFeatureFlags)(VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT);
         if (sim[f] & 8) r &= ~(VkFormatFeatureFlags)VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
+        if (sim[f] & 16) r = 0;
         cache[f] = r; have[f] = 1;
     }
     return r;
@@ -937,14 +949,30 @@ static int fmt_supported(VkFormat f, VkFlags need) { return (fmt_feats(f) & need
 /* SMO 0.1.3, off since 0.1.8 and no longer an option (SMO_VK_FMT_SUB=1, for tests): a Mali tester's visual errors went away with it off, at a small cost in fps. On a GPU that cannot filter or blend what the game
  * does with these formats, the render target is made in a format that can. R16G16_SNORM (filtered) and R32_SFLOAT (blended) as
  * R16G16_SFLOAT, RGBA32F (blended) as RGBA16F; the precision is less, the sampled values are the same. Not for textures with
- * data from the game's files (vt_get2 keeps those). */
+ * data from the game's files (vt_get2 keeps those).
+ * 0.5.6: the R16G16_SNORM swap is on by default again, alone. The 0.1.8 tester's Mali-G615 (r44p1) filters R16G16_SNORM, so
+ * there the option only swapped R32F and RGBA32F, which made his picture worse. A Galaxy M54 (Mali-G68, r38p1) showed the 3D
+ * picture black with the HUD right, and its log says it cannot filter R16G16_SNORM while the game samples a 640x720 target
+ * of it with a linear filter (undefined on Mali; the Mali-G57 r54p1 log of 2026-11-17 lacks it too). g_fmt_sub: 1 = that
+ * swap only (default), 2 = all three (SMO_VK_FMT_SUB=1), 0 = none (SMO_VK_FMT_SUB=0). */
 static int g_fmt_sub = -1;
 static VkFormat fmt_sub(int nf) {
-    if (g_fmt_sub < 0) { const char *e = getenv("SMO_VK_FMT_SUB"); g_fmt_sub = e && atoi(e) != 0; }
+    if (g_fmt_sub < 0) { const char *e = getenv("SMO_VK_FMT_SUB"); g_fmt_sub = !e ? 1 : atoi(e) != 0 ? 2 : 0; }
     if (!g_fmt_sub) return VK_FORMAT_UNDEFINED;
     if (nf == 0x13 && !fmt_supported(VK_FORMAT_R16G16_SNORM, VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)) return VK_FORMAT_R16G16_SFLOAT;
+    if (g_fmt_sub < 2) return VK_FORMAT_UNDEFINED;
     if (nf == 0x0a && !fmt_supported(VK_FORMAT_R32_SFLOAT, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT)) return VK_FORMAT_R16G16_SFLOAT;
     if (nf == 0x2e && !fmt_supported(VK_FORMAT_R32G32B32A32_SFLOAT, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT)) return VK_FORMAT_R16G16B16A16_SFLOAT;
+    return VK_FORMAT_UNDEFINED;
+}
+/* 0.5.7: the Vulkan BC format of NVN format nf (0x41..0x50), 0 for another format: the same table as tex_vkfmt's switch */
+static VkFormat bc_native_fmt(int nf) {
+    switch (nf) {
+    case 0x41: return VK_FORMAT_BC1_RGB_UNORM_BLOCK; case 0x42: return VK_FORMAT_BC1_RGBA_UNORM_BLOCK; case 0x43: return VK_FORMAT_BC2_UNORM_BLOCK; case 0x44: return VK_FORMAT_BC3_UNORM_BLOCK;
+    case 0x45: return VK_FORMAT_BC1_RGB_SRGB_BLOCK; case 0x46: return VK_FORMAT_BC1_RGBA_SRGB_BLOCK; case 0x47: return VK_FORMAT_BC2_SRGB_BLOCK; case 0x48: return VK_FORMAT_BC3_SRGB_BLOCK;
+    case 0x49: return VK_FORMAT_BC4_UNORM_BLOCK; case 0x4A: return VK_FORMAT_BC4_SNORM_BLOCK; case 0x4B: return VK_FORMAT_BC5_UNORM_BLOCK; case 0x4C: return VK_FORMAT_BC5_SNORM_BLOCK;
+    case 0x4D: return VK_FORMAT_BC7_UNORM_BLOCK; case 0x4E: return VK_FORMAT_BC7_SRGB_BLOCK; case 0x4F: return VK_FORMAT_BC6H_SFLOAT_BLOCK; case 0x50: return VK_FORMAT_BC6H_UFLOAT_BLOCK;
+    }
     return VK_FORMAT_UNDEFINED;
 }
 /* NVN texture format -> Vulkan. *expand = 1 + component kind when a 3-component format is stored with 4; *decode = 1 when the texels are decoded to RGBA8 on the CPU. */
@@ -986,6 +1014,20 @@ static VkFormat tex_vkfmt(int nf, int *expand, int *decode) {
                 for (unsigned i = 0; i < sizeof k_bc / sizeof k_bc[0]; i++)
                     o += (size_t)snprintf(l + o, sizeof l - o, " %s %s", k_bc[i].n, fmt_supported(k_bc[i].f, VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) ? "yes" : "no");
                 printf("nvn_vk: BC formats the driver still offers one by one (sampled, linear filter):%s\n", l);
+            }
+        }
+        /* 0.5.7: a GPU without the BC feature may still offer some BC formats one by one (the Pixel 10's PowerVR and Samsung's Xclipse
+         * offer BC1 to BC5 and lack only BC6H and BC7; Vulkan lets those be used as any format the driver lists). Where this format is
+         * offered with linear filtering and uploads, its blocks go to the GPU as they are, so only the missing formats are converted on
+         * the CPU: no re-encoding, no loss, less memory traffic. SMO_VK_BC_EACH=0: as before (all converted). */
+        if (!bc) {
+            static int each = -1;
+            if (each < 0) { const char *e = getenv("SMO_VK_BC_EACH"); each = !(e && !atoi(e)); }
+            VkFormat nat = bc_native_fmt(nf);
+            if (each && nat && fmt_supported(nat, VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT)) {
+                static uint32_t said;
+                if (!(said >> (nf - 0x41) & 1)) { said |= 1u << (nf - 0x41); printf("nvn_vk: BC format 0x%x read by the GPU as it is (Vulkan %d is offered although the BC feature is off)\n", nf, (int)nat); }
+                return nat;
             }
         }
         if (!bc && etc && tex_etc_target(nf)) {
@@ -2017,6 +2059,7 @@ static VStage *vstage_get(Prog *p, int s, const uint32_t *key, uint32_t fo) {
     v->next = g_vstage[h & 4095]; g_vstage[h & 4095] = v;
     st->vk = v;
     snprintf(what, sizeof what, "program #%d %s stage", p->serial, s == 5 ? "compute" : s ? "fragment" : "vertex");
+    if (getenv("SMO_VK_GLSLDUMP")) { size_t l = strlen(what); snprintf(what + l, sizeof what - l, " %016llx", (unsigned long long)fnv(0xcbf29ce484222325ULL, st->code, (size_t)st->code_len)); }      /* 0.5.6: the code hash of nvn_vk_watch / nvn_vk_hash in the dump's name */
     if (!mx_translate(&in, &out)) { printf("nvn_vk: %s: machine code not translated: %s\n", what, out.why); fflush(stdout); return NULL; }
     uint64_t spv_hash = 0;
     v->mod = module_from_glsl(s, out.glsl, what, &spv_hash);
@@ -5605,7 +5648,8 @@ static struct { VkDescriptorSetLayout dsl; VkPipelineLayout layout; VkDescriptor
 #define OV_SHAPES 24
 #define OV_BYTES 4096
 typedef struct { float sh[OV_SHAPES][4], col[OV_SHAPES][4], info[4], info2[4], glyph[OV_SHAPES], gs[43][4]; int32_t gr[9][4];
-                 uint32_t font[12][4]; int32_t tline[4][4], tcnt[4]; float tcol[4][4], tinfo[4]; } OvBlock;      /* 0.2.3: the performance overlay (ov_text) */      /* info2.x: sharpening 0..1; glyph: 0 a plain disc, else the icon (the shader's glyph()) */
+                 uint32_t font[24][4]; int32_t tline[12][4], tcnt[12]; float tcol[12][4], tinfo[4], gft[48], ginfo[4]; } OvBlock;      /* 0.5.3: 48 glyphs, 12 lines */      /* 0.2.3: the performance overlay (ov_text) */      /* info2.x: sharpening 0..1; glyph: 0 a plain disc, else the icon (the shader's glyph()) */
+_Static_assert(sizeof(OvBlock) <= OV_BYTES, "the overlay block outgrew its slice");
 /* the letters' strokes (x0 y0 x1 y1, in a button of radius 1, y down) and each letter's first stroke and count (A B X Y
  * house L R Z ~), read by the overlay shader from its uniform block: as constant arrays indexed by a variable the
  * Adreno 750 (system driver) made them again for every pixel, 20 ms of GPU time a frame for the touch controls and the
@@ -5629,7 +5673,7 @@ static const int32_t k_ov_gr[9][4] = {{0, 3}, {3, 10}, {13, 2}, {15, 3}, {18, 5}
             "#version 460\n" \
             "layout(push_constant) uniform PC { vec4 rect; vec4 crop; vec2 ext; int rot; } pc;\n"   /* rect: the picture in the window (0..1), crop: its part of the texture (uv) */ \
             "layout(set = 0, binding = 0) uniform sampler2D src;\n" \
-            "layout(std140, set = 0, binding = 1) uniform OV { vec4 sh[24]; vec4 col[24]; vec4 info; vec4 info2; vec4 glyph[6]; vec4 gs[43]; ivec4 gr[9]; uvec4 font[12]; ivec4 tline[4]; ivec4 tcnt; vec4 tcol[4]; vec4 tinfo; } ov;\n"   /* the overlay: touch controls, the performance overlay */ \
+            "layout(std140, set = 0, binding = 1) uniform OV { vec4 sh[24]; vec4 col[24]; vec4 info; vec4 info2; vec4 glyph[6]; vec4 gs[43]; ivec4 gr[9]; uvec4 font[24]; ivec4 tline[12]; ivec4 tcnt[3]; vec4 tcol[12]; vec4 tinfo; vec4 gft[12]; vec4 ginfo; } ov;\n"   /* the overlay: touch controls, the performance overlay */ \
             "layout(location = 0) out vec4 o;\n"
 #define PP_SHAPES \
             "float sg(vec2 p, vec4 s) { vec2 pa = p - s.xy, ba = s.zw - s.xy; return length(pa - ba * clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0)); }\n" \
@@ -5874,12 +5918,12 @@ static VkPipeline pp_pipeline(VkFormat fmt, VkPipeline *po) {
             "  if (q.x < -pad || q.y < -pad || q.x > ov.tinfo.z + pad || q.y > ov.tinfo.w + pad) return c;\n"
             "  c = mix(c, vec3(0.0), 0.55);\n"
             "  float y0 = 0.0;\n"
-            "  for (int i = 0; i < 4; i++) {\n"
+            "  for (int i = 0; i < 12; i++) {\n"
             "    if (i >= nl) break;\n"
             "    float sc = px * ov.tcol[i].w, h = 9.0 * sc;\n"
             "    if (q.y >= y0 && q.y < y0 + h) {\n"
             "      int cell = int(floor(q.x / (6.0 * sc)));\n"
-            "      if (q.x >= 0.0 && cell < ov.tcnt[i]) {\n"
+            "      if (q.x >= 0.0 && cell < ov.tcnt[i >> 2][i & 3]) {\n"
             "        int g = (ov.tline[i][cell >> 2] >> ((cell & 3) * 8)) & 255;\n"
             "        int col = int((q.x - float(cell) * 6.0 * sc) / sc), row = int((q.y - y0) / sc);\n"
             "        if (col < 5 && row < 7 && ovbit(g, col, row) > 0.5) c = ov.tcol[i].rgb;\n"
@@ -5887,6 +5931,14 @@ static VkPipeline pp_pipeline(VkFormat fmt, VkPipeline *po) {
             "      break;\n"
             "    }\n"
             "    y0 += h;\n"
+            "  }\n"
+            "  if (ov.ginfo.x > 0.5) {\n"   /* 0.5.3: the frame graph, 48 bars, the newest on the right */
+            "    float gy = ov.ginfo.y, bw = ov.ginfo.z, gh = ov.ginfo.w;\n"
+            "    if (q.y >= gy && q.y < gy + gh && q.x >= 0.0 && q.x < 48.0 * bw) {\n"
+            "      int bi = int(q.x / bw); float r = ov.gft[bi >> 2][bi & 3];\n"   /* the frame's time over the target frame time */
+            "      float bh = clamp(r / 3.0, 0.02, 1.0) * gh;\n"
+            "      if (r > 0.0 && q.y >= gy + gh - bh && q.x - float(bi) * bw < bw * 0.8) c = r >= 2.0 ? vec3(1.0, 0.3, 0.3) : r > 1.15 ? vec3(1.0, 0.9, 0.2) : vec3(0.85);\n"
+            "    }\n"
             "  }\n"
             "  return c;\n"
             "}\n"
@@ -6188,31 +6240,64 @@ void nvn_vk_fps_stats(float out[4]) {               /* any thread: a copy of the
 static volatile int g_pinfo[5];                    /* 0.2.3, the in-game menu: the picture's size, its size on the screen, fps (nvn_vk_present_info) */
 void nvn_vk_present_info(int out[5]) { for (int i = 0; i < 5; i++) out[i] = g_pinfo[i]; }
 /* 0.2.3, the performance overlay's font: 5x7, '#' = lit; OV_CHARS names the glyphs in order */
-#define OV_CHARS "0123456789.%FPSAVGLOWM -"
-static const char *const k_ov_font[24][7] = {
-    {" ### ", "#   #", "#  ##", "# # #", "##  #", "#   #", " ### "}, {"  #  ", " ##  ", "  #  ", "  #  ", "  #  ", "  #  ", " ### "},
-    {" ### ", "#   #", "    #", "   # ", "  #  ", " #   ", "#####"}, {"#####", "   # ", "  #  ", "   # ", "    #", "#   #", " ### "},
-    {"   # ", "  ## ", " # # ", "#  # ", "#####", "   # ", "   # "}, {"#####", "#    ", "#### ", "    #", "    #", "#   #", " ### "},
-    {"  ## ", " #   ", "#    ", "#### ", "#   #", "#   #", " ### "}, {"#####", "    #", "   # ", "  #  ", " #   ", " #   ", " #   "},
-    {" ### ", "#   #", "#   #", " ### ", "#   #", "#   #", " ### "}, {" ### ", "#   #", "#   #", " ####", "    #", "   # ", " ##  "},
-    {"     ", "     ", "     ", "     ", "     ", " ##  ", " ##  "}, {"##   ", "##  #", "   # ", "  #  ", " #   ", "#  ##", "   ##"},
-    {"#####", "#    ", "#    ", "#### ", "#    ", "#    ", "#    "}, {"#### ", "#   #", "#   #", "#### ", "#    ", "#    ", "#    "},
-    {" ####", "#    ", "#    ", " ### ", "    #", "    #", "#### "}, {" ### ", "#   #", "#   #", "#####", "#   #", "#   #", "#   #"},
-    {"#   #", "#   #", "#   #", "#   #", "#   #", " # # ", "  #  "}, {" ### ", "#   #", "#    ", "# ###", "#   #", "#   #", " ####"},
-    {"#    ", "#    ", "#    ", "#    ", "#    ", "#    ", "#####"}, {" ### ", "#   #", "#   #", "#   #", "#   #", "#   #", " ### "},
-    {"#   #", "#   #", "#   #", "# # #", "# # #", "# # #", " # # "}, {"#   #", "## ##", "# # #", "# # #", "#   #", "#   #", "#   #"},
-    {"     ", "     ", "     ", "     ", "     ", "     ", "     "}, {"     ", "     ", "     ", "#####", "     ", "     ", "     "},
+#define OV_CHARS "0123456789.%ABCDEFGHIJKLMNOPQRSTUVWXYZ -/+:@"      /* 0.5.3: A-Z for the new overlay lines */
+#define OV_NGLYPH 44
+static const char *const k_ov_font[OV_NGLYPH][7] = {
+    {" ### ", "#   #", "#  ##", "# # #", "##  #", "#   #", " ### "},
+    {"  #  ", " ##  ", "  #  ", "  #  ", "  #  ", "  #  ", " ### "},
+    {" ### ", "#   #", "    #", "   # ", "  #  ", " #   ", "#####"},
+    {"#####", "   # ", "  #  ", "   # ", "    #", "#   #", " ### "},
+    {"   # ", "  ## ", " # # ", "#  # ", "#####", "   # ", "   # "},
+    {"#####", "#    ", "#### ", "    #", "    #", "#   #", " ### "},
+    {"  ## ", " #   ", "#    ", "#### ", "#   #", "#   #", " ### "},
+    {"#####", "    #", "   # ", "  #  ", " #   ", " #   ", " #   "},
+    {" ### ", "#   #", "#   #", " ### ", "#   #", "#   #", " ### "},
+    {" ### ", "#   #", "#   #", " ####", "    #", "   # ", " ##  "},
+    {"     ", "     ", "     ", "     ", "     ", " ##  ", " ##  "},
+    {"##   ", "##  #", "   # ", "  #  ", " #   ", "#  ##", "   ##"},
+    {" ### ", "#   #", "#   #", "#####", "#   #", "#   #", "#   #"},
+    {"#### ", "#   #", "#   #", "#### ", "#   #", "#   #", "#### "},
+    {" ### ", "#   #", "#    ", "#    ", "#    ", "#   #", " ### "},
+    {"#### ", "#   #", "#   #", "#   #", "#   #", "#   #", "#### "},
+    {"#####", "#    ", "#    ", "#### ", "#    ", "#    ", "#####"},
+    {"#####", "#    ", "#    ", "#### ", "#    ", "#    ", "#    "},
+    {" ### ", "#   #", "#    ", "# ###", "#   #", "#   #", " ####"},
+    {"#   #", "#   #", "#   #", "#####", "#   #", "#   #", "#   #"},
+    {" ### ", "  #  ", "  #  ", "  #  ", "  #  ", "  #  ", " ### "},
+    {"  ###", "   # ", "   # ", "   # ", "   # ", "#  # ", " ##  "},
+    {"#   #", "#  # ", "# #  ", "##   ", "# #  ", "#  # ", "#   #"},
+    {"#    ", "#    ", "#    ", "#    ", "#    ", "#    ", "#####"},
+    {"#   #", "## ##", "# # #", "# # #", "#   #", "#   #", "#   #"},
+    {"#   #", "##  #", "# # #", "# # #", "#  ##", "#   #", "#   #"},
+    {" ### ", "#   #", "#   #", "#   #", "#   #", "#   #", " ### "},
+    {"#### ", "#   #", "#   #", "#### ", "#    ", "#    ", "#    "},
+    {" ### ", "#   #", "#   #", "#   #", "# # #", "#  # ", " ## #"},
+    {"#### ", "#   #", "#   #", "#### ", "# #  ", "#  # ", "#   #"},
+    {" ####", "#    ", "#    ", " ### ", "    #", "    #", "#### "},
+    {"#####", "  #  ", "  #  ", "  #  ", "  #  ", "  #  ", "  #  "},
+    {"#   #", "#   #", "#   #", "#   #", "#   #", "#   #", " ### "},
+    {"#   #", "#   #", "#   #", "#   #", "#   #", " # # ", "  #  "},
+    {"#   #", "#   #", "#   #", "# # #", "# # #", "# # #", " # # "},
+    {"#   #", "#   #", " # # ", "  #  ", " # # ", "#   #", "#   #"},
+    {"#   #", "#   #", " # # ", "  #  ", "  #  ", "  #  ", "  #  "},
+    {"#####", "    #", "   # ", "  #  ", " #   ", "#    ", "#####"},
+    {"     ", "     ", "     ", "     ", "     ", "     ", "     "},
+    {"     ", "     ", "     ", "#####", "     ", "     ", "     "},
+    {"    #", "    #", "   # ", "  #  ", " #   ", "#    ", "#    "},
+    {"     ", "  #  ", "  #  ", "#####", "  #  ", "  #  ", "     "},
+    {"     ", " ##  ", " ##  ", "     ", " ##  ", " ##  ", "     "},
+    {"     ", " ### ", "#####", "#####", "#####", " ### ", "     "},
 };
-static void ov_font_pack(uint32_t out[12][4]) {
-    memset(out, 0, sizeof(uint32_t) * 48);
-    for (int g = 0; g < 24; g++) for (int r = 0; r < 7; r++) for (int c = 0; c < 5; c++)
+static void ov_font_pack(uint32_t out[24][4]) {
+    memset(out, 0, sizeof(uint32_t) * 96);
+    for (int g = 0; g < OV_NGLYPH; g++) for (int r = 0; r < 7; r++) for (int c = 0; c < 5; c++)
         if (k_ov_font[g][r][c] == '#') out[g >> 1][(g & 1) * 2 + (r < 4 ? 0 : 1)] |= 1u << ((r < 4 ? r : r - 4) * 5 + c);
 }
 static int ov_col(float f, float rgb[4]) { rgb[0] = f >= 55 ? 0.3f : 1.0f; rgb[1] = f >= 55 ? 1.0f : f >= 30 ? 0.9f : 0.3f; rgb[2] = f >= 55 ? 0.3f : f >= 30 ? 0.2f : 0.3f; return 0; }      /* as the old counter: green, yellow, red */
 static void ov_line(OvBlock *ob, int i, const char *txt, const float rgb[3], float size) {
     int n = 0;
     memset(ob->tline[i], 0, sizeof ob->tline[i]);
-    for (; txt[n] && n < 16; n++) { const char *k = strchr(OV_CHARS, txt[n]); int g = k ? (int)(k - OV_CHARS) : 22; ob->tline[i][n >> 2] |= g << ((n & 3) * 8); }
+    for (; txt[n] && n < 16; n++) { int ch = txt[n] >= 'a' && txt[n] <= 'z' ? txt[n] - 32 : txt[n]; const char *k = ch ? strchr(OV_CHARS, ch) : NULL; int g = k ? (int)(k - OV_CHARS) : 38; ob->tline[i][n >> 2] |= g << ((n & 3) * 8); }
     ob->tcnt[i] = n; ob->tcol[i][0] = rgb[0]; ob->tcol[i][1] = rgb[1]; ob->tcol[i][2] = rgb[2]; ob->tcol[i][3] = size;
 }
 /* the lines, again twice a second (and at once when the settings change); fps_on: the fps line */
@@ -6221,7 +6306,8 @@ static void ov_text_fill(OvBlock *ob, int fps_on) {
     static int64_t at;
     static int key = -1, packed;
     const GfxOptions *o = gfx_options();
-    int k = fps_on | o->fps_avg << 1 | o->fps_low << 2 | o->frame_time << 3 | (int)(o->fps_size * 100.0f) << 4;
+    int k = fps_on | o->fps_avg << 1 | o->fps_low << 2 | o->frame_time << 3 | (int)(o->fps_size * 100.0f) << 4
+            | o->ov_gpu << 20 | o->ov_cpu << 21 | o->ov_bat << 22 | o->ov_soc << 23 | o->ov_ram << 24 | o->ov_drv << 25 | o->ov_thr << 26 | o->ov_graph << 27;
     plat_li fq; ((fq).QuadPart = plat_qpf());
     int64_t now = tk();
     if (!packed) { ov_font_pack(last.font); packed = 1; }
@@ -6238,11 +6324,73 @@ static void ov_text_fill(OvBlock *ob, int fps_on) {
         if (o->fps_avg) { if (st[1] > 0) snprintf(b, sizeof b, "AVG %.1f", (double)st[1]); else snprintf(b, sizeof b, "AVG -"); ov_line(&last, n++, b, w, 1.0f); }
         if (o->fps_low) { if (st[2] > 0) { snprintf(b, sizeof b, "1%% LOW %.1f", (double)st[2]); ov_col(st[2], c); } else { snprintf(b, sizeof b, "1%% LOW -"); memcpy(c, w, sizeof w); } ov_line(&last, n++, b, c, 1.0f); }
         if (o->frame_time) { if (st[3] > 0) snprintf(b, sizeof b, "%.1f MS", (double)st[3]); else snprintf(b, sizeof b, "- MS"); ov_line(&last, n++, b, w, 1.0f); }
+#ifdef __ANDROID__
+        if (o->ov_gpu | o->ov_cpu | o->ov_bat | o->ov_soc | o->ov_ram | o->ov_drv | o->ov_thr | o->ov_graph) {      /* 0.5.3: the items of Peanuts Native's overlay (android_ovstats.c) */
+            void android_ovstats(int out[10]);
+            void nvn_vk_totals(double t[10]);
+            int s[10];
+            float yel[3] = {1.0f, 0.9f, 0.2f}, red[3] = {1.0f, 0.3f, 0.3f}, grn[3] = {0.3f, 1.0f, 0.3f};
+            android_ovstats(s);
+            if (o->ov_gpu) {                         /* the GPU's busy time a frame since the last update (the timestamps, as the perf line) */
+                static double busy0, n0;
+                double tt[10]; nvn_vk_totals(tt);
+                double dn = tt[6] - n0, ms = dn > 0 ? (tt[9] - busy0) / dn : -1.0;
+                busy0 = tt[9]; n0 = tt[6];
+                if (ms > 0) snprintf(b, sizeof b, "GPU %.1f MS", ms); else snprintf(b, sizeof b, "GPU -");
+                ov_line(&last, n++, b, ms > 16.7 ? yel : w, 1.0f);
+            }
+            if (o->ov_cpu) { if (s[0] > 0) snprintf(b, sizeof b, "CPU CAP %d%%", s[0]); else snprintf(b, sizeof b, "CPU CAP -"); ov_line(&last, n++, b, s[0] > 0 && s[0] < 65 ? red : s[0] > 0 && s[0] < 85 ? yel : w, 1.0f); }
+            if (o->ov_soc) { if (s[1] > -1000) snprintf(b, sizeof b, "SOC %dC", (s[1] + 5) / 10); else snprintf(b, sizeof b, "SOC -"); ov_line(&last, n++, b, s[1] >= 800 ? red : s[1] >= 700 ? yel : w, 1.0f); }
+            if (o->ov_bat) {
+                if (s[5] > -1000 && s[6] >= 0) snprintf(b, sizeof b, "BAT %dC %d%%%s", (s[5] + 5) / 10, s[6], s[7] ? "+" : "");
+                else snprintf(b, sizeof b, "BAT -");
+                ov_line(&last, n++, b, s[5] > 450 ? red : s[5] > 420 ? yel : w, 1.0f);
+            }
+            if (o->ov_ram) {
+                if (s[2] > 0) { snprintf(b, sizeof b, "GAME %.1fG", s[2] / 1024.0); ov_line(&last, n++, b, w, 1.0f); }
+                if (s[3] > 0 && s[4] > 0) { snprintf(b, sizeof b, "RAM %.1f/%.1fG", s[3] / 1024.0, s[4] / 1024.0); ov_line(&last, n++, b, s[3] * 100 > s[4] * 85 ? yel : w, 1.0f); }
+            }
+            if (o->ov_thr) {                         /* the throttle dot, as Peanuts Native's: the worst of Android's thermal status (1 light: yellow,
+                                                      * 2 moderate and up: red), its 10 s headroom forecast (0.85: yellow, 1.0: red) */
+                int lv = -1;
+                if (s[8] >= 0) lv = s[8] >= 2 ? 2 : s[8];
+                if (s[9] >= 0) { int h2 = s[9] >= 100 ? 2 : s[9] >= 85 ? 1 : 0; if (h2 > lv) lv = h2; }
+                /* not the CPU clock cap (Peanuts' third signal): the S24 lowers its main cores' cap at the title screen while it is cool
+                 * (47 C chip, 31 C battery), which made the dot red; the cap has its own line */
+                snprintf(b, sizeof b, "@ HEAT %s", lv < 0 ? "-" : lv == 0 ? "OK" : lv == 1 ? "WARM" : "HOT");
+                ov_line(&last, n++, b, lv >= 2 ? red : lv == 1 ? yel : lv == 0 ? grn : w, 1.0f);
+            }
+            if (o->ov_drv) {                         /* the custom driver's name or the phone's own */
+                char d[16]; int j = 0;
+                for (const char *p = g_drv_name; *p && *p != ' ' && j < 11; p++) d[j++] = *p;
+                d[j] = 0;
+                snprintf(b, sizeof b, "DRV %s", j ? d : "-");
+                ov_line(&last, n++, b, w, 1.0f);
+            }
+        }
+#endif
         for (int i = 0; i < n; i++) { float sc = px * last.tcol[i][3], lw = (float)(last.tcnt[i] * 6 - 1) * sc; if (lw > wmax) wmax = lw; h += 9.0f * sc; }
         last.tinfo[0] = (float)n; last.tinfo[1] = px; last.tinfo[2] = wmax; last.tinfo[3] = n ? h - 2.0f * px * last.tcol[n - 1][3] : 0.0f;
+        memset(last.ginfo, 0, sizeof last.ginfo);
+#ifdef __ANDROID__
+        if (o->ov_graph) {                           /* 0.5.3: the frame graph under the lines (gft is filled every frame below) */
+            float bw = 2.0f * px, gh = 21.0f * px;
+            last.ginfo[0] = 1.0f; last.ginfo[1] = h; last.ginfo[2] = bw; last.ginfo[3] = gh;
+            if (48.0f * bw > wmax) last.tinfo[2] = 48.0f * bw;
+            last.tinfo[3] = h + gh;
+            if (n == 0) { last.tinfo[0] = 0.51f; last.tcnt[0] = 0; last.tcol[0][3] = 1.0f; }      /* a graph alone: the shader needs one (empty) line to draw the box */
+        }
+#endif
     }
     memcpy(ob->font, last.font, sizeof ob->font); memcpy(ob->tline, last.tline, sizeof ob->tline); memcpy(ob->tcnt, last.tcnt, sizeof ob->tcnt);
-    memcpy(ob->tcol, last.tcol, sizeof ob->tcol); memcpy(ob->tinfo, last.tinfo, sizeof ob->tinfo);
+    memcpy(ob->tcol, last.tcol, sizeof ob->tcol); memcpy(ob->tinfo, last.tinfo, sizeof ob->tinfo); memcpy(ob->ginfo, last.ginfo, sizeof ob->ginfo);
+    if (last.ginfo[0] > 0.5f) {                      /* every frame: the last 48 frame times over the target frame time, oldest on the left */
+        float tg = fg_on() || o->fps30 ? 33.333f : o->fps_cap ? 1000.0f / (float)o->fps_cap : 16.667f;
+        for (int i = 0; i < 48; i++) {
+            int back = 47 - i;
+            ob->gft[i] = back < g_ft_n ? g_ft[(g_ft_pos - 1 - back + FT_N * 2) % FT_N] / tg : 0.0f;
+        }
+    }
 }
 static int present_pass(uint32_t index, VTex *vt, const int *s4) {
     if (!g_pp.failed && V.image_count && !V.views[0]) swapchain_views(1);      /* the first present on this swapchain (the device's functions are loaded by now) */
@@ -6318,6 +6466,9 @@ static int present_pass(uint32_t index, VTex *vt, const int *s4) {
     /* the picture's place in the window as the app sees it, keeping its shape */
     int BW = (int)V.extent.width, BH = (int)V.extent.height, LW = V.rot & 1 ? BH : BW, LH = V.rot & 1 ? BW : BH, pw = LW, ph = LH;
     if (s4[2] > 0 && s4[3] > 0) { if ((int64_t)LW * s4[3] > (int64_t)LH * s4[2]) pw = (int)((int64_t)LH * s4[2] / s4[3]); else ph = (int)((int64_t)LW * s4[3] / s4[2]); }
+    if (LH > 0) g_win_aspect = (float)LW / (float)LH;      /* 0.5.5: smo_widescreen.c */
+        if (gfx_options()->widescreen && smo_widescreen_active() && s4[2] > 0 && s4[3] > 0 && (int64_t)LW * 9 > (int64_t)LH * 16 + LH / 10 && (int64_t)s4[2] * 9 >= (int64_t)s4[3] * 16 - s4[3] / 10) { pw = LW; ph = LH; }      /* the game's view is as wide as the window: no bars */
+    if (gfx_options()->widescreen) { static int nl; if (nl++ < 4) printf("nvn_vk: widescreen: window %dx%d (rot %d), picture crop %d,%d %dx%d of %dx%d, place %dx%d\n", LW, LH, V.rot, s4[0], s4[1], s4[2], s4[3], vt->w, vt->h, pw, ph); }
     {   /* 0.3.1, output_size (issue 22: a Mali-G57 MC2 spent ~12 ms a frame in menus, most of it drawing every pixel of a 2400 x 1080
          * screen): game = a swapchain only as tall as the game's picture (at least 720 lines; never taller than the window), which
          * Android's display hardware enlarges to the window at no GPU cost. On a 2400 x 1080 screen with the handheld picture
@@ -6976,8 +7127,11 @@ swap: ;
                    (long long)R.frame_skipped, (long long)g_fr_offskip, (long long)g_fr_cond, (long long)g_fr_condoff, (long long)g_fr_passes, (long long)g_fr_texbar, (long long)g_fr_vtxover, (long long)g_fr_wraps, (long long)(g_ring_bytes - g_fr_ring0) >> 10, (unsigned long long)g_fr_condhash);
         g_fr_cond = g_fr_condoff = g_fr_offskip = g_fr_passes = g_fr_texbar = g_fr_wraps = g_fr_vtxover = 0; g_fr_ring0 = g_ring_bytes; g_fr_condhash = 1469598103934665603ull;
     }
+    g_last_frame_draws = R.frame_draws;            /* 0.5.3: the benchmark (smo_bench.c) waits for its view by the draw count */
     R.frame_draws = R.frame_skipped = R.frame_clears = 0;
 }
+int nvn_vk_last_frame_draws(void) { return (int)g_last_frame_draws; }
+float nvn_vk_window_aspect(void) { return g_win_aspect; }
 const RBackend rb_vk = {"vk", vk_submit, vk_submit_async, vk_present, vk_present_movie, vk_fence, vk_sync_wait, vk_server_wait, vk_sync_drop, vk_flush, vk_finish, vk_write_texels, vk_read_texels, vk_housekeeping,
                         vk_reset_status, vk_no_grid, vk_idle, vk_menu};
 

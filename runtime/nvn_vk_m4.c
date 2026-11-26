@@ -310,6 +310,57 @@ static VStage *vstage_new(uint64_t hb, int s, int code_len, const uint32_t *key,
     v->next = g_vstage[hb & 4095]; g_vstage[hb & 4095] = v;
     return v;
 }
+/* 0.5.5, WHICH .var FILES EXIST: vstage_build and variants_known opened stage/<s>_<hb>.var for every stage, found or not; on
+ * Android the cache is on the app's external storage (FUSE), where even an open that fails is a round trip through the
+ * storage daemon, and a first start asks for tens of thousands of files that do not exist yet (noticed in another port's
+ * logs of this runtime: ~92,000 opens). The names are listed once at start (var_index_load) and each file written is added
+ * (var_index_add); a name not in the table is not opened. Lock-free (keys are 64-bit, 0 = empty), any thread.
+ * SMO_VK_VARINDEX=0: open every time, as before. */
+#define VARIDX_N (1u << 18)
+static uint64_t *g_varidx;
+static int g_varidx_on = -1;
+static int64_t g_varidx_skips, g_varidx_files;
+static uint64_t var_key(int s, uint64_t hb) { uint64_t k = (hb * 0x9E3779B97F4A7C15ULL) ^ ((uint64_t)(s + 1) << 56); return k ? k : 1; }
+static void var_index_add(int s, uint64_t hb) {
+    if (g_varidx_on != 1) return;
+    uint64_t k = var_key(s, hb);
+    for (unsigned i = (unsigned)(k >> 40) & (VARIDX_N - 1), n = 0; n < VARIDX_N; i = (i + 1) & (VARIDX_N - 1), n++) {
+        uint64_t cur = __atomic_load_n(&g_varidx[i], __ATOMIC_ACQUIRE);
+        if (cur == k) return;
+        if (!cur) { uint64_t z = 0; if (__atomic_compare_exchange_n(&g_varidx[i], &z, k, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) || z == k) return; }
+    }
+}
+static int var_index_has(int s, uint64_t hb) {     /* 1: the file may exist (or the index is off), 0: it does not */
+    if (g_varidx_on != 1) return 1;
+    uint64_t k = var_key(s, hb);
+    for (unsigned i = (unsigned)(k >> 40) & (VARIDX_N - 1), n = 0; n < VARIDX_N; i = (i + 1) & (VARIDX_N - 1), n++) {
+        uint64_t cur = __atomic_load_n(&g_varidx[i], __ATOMIC_ACQUIRE);
+        if (cur == k) return 1;
+        if (!cur) { plat_atomic_inc(&g_varidx_skips); return 0; }
+    }
+    return 1;
+}
+static void var_index_load(void) {                 /* prewarm_start, before any worker */
+    const char *e = getenv("SMO_VK_VARINDEX");
+    g_varidx_on = e ? atoi(e) != 0 : 1;
+    if (!g_varidx_on) { printf("nvn_vk: SMO_VK_VARINDEX=0: every .var file is opened to see whether it exists\n"); return; }
+    g_varidx = calloc(VARIDX_N, sizeof *g_varidx);
+    if (!g_varidx) { g_varidx_on = 0; return; }
+    g_varidx_on = 1;
+    plat_dir *d = plat_dir_open(vkc_file("stage"));
+    const char *name;
+    int is_dir;
+    int64_t size;
+    while (d && plat_dir_next(d, &name, &is_dir, &size)) {
+        int s; unsigned long long hb;
+        size_t len = strlen(name);
+        if (is_dir || len < 6 || strcmp(name + len - 4, ".var") || sscanf(name, "%d_%llx.var", &s, &hb) != 2) continue;
+        var_index_add(s, (uint64_t)hb); g_varidx_files++;
+    }
+    plat_dir_close(d);
+    if (g_varidx_files > (int64_t)(VARIDX_N / 2)) { g_varidx_on = 0; printf("nvn_vk: %lld .var files: too many for the index, every one is opened as before\n", (long long)g_varidx_files); return; }
+    printf("nvn_vk: .var files listed: %lld (a stage without one is not looked up on disk)\n", (long long)g_varidx_files);
+}
 /* Any thread, no lock: fills v (in the table, state 1) from its record on disk, else with the translator and glslang. */
 static void vstage_build(VStage *v, const SSrc *src) {
     int s = v->stage, done = 0;
@@ -317,7 +368,7 @@ static void vstage_build(VStage *v, const SSrc *src) {
     char path[128];
     StageRec r;
     snprintf(path, sizeof path, "%s/stage/%d_%016llx.var", vkc_dir(), s, (unsigned long long)v->hb);
-    FILE *fp = fopen(path, "rb");
+    FILE *fp = var_index_has(s, v->hb) ? fopen(path, "rb") : NULL;
     if (fp) {
         VarRec e;
         while (!done && fread(&e, 1, sizeof e, fp) == sizeof e) {
@@ -340,6 +391,7 @@ static void vstage_build(VStage *v, const SSrc *src) {
             memcpy(in.local_size, src->local, sizeof in.local_size); in.smem_bytes = src->smem; in.lmem_bytes = src->lmem;
         }
         snprintf(what, sizeof what, "program #%d %s stage", src->serial, s == 5 ? "compute" : s == 2 ? "geometry" : s ? "fragment" : "vertex");
+        if (getenv("SMO_VK_GLSLDUMP")) { size_t l = strlen(what); snprintf(what + l, sizeof what - l, " %016llx", (unsigned long long)fnv(0xcbf29ce484222325ULL, src->code, (size_t)src->code_len)); }      /* 0.5.6: the code hash of nvn_vk_watch / nvn_vk_hash in the dump's name */
         if (s == 1 && RS_ON) in.screen_scale = 1;
         {   /* SMO debug aid: SMO_VK_DUMP_SERIAL=<n> writes the machine code of program n's stages (vk_prog_<n>_<stage>.bin in SMO_SHADERDUMP or the run folder) */
             static int want = -2; if (want == -2) want = getenv("SMO_VK_DUMP_SERIAL") ? atoi(getenv("SMO_VK_DUMP_SERIAL")) : -1;
@@ -384,7 +436,7 @@ static void vstage_build(VStage *v, const SSrc *src) {
                 memset(&e, 0, sizeof e);
                 e.magic = STAGEREC_MAGIC; memcpy(e.key, v->key, 16); e.fo = v->fo; e.dep = v->dep; e.tex = v->tex_units; e.vh = v->h;
                 snprintf(path, sizeof path, "%s/stage/%d_%016llx.var", vkc_dir(), s, (unsigned long long)v->hb);
-                if ((fp = fopen(path, "ab")) != NULL) { fwrite(&e, 1, sizeof e, fp); fclose(fp); }
+                if ((fp = fopen(path, "ab")) != NULL) { fwrite(&e, 1, sizeof e, fp); fclose(fp); var_index_add(s, v->hb); }
             no_record:;
             }
         }
@@ -1445,6 +1497,7 @@ static void variants_known(const SSrc *src, uint64_t hb) {
     char path[300];
     VarRec e[32];
     int n, how;
+    if (!var_index_has(src->stage, hb)) return;
     snprintf(path, sizeof path, "%s/stage/%d_%016llx.var", vkc_dir(), src->stage, (unsigned long long)hb);
     FILE *fp = fopen(path, "rb");
     if (!fp) return;
@@ -1872,6 +1925,20 @@ void nvn_vk_first_prep_skip(void) {
     fflush(stdout);
 }
 static int set_over_budget(void) {
+#ifdef __ANDROID__
+    /* 0.5.1, THE BAR AGAIN WHEN THE CACHE LACKS THE STAGES (GitHub issue 42, an Infinix X6720B, Mali-G57 MC2): the marker of a
+     * finished preparation was there, but the game's programs were not in the cache (another translation, or stage files
+     * gone), so each program on the Joy-Con screen held the game about 20 ms behind a black screen; the player saw a black
+     * screen with the touch buttons for a minute and gave up. When the game has been held 5 s before it has handed over its
+     * programs, the start becomes a first-start preparation after all: the progress bar (GameActivity polls for it), no time
+     * limit, and the marker written again when it is done. */
+    if (g_fp_state == 0 && !getenv("SMO_VK_HOLD_BUDGET_S") && g_fp_serial < FIRST_PREP_PROGRAMS && g_set_held_tk > 5 * plat_qpf()) {
+        g_fp_state = 1; g_fp_t0 = tk();
+        printf("nvn_vk: first-start preparation after all: the game was held %.1f s for shaders at program %d although %s is there (the cache lacks this translation's stages); the progress bar is shown\n",
+               (double)g_set_held_tk / (double)plat_qpf(), (int)g_fp_serial, vkc_file(first_prep_marker()));
+        fflush(stdout);
+    }
+#endif
     if (g_fp_state == 1 || g_fp_state == 2) return 0;
     if (g_fp_state == 3) return 1;
     if (g_set_budget_tk < 0) {
@@ -1981,6 +2048,7 @@ static void prewarm_start(void) {
     plat_mutex_init(&g_sh_lock); plat_mutex_init(&g_gpl_lock); plat_mutex_init(&g_dl0_lock);
     plat_cond_init(&g_sh_cv); plat_cond_init(&g_jq_cv);
     plat_mkdirs(vkc_dir()); plat_mkdirs(vkc_file("spv")); plat_mkdirs(vkc_file("stage"));
+    var_index_load();
     if (getenv("SMO_VK_CACHE")) printf("nvn_vk: cache folder %s (SMO_VK_CACHE)\n", vkc_dir());
     first_prep_init();
     {   smo_glsl_bind(&g_glsl_to_spirv, &g_spirv_free);

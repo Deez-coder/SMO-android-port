@@ -314,7 +314,7 @@ static void *vk_sym(const char *name) {
 /* Render thread, once. Returns 1; any failure prints its cause and ends the process with code 5 (as the OpenGL path does). */
 int nvn_vk_init(void *hwnd) {
     static const char *const k_wanted[] = {"VK_KHR_swapchain", "VK_EXT_extended_dynamic_state3", "VK_EXT_vertex_input_dynamic_state", "VK_KHR_push_descriptor", "VK_EXT_custom_border_color",
-                                           "VK_EXT_conservative_rasterization", "VK_EXT_external_memory_host", "VK_EXT_depth_clip_control", "VK_EXT_provoking_vertex", "VK_EXT_4444_formats",
+                                           "VK_EXT_conservative_rasterization", "VK_EXT_external_memory_host", "VK_EXT_map_memory_placed", "VK_EXT_depth_clip_control", "VK_EXT_provoking_vertex", "VK_EXT_4444_formats",
                                            "VK_EXT_index_type_uint8", "VK_EXT_full_screen_exclusive", "VK_EXT_blend_operation_advanced", "VK_KHR_pipeline_library"};
     VkResult r;
     V.hwnd = hwnd;

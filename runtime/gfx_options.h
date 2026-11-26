@@ -16,6 +16,8 @@ typedef struct {
     int shader_skip;         /* shader_wait: 0 hold (a draw waits for its shader or pipeline: the frame is late), 1 skip (near a fight the draw is left out until they are ready; nvn_vk_m4.c skip_on; env SMO_VK_NOHOLD wins) */
     int profile;            /* 0 custom (the keys as written), 1 low: scale, aniso and present are set by the profile (gfx_options.c) */
     int fps_counter;         /* fps_counter = on (default) | off: the frame rate in the corner (Android present pass; env SMO_FPS=0 wins) */
+    int ov_gpu, ov_cpu, ov_bat, ov_soc, ov_ram, ov_drv, ov_thr, ov_graph;
+    int widescreen;                     /* 0.5.5 TEST: widescreen = on | off (smo_widescreen.c), read at the start */   /* 0.5.3: overlay_gpu / _cpu / _battery / _soc / _ram / _driver / _thermal = on | off: more overlay lines (android_ovstats.c) */
     int fps_avg, fps_low, frame_time;   /* fps_average, fps_low, frame_time = on | off: more lines of the performance overlay (the present pass, nvn_vk_draw.c ov_text) */
     float fps_size;          /* fps_size = 50..200 (%): its size */
     int driver_system;       /* driver = custom (default: a custom Vulkan driver when one is installed, Android) | system (env SMO_DRIVER=system wins) */

@@ -56,7 +56,14 @@ typedef struct {
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static Ctl g_ctl[8];
 static int g_nplayers = 1;
-static struct { int layout_labels, touch_mode, motion, camera_stick; float opacity, scale, deadzone, camera; } g_cfg = {0, 0, 1, 1, 0.45f, 1.0f, 0.15f, 1.0f};
+static struct { int layout_labels, touch_mode, motion, camera_stick; float opacity, scale, deadzone, camera; int touch_p2; } g_cfg = {0, 0, 1, 1, 0.45f, 1.0f, 0.15f, 1.0f, 0};
+/* 0.5.8, two players (GitHub issue 48): touch_player = 2 in controls.ini makes the touch controls player 2 while a controller is
+ * player 1, for the game's two-player mode (pause menu, Two Players: the second player is Cappy). With no controller yet the touch
+ * controls stay player 1, so the game is never left without one; further controllers then skip player 2. Two controllers and
+ * touch_player = 1 (the default): the first controller and touch are player 1, the second controller player 2. The phone's motion
+ * sensors and the back gesture go with the touch controls' player. g_lock held. */
+static int ctl_on(int player) { for (int i = 0; i < 8; i++) if (g_ctl[i].used && g_ctl[i].player == player) return 1; return 0; }
+static int touch_player(void) { return g_cfg.touch_p2 && ctl_on(0) ? 1 : 0; }
 static float g_accel[3] = {0, -9.80665f, 0}, g_gyro[3];
 static int g_has_sensors;
 static int64_t g_last_touch_ms, g_last_pad_ms, g_shake_until;
@@ -103,6 +110,7 @@ static int touch_visible(int64_t now) {              /* auto: hidden from a cont
     if (env == -2) env = getenv("SMO_TOUCH_SHOW") ? atoi(getenv("SMO_TOUCH_SHOW")) != 0 : -1;
     if (env >= 0) return env;
     if (g_cfg.touch_mode == 2) return 0;
+    if (touch_player() == 1) return 1;                 /* 0.5.8: player 2 on touch beside a controller: two people, keep them shown */
     if (g_cfg.touch_mode == 1) return 1;
     return g_last_touch_ms >= g_last_pad_ms;
 }
@@ -227,7 +235,7 @@ static Ctl *ctl_for(int device, int64_t now) {      /* g_lock held */
         memset(&g_ctl[i], 0, sizeof g_ctl[i]);
         g_ctl[i].used = 1; g_ctl[i].id = device; g_ctl[i].last_ms = now;
         int p = 0;                                    /* the first controller joins player 1 (with the touch pad), the others the next free players */
-        for (int taken = 1; taken; ) { taken = 0; for (int k = 0; k < 8; k++) if (k != i && g_ctl[k].used && g_ctl[k].player == p) { taken = 1; p++; } }
+        for (int taken = 1; taken; ) { taken = 0; if (p == 1 && g_cfg.touch_p2) { taken = 1; p++; continue; } for (int k = 0; k < 8; k++) if (k != i && g_ctl[k].used && g_ctl[k].player == p) { taken = 1; p++; } }      /* touch_player = 2: player 2 is the touch controls' */
         g_ctl[i].player = p;
         if (p + 1 > g_nplayers) g_nplayers = p + 1;
         printf("nnpad: controller %d is player %d\n", device, p + 1);
@@ -353,7 +361,10 @@ static const char k_default_ini[] =
 "; the touch camera's speed (0.2..4; with the stick, below 1 slows it)\n"
 "camera_speed = 1.0\n"
 "; the phone's own motion sensors as the console's (Cappy throws, motion aiming): on | off\n"
-"motion = on\n";
+"motion = on\n"
+"; who the touch controls are while a controller is connected: 1 = player 1 together with the first controller; 2 = player 2\n"
+";   (the game's two-player mode: pause menu, Two Players; player 2 plays Cappy). Without a controller they are player 1.\n"
+"touch_player = 1\n";
 static uint64_t g_ini_stamp;
 static void load_config(int force) {
     char path[PLAT_MAX_PATH], line[256];
@@ -399,6 +410,7 @@ static void load_config(int force) {
         else if (!strcmp(key, "camera_speed")) { float v = (float)atof(val); g_cfg.camera = v < 0.2f ? 0.2f : v > 4 ? 4 : v; }
         else if (!strcmp(key, "motion")) g_cfg.motion = strcmp(val, "off") != 0;
         else if (!strcmp(key, "camera_touch")) g_cfg.camera_stick = strcmp(val, "drag") != 0;
+        else if (!strcmp(key, "touch_player")) g_cfg.touch_p2 = atoi(val) == 2;
     }
     if (f) fclose(f);
     pthread_mutex_lock(&g_lock);
@@ -408,6 +420,7 @@ static void load_config(int force) {
     memcpy(g_bind, bind, sizeof g_bind);
     pthread_mutex_unlock(&g_lock);
     if (moved || bound) printf("nnpad: controls: %d touch controls placed by the player, %d controller keys bound by the player\n", moved, bound);
+    printf("nnpad: controls: touch controls are player %d while a controller is connected (touch_player)\n", g_cfg.touch_p2 ? 2 : 1);
     printf("nnpad: controls: layout %s, touch %s (opacity %.2f, scale %.2f), dead zone %.2f, camera %s speed %.2f, motion %s\n",
            g_cfg.layout_labels ? "labels" : "positional", g_cfg.touch_mode == 1 ? "on" : g_cfg.touch_mode == 2 ? "off" : "auto",
            g_cfg.opacity, g_cfg.scale, g_cfg.deadzone, g_cfg.camera_stick ? "stick" : "drag", g_cfg.camera, g_cfg.motion ? "on" : "off");
@@ -446,20 +459,19 @@ void nnpad_poll(int force) {
     load_config(0);
 }
 int nnpad_present(int player) {
-    if (player == 0) return 1;                        /* the touch pad is always there */
     pthread_mutex_lock(&g_lock);
-    int any = 0;
+    int any = player == touch_player();               /* the touch pad is always there (player 1, or 2 beside a controller) */
     for (int i = 0; i < 8; i++) any |= g_ctl[i].used && g_ctl[i].player == player;
     pthread_mutex_unlock(&g_lock);
     return any;
 }
 int nnpad_get(int player, NnPadState *out) {
     int64_t now = (int64_t)plat_ms64();
-    int any = player == 0;
     memset(out, 0, sizeof *out);
     pthread_mutex_lock(&g_lock);
+    int tp = touch_player(), any = player == tp;
     for (int i = 0; i < 8; i++) if (g_ctl[i].used && g_ctl[i].player == player) { ctl_state(&g_ctl[i], out); any = 1; }
-    if (player == 0) {
+    if (player == tp) {
         touch_state(out, now);
         out->buttons |= g_back_key;
         motion_state(out, now);
